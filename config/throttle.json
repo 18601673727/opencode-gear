@@ -1,0 +1,21 @@
+{
+  "$comment": "Throttle controls ONLY the OpenAI Lead tier. It must never decide which consumer model handles EXPLORE / BUILD / VERIFY / DEBUG - that is config/routing.json. `model` references a key in config/models.json; `variant` must be one of that model's declared variants.",
+  "default": "low",
+  "levels": {
+    "low": {
+      "model": "sol",
+      "variant": "medium",
+      "description": "Economical Lead. Best default when cost matters."
+    },
+    "mid": {
+      "model": "sol",
+      "variant": "high",
+      "description": "Stronger Lead reasoning on the same Sol model."
+    },
+    "high": {
+      "model": "astra",
+      "variant": "high",
+      "description": "Premium Lead. Larger context and the stronger reasoning tier."
+    }
+  }
+}

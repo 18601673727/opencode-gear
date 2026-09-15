@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local gear state and per-project overrides
+.opencode-gear.json
+*.events.jsonl
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

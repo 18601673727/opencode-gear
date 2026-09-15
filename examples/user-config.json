@@ -1,0 +1,13 @@
+{
+  "$comment": "Example USER override. Copy to ~/.config/opencode-gear/config.json. Applies to every project that does not override the same key. Deep-merged over the gear defaults and under the project override.",
+  "throttle": {
+    "default": "low"
+  },
+  "observability": {
+    "enabled": false,
+    "path": "~/state/opencode-gear/events.jsonl"
+  },
+  "opencode": {
+    "username": "you"
+  }
+}

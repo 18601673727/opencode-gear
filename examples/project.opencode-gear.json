@@ -1,0 +1,15 @@
+{
+  "$comment": "Example PROJECT override. Copy to <project>/.opencode-gear.json and keep only the keys you need. This file is read automatically when `oc` runs in that project directory. Deep-merged over the gear defaults and over your user config.",
+  "throttle": {
+    "default": "mid"
+  },
+  "routing": {
+    "roles": {
+      "build": { "model": "glm-5.3", "variant": "max" },
+      "verify": { "model": "glm-5.3-flash", "variant": "high" }
+    }
+  },
+  "prompts": {
+    "lead": "./docs/agent-lead.md"
+  }
+}
