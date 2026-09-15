@@ -335,6 +335,122 @@ class OverrideTests(GearTestCase):
         self.assertEqual(body, "Relative lead prompt.")
 
 
+class PromptExtensionTests(GearTestCase):
+    """Project policy must extend the gear prompt, never fork it."""
+
+    def core_lead(self) -> str:
+        return (self.home / "config" / "prompts" / "lead.md").read_text(encoding="utf-8")
+
+    def test_append_keeps_core_prompt_and_adds_project_policy(self) -> None:
+        policy = self.project / "lead-policy.md"
+        policy.write_text("# Project policy\n\nNever touch production.\n", encoding="utf-8")
+        self.patch_project({"prompts": {"lead": {"append": [str(policy)]}}})
+        effective, _ = self.effective()
+        _, body = oc.read_prompt(effective, "lead", self.project)
+        self.assertIn("You are the Lead in an OpenCode Gear multi-model setup.", body)
+        self.assertIn("Never touch production.", body)
+        self.assertIn(oc.PROMPT_APPEND_SEPARATOR.strip(), body)
+        self.assertLess(body.index("You are the Lead"), body.index("Never touch production."))
+
+    def test_append_only_uses_the_gear_default_not_a_replacement(self) -> None:
+        policy = self.project / "policy.md"
+        policy.write_text("Project-only clause.\n", encoding="utf-8")
+        self.patch_project({"prompts": {"lead": {"append": [str(policy)]}}})
+        effective, _ = self.effective()
+        _, body = oc.read_prompt(effective, "lead", self.project)
+        # The gear prompt is still present verbatim at the front.
+        self.assertTrue(body.startswith(self.core_lead().strip()))
+        self.assertTrue(body.endswith("Project-only clause."))
+
+    def test_append_accepts_inline_text(self) -> None:
+        self.patch_project({"prompts": {"lead": {"append": [{"text": "Inline clause."}]}}})
+        effective, _ = self.effective()
+        _, body = oc.read_prompt(effective, "lead", self.project)
+        self.assertIn("Inline clause.", body)
+
+    def test_path_then_append_replaces_and_extends(self) -> None:
+        replacement = self.project / "replacement.md"
+        replacement.write_text("Replacement core.\n", encoding="utf-8")
+        extra = self.project / "extra.md"
+        extra.write_text("Extra policy.\n", encoding="utf-8")
+        self.patch_project({"prompts": {"lead": {"path": str(replacement), "append": [str(extra)]}}})
+        effective, _ = self.effective()
+        _, body = oc.read_prompt(effective, "lead", self.project)
+        self.assertTrue(body.startswith("Replacement core."))
+        self.assertTrue(body.endswith("Extra policy."))
+        self.assertNotIn("You are the Lead in an OpenCode Gear", body)
+
+    def test_append_accepts_relative_project_path(self) -> None:
+        nested = self.project / "policy"
+        nested.mkdir()
+        (nested / "lead.md").write_text("Relative project policy.\n", encoding="utf-8")
+        self.patch_project({"prompts": {"lead": {"append": ["policy/lead.md"]}}})
+        effective, _ = self.effective()
+        _, body = oc.read_prompt(effective, "lead", self.project)
+        self.assertTrue(body.endswith("Relative project policy."))
+
+    def test_appended_policy_reaches_the_rendered_lead_agent(self) -> None:
+        policy = self.project / "lead-policy.md"
+        policy.write_text("Use `{{build}}` only for approved scope.\n", encoding="utf-8")
+        self.patch_project({"prompts": {"lead": {"append": [str(policy)]}}})
+        effective, _ = self.effective()
+        config = oc.build_opencode_config(effective, "low", self.project)
+        prompt = config["agent"]["lead-low"]["prompt"]
+        self.assertIn("Use `ocg-build` only for approved scope.", prompt)
+
+    def test_missing_appended_file_is_reported(self) -> None:
+        self.patch_project({"prompts": {"lead": {"append": ["missing-policy.md"]}}})
+        effective, _ = self.effective()
+        self.assertTrue(any("lead" in e for e in self.errors(effective)), self.errors(effective))
+
+    def test_append_must_be_a_list(self) -> None:
+        self.patch_project({"prompts": {"lead": {"append": "not-a-list"}}})
+        effective, _ = self.effective()
+        self.assertTrue(any("append" in e for e in self.errors(effective)))
+
+    def test_append_does_not_leak_into_consumer_prompts(self) -> None:
+        policy = self.project / "lead-policy.md"
+        policy.write_text("Lead-only clause.\n", encoding="utf-8")
+        self.patch_project({"prompts": {"lead": {"append": [str(policy)]}}})
+        effective, _ = self.effective()
+        config = oc.build_opencode_config(effective, "low", self.project)
+        for role in oc.role_specs(effective):
+            self.assertNotIn("Lead-only clause.", config["agent"][oc.consumer_agent_id(role)]["prompt"])
+
+    def test_core_lead_prompt_stays_project_agnostic(self) -> None:
+        core = self.core_lead()
+        for token in ("Zh" + "uju", "xiang" + "min", "chun" + "cheon", "/opt/" + "zhuju"):
+            self.assertNotIn(token, core)
+        self.assertNotIn("/home/", core)
+        self.assertNotIn("/Users/", core)
+
+
+class ProjectLayerTests(GearTestCase):
+    def test_project_override_is_loaded_only_for_that_project(self) -> None:
+        self.patch_project({"throttle": {"default": "high"}})
+        here, applied_here = self.effective()
+        other = self.tmp / "other-project"
+        other.mkdir()
+        elsewhere, applied_elsewhere = oc.build_effective(self.home, other)
+        self.assertEqual(oc.resolve_throttle(here), "high")
+        self.assertEqual(oc.resolve_throttle(elsewhere), "low")
+        self.assertEqual([name for name, _ in applied_here], ["project"])
+        self.assertEqual(applied_elsewhere, [])
+
+    def test_rendered_lead_is_the_core_prompt_when_no_project_policy_exists(self) -> None:
+        effective, applied = self.effective()
+        self.assertEqual(applied, [])
+        config = oc.build_opencode_config(effective, "low", self.project)
+        core = (self.home / "config" / "prompts" / "lead.md").read_text(encoding="utf-8")
+        # Only the template placeholders are substituted; no project text is injected.
+        rendered = config["agent"]["lead-low"]["prompt"]
+        self.assertIn("You are the Lead in an OpenCode Gear multi-model setup.", rendered)
+        for line in core.splitlines():
+            stripped = line.strip()
+            if stripped and "{{" not in stripped and "|" not in stripped:
+                self.assertIn(stripped, rendered)
+
+
 class ObservabilityTests(GearTestCase):
     def test_trace_is_disabled_by_default(self) -> None:
         effective, _ = self.effective()

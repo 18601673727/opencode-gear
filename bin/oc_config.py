@@ -54,6 +54,9 @@ CONSUMER_AGENT_PREFIX = "ocg-"
 DEFAULT_PROMPT_NAMES: tuple[str, ...] = (LEAD_ROLE,) + CONSUMER_ROLES
 TRACE_ENV = "OC_GEAR_TRACE"
 
+# Inserted between the gear prompt for a role and each appended project block.
+PROMPT_APPEND_SEPARATOR = "\n\n---\n\n"
+
 # Files kept in the gear's config/ directory.
 REGISTRY_FILES = ("throttle.json", "models.json", "routing.json", "permissions.json", "base.json")
 
@@ -156,9 +159,11 @@ def load_defaults(home: Path) -> dict[str, Any]:
         raise ConfigError("config/routing.json is missing 'roles'")
 
     prompts: dict[str, Any] = {}
+    prompt_defaults: dict[str, str] = {}
     prompt_dir = config / "prompts"
     for role in DEFAULT_PROMPT_NAMES:
         prompts[role] = str(prompt_dir / f"{role}.md")
+        prompt_defaults[role] = str(prompt_dir / f"{role}.md")
 
     return {
         "throttle": throttle,
@@ -167,6 +172,9 @@ def load_defaults(home: Path) -> dict[str, Any]:
         "permissions": permissions,
         "base": base,
         "prompts": prompts,
+        # Never overridden: the project-agnostic gear prompt for each role, so an
+        # override that only APPENDS project policy still keeps the core prompt.
+        "_prompt_defaults": prompt_defaults,
         "observability": {"enabled": False, "path": None},
     }
 
@@ -284,26 +292,64 @@ def resolve_prompt_path(raw: str, effective: dict[str, Any], cwd: Path) -> Path:
     return (cwd / candidate).resolve()
 
 
-def read_prompt(effective: dict[str, Any], role: str, cwd: Path) -> tuple[dict[str, str], str]:
-    source = prompt_source(effective, role)
-    if isinstance(source, dict):
-        if "text" in source:
-            text = str(source["text"])
-        elif "path" in source:
-            text = resolve_prompt_path(str(source["path"]), effective, cwd).read_text(encoding="utf-8")
-        else:
-            raise ConfigError(f"prompt for role {role!r} must be a path or have 'text'/'path'")
-    elif isinstance(source, str):
+def default_prompt_path(effective: dict[str, Any], role: str) -> Path:
+    """The project-agnostic gear prompt for a role, independent of overrides."""
+    raw = (effective.get("_prompt_defaults") or {}).get(role)
+    if raw:
+        return Path(str(raw))
+    home = effective.get("_home")
+    if home:
+        return Path(str(home)) / "config" / "prompts" / f"{role}.md"
+    raise ConfigError(f"no default prompt path for role {role!r}")
+
+
+def read_prompt_source_text(
+    source: Any, effective: dict[str, Any], cwd: Path, role: str
+) -> str:
+    """Return the raw text of one prompt source entry.
+
+    Accepted forms: a path string, ``{"path": ...}``, ``{"text": ...}``, or
+    ``{"append": [...]}`` (which uses the unmodified gear prompt for the role).
+    """
+    if isinstance(source, str):
         path = resolve_prompt_path(source, effective, cwd)
         if not path.is_file():
             raise ConfigError(f"prompt file for role {role!r} not found: {path}")
-        text = path.read_text(encoding="utf-8")
-    else:
-        raise ConfigError(f"prompt for role {role!r} has an unsupported value")
+        return path.read_text(encoding="utf-8")
+    if isinstance(source, dict):
+        if "text" in source:
+            return str(source["text"])
+        if "path" in source:
+            path = resolve_prompt_path(str(source["path"]), effective, cwd)
+            if not path.is_file():
+                raise ConfigError(f"prompt file for role {role!r} not found: {path}")
+            return path.read_text(encoding="utf-8")
+        if "append" in source:
+            path = default_prompt_path(effective, role)
+            if not path.is_file():
+                raise ConfigError(f"prompt file for role {role!r} not found: {path}")
+            return path.read_text(encoding="utf-8")
+    raise ConfigError(
+        f"prompt for role {role!r} must be a path, {{'path': ...}}, {{'text': ...}} "
+        f"or {{'append': [...]}}"
+    )
 
+
+def read_prompt(effective: dict[str, Any], role: str, cwd: Path) -> tuple[dict[str, str], str]:
+    source = prompt_source(effective, role)
+    text = read_prompt_source_text(source, effective, cwd, role)
     meta, body = split_frontmatter(text)
     if not body.strip():
         raise ConfigError(f"prompt for role {role!r} is empty")
+
+    appended = source.get("append", []) if isinstance(source, dict) else []
+    if not isinstance(appended, list):
+        raise ConfigError(f"prompt 'append' for role {role!r} must be a list")
+    for entry in appended:
+        _, extra = split_frontmatter(read_prompt_source_text(entry, effective, cwd, role))
+        if not extra.strip():
+            raise ConfigError(f"appended prompt for role {role!r} is empty")
+        body = body.strip() + PROMPT_APPEND_SEPARATOR + extra.strip()
     return meta, body.strip()
 
 

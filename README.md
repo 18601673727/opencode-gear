@@ -42,6 +42,7 @@ specialists that are good at their one job and cheap enough to use often.
 - [Consumer Router semantics](#consumer-router-semantics)
 - [Provider and model mapping](#provider-and-model-mapping)
 - [Configuration and overrides](#configuration-and-overrides)
+- [Project-local policy](#project-local-policy)
 - [Commands](#commands)
 - [Isolation and permissions](#isolation-and-permissions)
 - [Security and secrets](#security-and-secrets)
@@ -271,8 +272,11 @@ plus the gear-only extras `prompts`, `observability` and `opencode`.
     }
   },
 
-  // replace a prompt (path, or {"text": "..."})
-  "prompts": { "lead": "~/prompts/my-lead.md" },
+  // extend a prompt instead of replacing it (recommended for project policy)
+  "prompts": { "lead": { "append": [".opencode/lead-policy.md"] } },
+
+  // or replace a prompt entirely (path, or {"text": "..."})
+  // "prompts": { "lead": "~/prompts/my-lead.md" },
 
   // optional local routing trace
   "observability": { "enabled": true, "path": "~/state/oc-gear-events.jsonl" },
@@ -308,6 +312,46 @@ refuses to build a config that would otherwise fail at runtime.
 Prompt paths may be absolute, or relative — relative paths are resolved against
 the project directory first, then the gear's `config/` directory.
 
+## Project-local policy
+
+OpenCode Gear core is project-agnostic. Repository-specific instructions should
+be supplied through project-local configuration/instruction layers rather than
+by editing Gear's core prompts.
+
+The recommended shape is an **append**, not a replacement, so the gear prompt
+keeps improving while project policy stays independent:
+
+```text
+<project>/.opencode-gear.json      # project override
+{ "prompts": { "lead": { "append": [".opencode/lead-policy.md"] } } }
+
+<project>/.opencode/lead-policy.md # the project's own rules
+```
+
+The rendered Lead prompt is then:
+
+```text
+OpenCode Gear generic core prompt
+        +
+---
+project policy
+---
+```
+
+Why append:
+
+- Updating the gear (a new model, a new escalation rule) never overwrites
+  project policy, and project policy never freezes the core prompt.
+- The gear repository stays free of any single project's conventions, domain
+  rules or private context.
+- The override is per project: another repository can append a completely
+  different policy, or none at all.
+
+`{{role}}` placeholders and `{{routing}}` are substituted in appended text too,
+so project policy can refer to the configured agents without hardcoding model
+ids. Appending affects only the role you target — consumer prompts stay
+project-agnostic.
+
 ## Commands
 
 ```text
@@ -329,6 +373,11 @@ Inside the TUI, `Tab` / `Shift+Tab` cycle the three Lead agents. The cycle
 order depends on the active `default_agent`; the default configuration starts
 at `lead-low`. If you do not want the keybind, remove `keybinds` from
 `config/base.json` or override it in your project config.
+
+`oc` is the OpenCode Gear CLI. If you already have a different tool installed
+under the same name, rename it or remove it from `PATH` so the gear owns the
+command; the install snippet above puts the gear's `bin/` on `PATH` directly.
+`oc` follows symlinks, so a symlink on `PATH` is enough.
 
 ## Isolation and permissions
 

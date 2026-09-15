@@ -99,6 +99,38 @@ Delegation policy is prompt policy. Edit `config/prompts/lead.md`, or replace
 it per project with a `prompts` override. Remember that prompts shape
 behaviour; they do not enforce it.
 
+## My project policy is not in the Lead prompt
+
+Project policy is applied through the project override. Check:
+
+```bash
+oc layers                      # is the project layer [found]?
+oc --dry-run | python3 -c "import json,sys; print(json.load(sys.stdin)['agent']['lead-low']['prompt'])" | tail -40
+```
+
+`oc` reads `<cwd>/.opencode-gear.json`; run it from the project root, or point
+`OC_GEAR_PROJECT_CONFIG` at the file. If the override sets
+`prompts.lead.path`, it **replaces** the gear prompt, so append instead:
+
+```json
+{ "prompts": { "lead": { "append": ["path/to/policy.md"] } } }
+```
+
+## `opencode run --agent <consumer>` does not run the consumer
+
+OpenCode only accepts a **primary** agent in `--agent`; a subagent is rejected
+or ignored (`default agent "..." is a subagent`). Consumers are reached through
+the Lead's Task tool, which is the normal path. To smoke-test routing, ask the
+Lead to delegate explicitly, for example:
+
+```bash
+oc run 'Call the task tool once with subagent_type "ocg-build" and prompt "reply OK".'
+```
+
+You can confirm which model actually ran by checking the OpenCode log or the
+session store for the `providerID` / `modelID` / `variant` of the assistant
+message.
+
 ## I want to pin the whole project to different models
 
 Create `<project>/.opencode-gear.json`:

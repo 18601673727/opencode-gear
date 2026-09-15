@@ -130,10 +130,25 @@ Consumer prompts may carry YAML front matter with `description` and
 
 Prompt values in an override may be:
 
-- a string path (absolute, or relative to the project directory / gear
-  `config/` directory),
-- `{ "path": "..." }`,
-- `{ "text": "..." }` for an inline prompt.
+| Form | Meaning |
+| --- | --- |
+| `"path/to/prompt.md"` | replace the gear prompt with this file |
+| `{ "path": "..." }` | same as above |
+| `{ "text": "..." }` | replace with inline text |
+| `{ "append": ["a.md", {"text": "..."}] }` | keep the gear prompt and append blocks |
+| `{ "path": "...", "append": [...] }` | replace, then append |
+
+Appended blocks are joined to the base prompt with a `---` separator, and
+placeholder substitution applies to the whole assembled prompt. This is the
+supported way to layer repository-specific policy on top of the gear prompt
+without forking it:
+
+```json
+{ "prompts": { "lead": { "append": [".opencode/lead-policy.md"] } } }
+```
+
+The gear keeps the unmodified prompt for every role in `_prompt_defaults`, so
+an append-only override never has to restate the core prompt.
 
 ## Environment variables
 

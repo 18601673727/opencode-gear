@@ -73,9 +73,13 @@ Consumer Router = delegated execution routing    EXPLORE / BUILD / VERIFY / DEBU
 ## Keeping the old CLI alive during migration
 
 If you have muscle memory for an old `oc use ...` command, keep the old script
-on `PATH` under a different name (`oc-old`) while you migrate, then delete it.
-Do not keep two scripts named `oc`; the second one on `PATH` wins and the
-failure is confusing.
+on `PATH` under a different name (for example `oc-old`) while you migrate, then
+delete it. Do not keep two scripts named `oc`; the second one on `PATH` wins and
+the failure is confusing.
+
+The same applies to any unrelated tool that already owns the name `oc`. `oc` is
+the OpenCode Gear CLI; rename the other tool, or put the gear's `bin/`
+directory earlier on `PATH`.
 
 ## What intentionally did not carry over
 

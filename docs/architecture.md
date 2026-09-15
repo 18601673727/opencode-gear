@@ -135,5 +135,30 @@ one place (`config/prompts/lead.md`) and `config/routing.json`.
 | Change Lead tiers | `config/throttle.json` |
 | Add a specialist role | add a prompt, a routing role, a permission profile binding |
 | Pin a project to different models | `<project>/.opencode-gear.json` |
-| Change a prompt for one project | `prompts` override pointing at a file |
+| Add repository-specific Lead policy | `prompts.lead.append` in `<project>/.opencode-gear.json` |
+| Replace a prompt for one project | `prompts` override pointing at a file |
 | Add raw OpenCode settings | `opencode` key in an override, or `config/base.json` |
+
+## Project policy stays out of the core
+
+The gear prompt is a project-agnostic baseline. Repository-specific rules are
+layered on **per project**, never written into the core:
+
+```text
+gear default prompt  (config/prompts/lead.md, project-agnostic)
+        +
+project override     (<project>/.opencode-gear.json -> prompts.lead.append)
+        =
+rendered Lead prompt
+```
+
+Two consequences worth keeping true:
+
+1. Upgrading the gear never overwrites project policy, because project policy
+   lives outside the gear tree.
+2. The public core never accumulates one project's domain rules, so it stays
+   usable by an unrelated Rust, Go, Python, Java or TypeScript repository.
+
+`oc layers` shows which override file was applied, and `oc --dry-run` shows the
+rendered prompt.
+
