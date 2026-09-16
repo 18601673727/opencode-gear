@@ -1,21 +1,25 @@
 # Configuration reference
 
 All configuration is JSON. There is no framework, no plugin system and no
-database; the builder is `bin/oc_config.py`, standard library only.
+database. `ocg` is a single Rust binary that embeds the shipped defaults and
+merges overrides on top.
 
 ## Layers
 
 ```text
-1. gear defaults      <gear>/config/*.json
+1. embedded defaults  config/*.json (compiled into ocg)
 2. user config        ~/.config/opencode-gear/config.json
 3. project config     <project>/.opencode-gear.json
-4. CLI / environment  --throttle, OC_GEAR_THROTTLE
+4. CLI / environment  ocg high, --throttle, OPENCODE_GEAR_THROTTLE
 ```
 
 Layers are deep-merged in order. Later layers win; dictionaries merge key by
 key and lists are replaced wholesale.
 
-`oc layers` prints which files were found. `oc status` prints the resolved
+An explicit `OPENCODE_GEAR_HOME` (legacy `OC_GEAR_HOME`) directory containing
+`config/` replaces layer 1 with files from disk.
+
+`ocg layers` prints which files were found. `ocg status` prints the resolved
 values.
 
 ## Override file shape
@@ -61,7 +65,7 @@ Example:
 ```
 
 `variants` is optional and documents the reasoning variants the provider
-really exposes. If present, `oc validate` rejects any configured variant that
+really exposes. If present, `ocg validate` rejects any configured variant that
 is not in the list, which stops invented reasoning levels from sneaking in.
 
 ### `config/throttle.json`
@@ -97,8 +101,10 @@ default.
 ```
 
 The shipped roles are `explore`, `explore-deep`, `build`, `verify`, `debug`
-and `docs`. Adding a role requires a matching prompt and, if you want a
-non-default profile, a `permissions.role_profiles` entry.
+and `docs`, but roles are not hardcoded. Adding a role requires a matching
+prompt and, if you want a non-default profile, a `permissions.role_profiles`
+entry. The generated agent is named `ocg-<role>`, and `{{<role>}}` placeholders
+(underscores for dashes) are substituted in the Lead prompt.
 
 ### `config/permissions.json`
 
@@ -122,6 +128,7 @@ One prompt per role. The Lead prompt is a template and supports:
 | Placeholder | Replaced with |
 | --- | --- |
 | `{{explore}}`, `{{explore_deep}}`, `{{build}}`, `{{verify}}`, `{{debug}}`, `{{docs}}` | the consumer agent id |
+| any custom role, e.g. `{{audit}}` | its `ocg-audit` agent id |
 | `{{throttle}}` | the active level |
 | `{{routing}}` | a generated routing table (+ configured fallbacks) |
 
@@ -147,42 +154,44 @@ without forking it:
 { "prompts": { "lead": { "append": [".opencode/lead-policy.md"] } } }
 ```
 
-The gear keeps the unmodified prompt for every role in `_prompt_defaults`, so
-an append-only override never has to restate the core prompt.
+The gear keeps the unmodified prompt for every role, so an append-only override
+never has to restate the core prompt.
 
 ## Environment variables
 
+`OPENCODE_GEAR_*` is canonical; the legacy `OC_GEAR_*` names are accepted as
+fallbacks.
+
 | Variable | Effect |
 | --- | --- |
-| `OC_GEAR_HOME` | gear installation directory |
-| `OC_GEAR_THROTTLE` | default throttle level |
-| `OC_GEAR_USER_CONFIG` | path to the user override file |
-| `OC_GEAR_PROJECT_CONFIG` | path to the project override file |
-| `OC_GEAR_OPENCODE_BIN` | `opencode` binary to run |
-| `OC_GEAR_PYTHON` | python interpreter |
-| `OC_GEAR_TRACE` | trace file, read only when observability is enabled |
+| `OPENCODE_GEAR_HOME` (legacy `OC_GEAR_HOME`) | load `config/` from this directory instead of the embedded defaults |
+| `OPENCODE_GEAR_THROTTLE` (legacy `OC_GEAR_THROTTLE`) | default throttle level |
+| `OPENCODE_GEAR_USER_CONFIG` (legacy `OC_GEAR_USER_CONFIG`) | path to the user override file |
+| `OPENCODE_GEAR_PROJECT_CONFIG` (legacy `OC_GEAR_PROJECT_CONFIG`) | path to the project override file |
+| `OPENCODE_GEAR_OPENCODE_BIN` / `OC_GEAR_OPENCODE_BIN` | `opencode` binary to run |
+| `OPENCODE_GEAR_TRACE` (legacy `OC_GEAR_TRACE`) | trace file, read only when observability is enabled |
 
-## Builder commands
-
-`oc` wraps these; they are also usable directly:
+## Commands
 
 ```text
-bin/oc_config.py build [--throttle LEVEL] [--cwd DIR] [--pretty]
-bin/oc_config.py validate [--cwd DIR]
-bin/oc_config.py routing [--cwd DIR]
-bin/oc_config.py status [--throttle LEVEL] [--cwd DIR]
-bin/oc_config.py throttle [LEVEL] [--cwd DIR]
-bin/oc_config.py layers [--cwd DIR]
-bin/oc_config.py trace --event launch [--cwd DIR]
+ocg [low|mid|high] [--throttle LEVEL] [--project DIR] [--dry-run] [--pretty] [command] [args...]
+
+ocg build    [--pretty] [--throttle LEVEL] [--project DIR]
+ocg validate [--throttle LEVEL] [--project DIR]
+ocg routing  [--project DIR]
+ocg status   [--throttle LEVEL] [--project DIR]
+ocg throttle [LEVEL] [--project DIR]
+ocg layers   [--project DIR]
+ocg trace    --event launch [--project DIR]
 ```
 
-`build` prints the merged OpenCode config consumed through
+`build` (and `--dry-run`) prints the merged OpenCode config consumed through
 `OPENCODE_CONFIG_CONTENT`. `validate` exits non-zero on any configuration
-error.
+error and prints every problem it finds.
 
 ## Observability
 
-Off by default. When enabled, `oc` appends one JSON line per launch to a local
+Off by default. When enabled, `ocg` appends one JSON line per launch to a local
 file:
 
 ```json

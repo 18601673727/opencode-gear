@@ -1,19 +1,34 @@
 # OpenCode Gear - development targets
 #
-# `make test` runs the unit tests and the CLI smoke tests.
+# `make test` runs the Rust test suite.
+# `make check` runs the full gate: formatting, clippy with warnings denied, tests.
 # `make validate` validates the shipped configuration.
 
-PYTHON ?= python3
+CARGO ?= cargo
 
-.PHONY: test unit cli validate
+.PHONY: all build test check fmt fmt-check clippy validate clean
 
-test: unit cli
+all: check
 
-unit:
-	$(PYTHON) -m unittest discover -s tests -v
+build:
+	$(CARGO) build
 
-cli:
-	bash tests/test_cli.sh
+test:
+	$(CARGO) test
+
+check: fmt-check clippy test
+
+fmt:
+	$(CARGO) fmt
+
+fmt-check:
+	$(CARGO) fmt --check
+
+clippy:
+	$(CARGO) clippy --all-targets -- -D warnings
 
 validate:
-	$(PYTHON) bin/oc_config.py validate
+	$(CARGO) run --quiet -- validate
+
+clean:
+	$(CARGO) clean

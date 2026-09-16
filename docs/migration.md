@@ -50,12 +50,13 @@ Consumer Router = delegated execution routing    EXPLORE / BUILD / VERIFY / DEBU
    `<project>/.opencode-gear.json`, never in the shared core.
 
 7. **Replace mode switching.**
-   - Interactive, per session: `oc --throttle high`, or `Tab` in the TUI.
-   - Persistent default: `oc throttle mid`.
+   - Interactive, per session: `ocg high`, `ocg --throttle high`, or `Tab` in
+     the TUI.
+   - Persistent default: `ocg throttle mid`.
    - Provider-scope restrictions (the old "mode" idea): express them as an
      explicit `models` + `routing` override for that project.
 
-8. **Validate.** `oc validate` must pass, and `oc --dry-run` must show the
+8. **Validate.** `ocg validate` must pass, and `ocg --dry-run` must show the
    agents you expect. Then run one real task.
 
 ## Name mapping cheat-sheet
@@ -67,24 +68,17 @@ Consumer Router = delegated execution routing    EXPLORE / BUILD / VERIFY / DEBU
 | `builder-low/mid/high` | `ocg-build` |
 | `explorer-*` | `ocg-explore`, `ocg-explore-deep` |
 | `verifier-*` | `ocg-verify`, `ocg-debug` |
-| `oc use <mode>` | `oc --throttle <level>` / override file |
-| Lead-Low startup | default `low`; change with `oc throttle` |
+| `oc use <mode>` | `ocg <level>` / `ocg --throttle <level>` / override file |
+| Lead-Low startup | default `low`; change with `ocg throttle` |
 
-## Keeping the old CLI alive during migration
+## Environment variables
 
-If you have muscle memory for an old `oc use ...` command, keep the old script
-on `PATH` under a different name (for example `oc-old`) while you migrate, then
-delete it. Do not keep two scripts named `oc`; the second one on `PATH` wins and
-the failure is confusing.
+The canonical prefix is `OPENCODE_GEAR_*`. The older `OC_GEAR_*` names still
+work, so an existing shell profile does not break. Prefer the new names in new
+scripts; `OC_GEAR_OPENCODE_BIN` is explicitly preserved.
 
-The same applies to any unrelated tool that already owns the name `oc`. `oc` is
-the OpenCode Gear CLI; rename the other tool, or put the gear's `bin/`
-directory earlier on `PATH`.
+## Keeping an old CLI alive during migration
 
-## What intentionally did not carry over
-
-- Whole-bundle "Gear" switching. It is the thing this project exists to remove.
-- Automatic escalation. Escalation is prompt policy in the Lead prompt; there
-  is no scheduler, and pretending otherwise would be misleading.
-- Provider fail-over that silently changes routing. Fallbacks exist but must be
-  declared per role and are always visible.
+`ocg` does not claim the name `oc`. If you have an older `oc` script, it can
+stay on `PATH` while you migrate; invoke the gear as `ocg` during the
+transition, then remove the old script when you are done.

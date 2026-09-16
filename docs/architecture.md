@@ -3,6 +3,10 @@
 OpenCode Gear is deliberately small. This document explains the moving parts
 and, more importantly, the invariants that keep the model sane.
 
+`ocg` is a single self-contained Rust binary. It embeds the shipped registries
+and prompts, resolves the layered configuration in memory, and launches
+`opencode` with the result.
+
 ## The two axes
 
 Most multi-model OpenCode setups start with a single word — "profile" or
@@ -29,6 +33,7 @@ Everything else in the repository exists to keep that true.
 ## Resolution pipeline
 
 ```text
+embedded defaults       config/*.json + config/prompts/*.md (compiled in)
 config/base.json        shared OpenCode config (providers, disabled built-ins)
 config/models.json      model key -> provider + real model id (+ variants)
 config/throttle.json    level -> Lead model key + reasoning variant
@@ -37,7 +42,7 @@ config/permissions.json isolation profiles and role -> profile mapping
 config/prompts/*.md     one prompt per role
         │
         ▼
-bin/oc_config.py        merge defaults → user → project → CLI/env
+src/config.rs           merge defaults → user → project → CLI/env
         │
         ▼
 generated OpenCode config
@@ -50,8 +55,13 @@ generated OpenCode config
 OPENCODE_CONFIG_CONTENT  →  opencode
 ```
 
-`oc` never writes to the repository. The only persisted state is the default
-throttle level in the user config, and only via `oc throttle <level>`.
+`ocg` never writes to the repository. The only persisted state is the default
+throttle level in the user config, and only via `ocg throttle <level>`.
+
+For development and tests, or to load a different set of defaults, set
+`OPENCODE_GEAR_HOME` (legacy `OC_GEAR_HOME`) to a directory containing `config/`.
+Otherwise the compiled-in defaults are used, which is what makes a released
+binary self-contained.
 
 ## Why one agent per throttle level
 
@@ -82,6 +92,10 @@ Sol/Astra  K2.7/K3  DS4.1   GLMfl   GLM5.3 DS4.1   <- replaceable models
 - Reasoning variants are validated against the `variants` list a model
   declares, so a future `Kimi K4` or `DeepSeek V5` is a config edit, not a
   rewrite.
+- Roles are not hardcoded. Adding a role means adding a routing entry, a
+  prompt, and (optionally) a permission profile binding. The generator creates
+  an `ocg-<role>` consumer and substitutes `{{role}}` placeholders in the Lead
+  prompt.
 
 ## Provider binding is deterministic
 
@@ -93,7 +107,7 @@ table so the session cannot quietly pull a model from somewhere else.
 Fallbacks are the only exception, and they are explicit:
 
 - declared per role as `fallback`,
-- surfaced in `oc routing` and in the Lead prompt,
+- surfaced in the rendered Lead prompt and validated by `ocg validate`,
 - intended for provider failure or quota exhaustion only, never a silent
   permanent switch.
 
@@ -159,6 +173,5 @@ Two consequences worth keeping true:
 2. The public core never accumulates one project's domain rules, so it stays
    usable by an unrelated Rust, Go, Python, Java or TypeScript repository.
 
-`oc layers` shows which override file was applied, and `oc --dry-run` shows the
-rendered prompt.
-
+`ocg layers` shows which override file was applied, and `ocg --dry-run` shows
+the rendered prompt.

@@ -1,11 +1,11 @@
 # Troubleshooting
 
-## `oc: could not build the OpenCode Gear config`
+## `ocg: configuration is invalid`
 
 The builder refuses to emit an invalid config. Run:
 
 ```bash
-oc validate
+ocg validate
 ```
 
 The errors name the offending key, for example:
@@ -20,11 +20,13 @@ The errors name the offending key, for example:
 
 ## `opencode: command not found`
 
-`oc` runs `opencode` from `PATH`. Install it, or point the gear at it:
+`ocg` runs `opencode` from `PATH`. Install it, or point the gear at it:
 
 ```bash
-export OC_GEAR_OPENCODE_BIN=/path/to/opencode
+export OPENCODE_GEAR_OPENCODE_BIN=/path/to/opencode
 ```
+
+The legacy `OC_GEAR_OPENCODE_BIN` variable keeps working.
 
 ## Provider or model errors at launch
 
@@ -32,7 +34,7 @@ Model catalogues change faster than documentation. Ask OpenCode what it
 actually exposes with the gear config:
 
 ```bash
-oc models
+ocg models
 opencode models openai --verbose
 opencode models volcengine-coding --verbose
 ```
@@ -63,7 +65,7 @@ If your plan exposes a different alias, add it to that block and to
 Permissions are OpenCode agent config, not prompt text.
 
 ```bash
-oc --dry-run | python3 -m json.tool | less
+ocg build --pretty | less
 ```
 
 Confirm the agent's `permission` block, and check that your project does not
@@ -78,20 +80,23 @@ The cycle depends on the three `lead-*` agents and on `keybinds` (shipped in
   the default agent. With the default `lead-low` startup, `Tab` runs
   low → mid → high.
 - If you override `keybinds`, your override wins. Inspect the resolved value
-  with `oc --dry-run`.
+  with `ocg --dry-run`.
 
 ## Overrides seem to be ignored
 
 ```bash
-oc layers
+ocg layers
 ```
 
 prints every layer and whether it was found. Common causes:
 
-- `OC_GEAR_USER_CONFIG` / `OC_GEAR_PROJECT_CONFIG` point somewhere unexpected.
-  An explicitly configured path wins over directory discovery.
+- `OPENCODE_GEAR_USER_CONFIG` / `OPENCODE_GEAR_PROJECT_CONFIG` (or their legacy
+  `OC_GEAR_*` names) point somewhere unexpected. An explicitly configured path
+  wins over directory discovery.
 - You edited the gear's `config/` but a project override re-sets the same key.
-- The override is not valid JSON. `oc validate` reports the parse error.
+  Note that a released binary embeds its defaults; to load `config/` from a
+  directory at runtime, set `OPENCODE_GEAR_HOME`.
+- The override is not valid JSON. `ocg validate` reports the parse error.
 
 ## The Lead delegates too much (or too little)
 
@@ -104,12 +109,12 @@ behaviour; they do not enforce it.
 Project policy is applied through the project override. Check:
 
 ```bash
-oc layers                      # is the project layer [found]?
-oc --dry-run | python3 -c "import json,sys; print(json.load(sys.stdin)['agent']['lead-low']['prompt'])" | tail -40
+ocg layers                      # is the project layer [found]?
+ocg build --pretty | less       # inspect agent.lead-low.prompt
 ```
 
-`oc` reads `<cwd>/.opencode-gear.json`; run it from the project root, or point
-`OC_GEAR_PROJECT_CONFIG` at the file. If the override sets
+`ocg` reads `<cwd>/.opencode-gear.json`; run it from the project root, or point
+`OPENCODE_GEAR_PROJECT_CONFIG` at the file. If the override sets
 `prompts.lead.path`, it **replaces** the gear prompt, so append instead:
 
 ```json
@@ -124,7 +129,7 @@ the Lead's Task tool, which is the normal path. To smoke-test routing, ask the
 Lead to delegate explicitly, for example:
 
 ```bash
-oc run 'Call the task tool once with subagent_type "ocg-build" and prompt "reply OK".'
+ocg run 'Call the task tool once with subagent_type "ocg-build" and prompt "reply OK".'
 ```
 
 You can confirm which model actually ran by checking the OpenCode log or the

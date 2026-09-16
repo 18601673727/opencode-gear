@@ -1,0 +1,26 @@
+[package]
+name = "opencode-gear"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Project-agnostic multi-model orchestration for OpenCode"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/18601673727/opencode-gear"
+keywords = ["opencode", "ai", "agents", "cli"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "ocg"
+path = "src/main.rs"
+
+[lib]
+name = "opencode_gear"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.release]
+lto = true
+strip = true

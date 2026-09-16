@@ -1,5 +1,5 @@
 {
-  "$comment": "Example PROJECT override. Copy to <project>/.opencode-gear.json and keep only the keys you need. This file is read automatically when `oc` runs in that project directory, and is deep-merged over the gear defaults and over your user config. Nothing here belongs in the OpenCode Gear repository itself.",
+  "$comment": "Example PROJECT override. Copy to <project>/.opencode-gear.json and keep only the keys you need. This file is read automatically when `ocg` runs in that project directory, and is deep-merged over the gear defaults and over your user config. Nothing here belongs in the OpenCode Gear repository itself.",
   "throttle": {
     "default": "mid"
   },

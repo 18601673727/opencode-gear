@@ -1,8 +1,5 @@
-# Python
-__pycache__/
-*.py[cod]
-.venv/
-venv/
+# Rust
+/target/
 
 # Local gear state and per-project overrides
 .opencode-gear.json

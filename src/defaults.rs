@@ -1,0 +1,150 @@
+//! Shipped defaults.
+//!
+//! The release binary embeds `config/*.json` and `config/prompts/*.md` so it is
+//! self-contained. For development and tests a gear home directory with the
+//! same layout can be supplied through `OPENCODE_GEAR_HOME` (legacy
+//! `OC_GEAR_HOME`), and its files replace the embedded defaults.
+
+use crate::error::{GearError, Result};
+use crate::json::{parse_json_object, read_json_object};
+use serde_json::{json, Map, Value};
+use std::path::PathBuf;
+
+/// The orchestrating role. There is exactly one Lead prompt, shared by every
+/// throttle level.
+pub const LEAD_ROLE: &str = "lead";
+
+/// The three required Lead tiers.
+pub const LEAD_LEVELS: [&str; 3] = ["low", "mid", "high"];
+
+/// Shipped consumer roles. Routing roles are otherwise open-ended; these are
+/// only the roles that ship with a default prompt.
+pub const CONSUMER_ROLES: [&str; 6] = [
+    "explore",
+    "explore-deep",
+    "build",
+    "verify",
+    "debug",
+    "docs",
+];
+
+/// Consumer agent ids are namespaced so they cannot collide with a repository's
+/// own agents.
+pub const CONSUMER_AGENT_PREFIX: &str = "ocg-";
+
+/// Inserted between the gear prompt for a role and each appended project block.
+pub const PROMPT_APPEND_SEPARATOR: &str = "\n\n---\n\n";
+
+/// Internal marker for "use the embedded prompt for this role". A NUL byte
+/// cannot appear in a real path, so it can never collide with a user file.
+pub const EMBEDDED_PROMPT_PREFIX: &str = "\u{0}embedded:";
+
+const BASE_JSON: &str = include_str!("../config/base.json");
+const MODELS_JSON: &str = include_str!("../config/models.json");
+const PERMISSIONS_JSON: &str = include_str!("../config/permissions.json");
+const ROUTING_JSON: &str = include_str!("../config/routing.json");
+const THROTTLE_JSON: &str = include_str!("../config/throttle.json");
+
+const LEAD_PROMPT: &str = include_str!("../config/prompts/lead.md");
+const EXPLORE_PROMPT: &str = include_str!("../config/prompts/explore.md");
+const EXPLORE_DEEP_PROMPT: &str = include_str!("../config/prompts/explore-deep.md");
+const BUILD_PROMPT: &str = include_str!("../config/prompts/build.md");
+const VERIFY_PROMPT: &str = include_str!("../config/prompts/verify.md");
+const DEBUG_PROMPT: &str = include_str!("../config/prompts/debug.md");
+const DOCS_PROMPT: &str = include_str!("../config/prompts/docs.md");
+
+/// Where the default registries and prompts come from.
+#[derive(Debug, Clone)]
+pub enum GearSource {
+    /// The config compiled into the binary. Used by released binaries.
+    Embedded,
+    /// A gear home containing `config/`, used for development, tests and
+    /// power-user overrides.
+    Dir(PathBuf),
+}
+
+/// Roles that ship with a default prompt, Lead first.
+pub fn default_prompt_roles() -> Vec<&'static str> {
+    let mut roles = Vec::with_capacity(1 + CONSUMER_ROLES.len());
+    roles.push(LEAD_ROLE);
+    roles.extend(CONSUMER_ROLES);
+    roles
+}
+
+/// The embedded prompt for a role, if one is compiled in.
+pub fn embedded_prompt(role: &str) -> Option<&'static str> {
+    match role {
+        "lead" => Some(LEAD_PROMPT),
+        "explore" => Some(EXPLORE_PROMPT),
+        "explore-deep" => Some(EXPLORE_DEEP_PROMPT),
+        "build" => Some(BUILD_PROMPT),
+        "verify" => Some(VERIFY_PROMPT),
+        "debug" => Some(DEBUG_PROMPT),
+        "docs" => Some(DOCS_PROMPT),
+        _ => None,
+    }
+}
+
+/// Build the base effective configuration (before user/project overrides).
+pub fn load_defaults(source: &GearSource) -> Result<Value> {
+    let (models, throttle, routing, permissions, base, prompt_dir) = match source {
+        GearSource::Embedded => (
+            parse_json_object("config/models.json", MODELS_JSON)?,
+            parse_json_object("config/throttle.json", THROTTLE_JSON)?,
+            parse_json_object("config/routing.json", ROUTING_JSON)?,
+            parse_json_object("config/permissions.json", PERMISSIONS_JSON)?,
+            parse_json_object("config/base.json", BASE_JSON)?,
+            None,
+        ),
+        GearSource::Dir(home) => {
+            let config = home.join("config");
+            (
+                read_json_object(&config.join("models.json"))?,
+                read_json_object(&config.join("throttle.json"))?,
+                read_json_object(&config.join("routing.json"))?,
+                read_json_object(&config.join("permissions.json"))?,
+                read_json_object(&config.join("base.json"))?,
+                Some(config.join("prompts")),
+            )
+        }
+    };
+
+    require_key(&models, "providers", "config/models.json")?;
+    require_key(&models, "models", "config/models.json")?;
+    require_key(&throttle, "default", "config/throttle.json")?;
+    require_key(&throttle, "levels", "config/throttle.json")?;
+    require_key(&routing, "roles", "config/routing.json")?;
+
+    let mut prompts = Map::new();
+    let mut prompt_defaults = Map::new();
+    for role in default_prompt_roles() {
+        let value = match &prompt_dir {
+            None => Value::String(format!("{EMBEDDED_PROMPT_PREFIX}{role}")),
+            Some(dir) => Value::String(
+                dir.join(format!("{role}.md"))
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        };
+        prompts.insert(role.to_string(), value.clone());
+        prompt_defaults.insert(role.to_string(), value);
+    }
+
+    Ok(json!({
+        "throttle": throttle,
+        "models": models,
+        "routing": routing,
+        "permissions": permissions,
+        "base": base,
+        "prompts": prompts,
+        "_prompt_defaults": prompt_defaults,
+        "observability": {"enabled": false, "path": Value::Null},
+    }))
+}
+
+fn require_key(value: &Value, key: &str, label: &str) -> Result<()> {
+    if value.get(key).is_none() {
+        return Err(GearError::config(format!("{label} is missing '{key}'")));
+    }
+    Ok(())
+}

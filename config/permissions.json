@@ -1,5 +1,5 @@
 {
-  "$comment": "Agent isolation / least-privilege rules, applied by oc-config.py to the generated consumer agents. Permission rules are last-match-wins: a key with a string value applies to resource '*'; an object maps a resource pattern to an effect. 'task' resources are subagent names. Profiles are named bundles; role_profiles binds a role to a profile. Override any of this in your user/project config.",
+  "$comment": "Agent isolation / least-privilege rules, applied by the Rust configuration engine to the generated consumer agents. Permission rules are last-match-wins: a key with a string value applies to resource '*'; an object maps a resource pattern to an effect. 'task' resources are subagent names. Profiles are named bundles; role_profiles binds a role to a profile. Override any of this in your user/project config.",
   "profiles": {
     "read_only": {
       "*": "deny",

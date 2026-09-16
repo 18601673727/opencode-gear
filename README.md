@@ -1,9 +1,10 @@
 # OpenCode Gear
 
-**OC Gear** — project-agnostic multi-model orchestration for OpenCode.
+**OpenCode Gear** (`ocg`) — project-agnostic multi-model orchestration for
+[OpenCode](https://opencode.ai).
 
-OpenCode Gear is a small configuration layer for [OpenCode](https://opencode.ai)
-that separates two things a lot of agent setups accidentally fuse together:
+OpenCode Gear is a small configuration layer that separates two things a lot of
+agent setups accidentally fuse together:
 
 ```text
 THROTTLE
@@ -36,7 +37,7 @@ specialists that are good at their one job and cheap enough to use often.
 
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
-- [Install](#install)
+- [Build from source](#build-from-source)
 - [Quick start](#quick-start)
 - [Throttle semantics](#throttle-semantics)
 - [Consumer Router semantics](#consumer-router-semantics)
@@ -44,6 +45,7 @@ specialists that are good at their one job and cheap enough to use often.
 - [Configuration and overrides](#configuration-and-overrides)
 - [Project-local policy](#project-local-policy)
 - [Commands](#commands)
+- [Environment variables](#environment-variables)
 - [Isolation and permissions](#isolation-and-permissions)
 - [Security and secrets](#security-and-secrets)
 - [Observability (optional)](#observability-optional)
@@ -78,22 +80,23 @@ OpenAI Lead                      ← throttle picks the tier
    (Volcano)        Flash (Go)      Flash (Go)    GLM-5.3 (Go)
 ```
 
-`oc` resolves the configuration in layers, then launches `opencode` with the
-merged result:
+`ocg` is a self-contained Rust binary. It embeds the shipped configuration and
+prompts at build time, resolves the effective configuration in layers, then
+launches `opencode` with the merged result through `OPENCODE_CONFIG_CONTENT`:
 
 ```text
-OpenCode Gear defaults  (this repository)
+OpenCode Gear embedded defaults  (compiled into ocg)
         ↓
-user config             (~/.config/opencode-gear/config.json)
+user config                      (~/.config/opencode-gear/config.json)
         ↓
-project config          (<project>/.opencode-gear.json)
+project config                   (<project>/.opencode-gear.json)
         ↓
-CLI / environment       (oc --throttle high, OC_GEAR_THROTTLE)
+CLI / environment                (ocg high, --throttle, OPENCODE_GEAR_THROTTLE)
 ```
 
 Nothing is written back into the repository or into the project. The only
 persisted state is the default throttle level, and only when you ask for it
-with `oc throttle <level>`.
+with `ocg throttle <level>`.
 
 OpenCode binds exactly one model per agent, so the gear materialises:
 
@@ -109,9 +112,8 @@ during a session cannot silently re-route BUILD or VERIFY.
 
 | Requirement | Notes |
 | --- | --- |
-| OpenCode | 1.18.x or newer. `oc` uses `OPENCODE_CONFIG_CONTENT`. |
-| Python 3.9+ | Standard library only. Used by `bin/oc_config.py`. |
-| Bash | `bin/oc` is a POSIX-ish bash script. |
+| Rust 1.74+ | Build-time only; the released `ocg` binary is self-contained. |
+| OpenCode | 1.18.x or newer. `ocg` uses `OPENCODE_CONFIG_CONTENT`. |
 | OpenAI plan/credentials | For the Lead (`openai` provider). |
 | Volcano Coding Plan Pro | For the EXPLORE models (Kimi). Declared in `config/base.json`. |
 | OpenCode Go | For BUILD / VERIFY / DEBUG (DeepSeek and GLM). |
@@ -125,40 +127,34 @@ opencode auth login opencode-go
 ```
 
 The exact provider ids depend on your OpenCode build; check the list with
-`opencode auth login` or `oc models`.
+`opencode auth login` or `ocg models`.
 
-## Install
-
-Global install (recommended):
+## Build from source
 
 ```bash
-git clone https://github.com/18601673727/opencode-gear.git ~/.local/share/opencode-gear
-ln -s ~/.local/share/opencode-gear/bin/oc ~/.local/bin/oc   # ~/.local/bin must be on PATH
-oc validate
+git clone https://github.com/18601673727/opencode-gear.git
+cd opencode-gear
+cargo build --release
+# binary: target/release/ocg
 ```
 
-`oc` follows symlinks, so the symlink above is enough. If you prefer an
-explicit location, set `OC_GEAR_HOME`:
+Put `target/release/ocg` on your `PATH` (for example by copying it into a
+directory that is already there). Packaging and an installer are intentionally
+out of scope for this change.
 
-```bash
-export OC_GEAR_HOME=~/code/opencode-gear
-```
-
-Per-project vendoring (useful if you want the gear pinned inside a repo):
-
-```bash
-git clone https://github.com/18601673727/opencode-gear.git <project>/.opencode-gear
-<project>/.opencode-gear/bin/oc --project <project> --dry-run
-```
+`ocg` is the OpenCode Gear CLI. If you already have a different tool installed
+under a similar name, choose the name you invoke accordingly; `ocg` does not
+shadow it.
 
 ## Quick start
 
 ```bash
-oc status                  # throttle, routing and the config layers in use
-oc routing                 # role -> model table
-oc --throttle mid          # interactive session with the mid Lead
-oc run "summarise the failing tests"   # one-shot run
-oc --dry-run               # print the merged OpenCode config, launch nothing
+ocg status                  # throttle, routing and the config layers in use
+ocg routing                 # role -> model table
+ocg mid                     # interactive session with the mid Lead
+ocg --throttle high         # same thing spelled explicitly
+ocg run "summarise the failing tests"   # one-shot run
+ocg --dry-run               # print the merged OpenCode config, launch nothing
 ```
 
 Run these from any project directory. OpenCode starts in the current working
@@ -177,20 +173,20 @@ Throttle selects the OpenAI Lead tier only.
 
 Notes:
 
-- The model ids and reasoning variants are the ones the providers actually
-  expose, and they are centralised in `config/models.json` and
-  `config/throttle.json`. Swap a model there and nothing else changes.
+- The model ids and reasoning variants are centralised in `config/models.json`
+  and `config/throttle.json`. Swap a model there and nothing else changes.
 - If a provider does not expose a reasoning variant, omit `variant` and the
   provider default is used.
 - **Throttle never decides which consumer handles EXPLORE / BUILD / VERIFY.**
-- Precedence: `--throttle` > `OC_GEAR_THROTTLE` > project config > user config
-  > `config/throttle.json` default.
+- Precedence: positional `ocg high` / `--throttle` > `OPENCODE_GEAR_THROTTLE`
+  (legacy `OC_GEAR_THROTTLE`) > project config > user config >
+  `config/throttle.json` default.
 
 Persist a default (writes `~/.config/opencode-gear/config.json`):
 
 ```bash
-oc throttle mid
-oc throttle          # print the resolved default
+ocg throttle mid
+ocg throttle          # print the resolved default
 ```
 
 ## Consumer Router semantics
@@ -203,6 +199,9 @@ oc throttle          # print the resolved default
 | VERIFY | Independently inspect a completed diff against acceptance criteria; look for missed files, API/type/state inconsistencies, regressions. | read + tests |
 | DEBUG | Escalation target: difficult debugging, root-cause analysis, architecture-sensitive review, problems BUILD failed to resolve. | read + tests |
 | DOCS | Factual closeout reports and handoff notes after work is verified. | read/write |
+
+Roles are arbitrary: you can add a new role with its own model and prompt in an
+override. The shipped six roles are the baseline, not a hard limit.
 
 OpenAI is **not** part of the normal consumer pool. The Lead is the only
 OpenAI agent.
@@ -226,8 +225,8 @@ enforce them mechanically, so the Lead prompt encodes them explicitly:
 
 ### Fallbacks
 
-A role may declare an optional `fallback` model. Fallbacks are shown in
-`oc routing` and injected into the Lead prompt, and are meant for provider
+A role may declare an optional `fallback` model. Fallbacks are shown in the
+Lead prompt (and validated by `ocg validate`), and are meant for provider
 failure or quota exhaustion only. A fallback must never become the silent
 default. By default no fallbacks are configured.
 
@@ -279,7 +278,7 @@ plus the gear-only extras `prompts`, `observability` and `opencode`.
   // "prompts": { "lead": "~/prompts/my-lead.md" },
 
   // optional local routing trace
-  "observability": { "enabled": true, "path": "~/state/oc-gear-events.jsonl" },
+  "observability": { "enabled": true, "path": "~/state/opencode-gear/events.jsonl" },
 
   // raw OpenCode config merged into the result last
   "opencode": { "username": "you" }
@@ -292,17 +291,19 @@ To redefine a throttle level, override the `throttle` registry itself:
 { "throttle": { "levels": { "high": { "model": "astra", "variant": "xhigh" } } } }
 ```
 
-Locations and how to point `oc` at a different file:
+Locations:
 
 | Layer | Default path | Override with |
 | --- | --- | --- |
-| User | `~/.config/opencode-gear/config.json` | `OC_GEAR_USER_CONFIG` (or `--user-config` on `bin/oc_config.py`) |
-| Project | `<project>/.opencode-gear.json` | `OC_GEAR_PROJECT_CONFIG` (or `--project-config` on `bin/oc_config.py`) |
+| User | `~/.config/opencode-gear/config.json` | `OPENCODE_GEAR_USER_CONFIG` (legacy `OC_GEAR_USER_CONFIG`) or `--user-config` |
+| Project | `<project>/.opencode-gear.json` | `OPENCODE_GEAR_PROJECT_CONFIG` (legacy `OC_GEAR_PROJECT_CONFIG`) or `--project-config` |
 
-Precedence is project over user over defaults. Validate at any time:
+`ocg --project DIR` resolves the project layer against `DIR` and launches
+OpenCode there. Precedence is project over user over defaults. Validate at any
+time:
 
 ```bash
-oc validate
+ocg validate
 ```
 
 Validation catches unknown model keys, unknown providers, reasoning variants
@@ -310,7 +311,8 @@ that a model does not expose, missing prompts and malformed fallbacks, and it
 refuses to build a config that would otherwise fail at runtime.
 
 Prompt paths may be absolute, or relative — relative paths are resolved against
-the project directory first, then the gear's `config/` directory.
+the project directory first, then the gear's `config/` directory when a gear
+home is in use.
 
 ## Project-local policy
 
@@ -355,7 +357,7 @@ project-agnostic.
 ## Commands
 
 ```text
-oc [--throttle low|mid|high] [--project DIR] [--dry-run] [command] [args...]
+ocg [low|mid|high] [--throttle low|mid|high] [--project DIR] [--dry-run] [command] [args...]
 
 (none)              launch interactive OpenCode with the gear config
 run <args...>       launch `opencode run`
@@ -365,6 +367,7 @@ routing             consumer role -> model table
 throttle [level]    print, or persist, the default throttle level
 validate            validate the merged configuration
 layers              show config layers and trace state
+build               print the resolved OpenCode config
 version             print the version
 help                print usage
 ```
@@ -374,10 +377,20 @@ order depends on the active `default_agent`; the default configuration starts
 at `lead-low`. If you do not want the keybind, remove `keybinds` from
 `config/base.json` or override it in your project config.
 
-`oc` is the OpenCode Gear CLI. If you already have a different tool installed
-under the same name, rename it or remove it from `PATH` so the gear owns the
-command; the install snippet above puts the gear's `bin/` on `PATH` directly.
-`oc` follows symlinks, so a symlink on `PATH` is enough.
+## Environment variables
+
+`OPENCODE_GEAR_*` is the canonical prefix. The older `OC_GEAR_*` names are
+accepted as fallbacks for compatibility, and `OC_GEAR_OPENCODE_BIN` keeps
+working explicitly.
+
+| Variable | Effect |
+| --- | --- |
+| `OPENCODE_GEAR_HOME` (legacy `OC_GEAR_HOME`) | load `config/` from this directory instead of the embedded defaults |
+| `OPENCODE_GEAR_THROTTLE` (legacy `OC_GEAR_THROTTLE`) | default throttle level |
+| `OPENCODE_GEAR_USER_CONFIG` (legacy `OC_GEAR_USER_CONFIG`) | path to the user override file |
+| `OPENCODE_GEAR_PROJECT_CONFIG` (legacy `OC_GEAR_PROJECT_CONFIG`) | path to the project override file |
+| `OPENCODE_GEAR_OPENCODE_BIN` / `OC_GEAR_OPENCODE_BIN` | `opencode` binary to run |
+| `OPENCODE_GEAR_TRACE` (legacy `OC_GEAR_TRACE`) | trace file, read only when observability is enabled |
 
 ## Isolation and permissions
 
@@ -420,7 +433,7 @@ replaced per project.
 
 ## Observability (optional)
 
-Disabled by default. When enabled, `oc` appends one JSON line per launch to a
+Disabled by default. When enabled, `ocg` appends one JSON line per launch to a
 local file — never to a remote service:
 
 ```json
@@ -435,21 +448,22 @@ local file — never to a remote service:
   Success/failure, retry counts and duration are **not** captured — that needs
   a session-level hook, which this project deliberately does not ship yet.
 - Enable with `"observability": {"enabled": true, "path": "~/..."}`, or point
-  `OC_GEAR_TRACE` at a file. Delete the file to delete the history.
+  `OPENCODE_GEAR_TRACE` at a file. Delete the file to delete the history.
 
 ## Troubleshooting
 
-**`oc: could not build the OpenCode Gear config`** — run `oc validate`; the
-builder refuses to emit an invalid config. The error names the offending key.
+**`ocg: configuration is invalid`** — run `ocg validate`; the builder refuses to
+emit an invalid config, and the error names the offending key.
 
-**`opencode: command not found`** — `oc` runs `opencode` from `PATH`. Set
-`OC_GEAR_OPENCODE_BIN=/path/to/opencode`.
+**`opencode: command not found`** — `ocg` runs `opencode` from `PATH`. Set
+`OPENCODE_GEAR_OPENCODE_BIN=/path/to/opencode` (or the legacy
+`OC_GEAR_OPENCODE_BIN`).
 
 **Provider/model errors on launch** — the model names and provider ids move
 faster than this README. Check what your OpenCode actually exposes:
 
 ```bash
-oc models                       # everything OpenCode can see with this config
+ocg models                       # everything OpenCode can see with this config
 opencode models openai --verbose
 ```
 
@@ -463,23 +477,34 @@ another alias.
 
 **A consumer ignores its read-only permission** — permissions are OpenCode
 agent config, not prompt text. Confirm the active agent is the generated one
-(`oc --dry-run` and inspect `agent.<name>.permission`), and that your project
-does not override it.
+(`ocg build --pretty` and inspect `agent.<name>.permission`), and that your
+project does not override it.
 
 **Tab does not cycle the Lead** — the cycle depends on the three `lead-*`
 agents and on `keybinds`. Inspect the generated `keybinds` with
-`oc --dry-run`, and note that the order shifts with `default_agent`.
+`ocg --dry-run`, and note that the order shifts with `default_agent`.
 
-**Overrides seem ignored** — `oc layers` shows exactly which files were found.
-Check `OC_GEAR_USER_CONFIG` / `OC_GEAR_PROJECT_CONFIG` are not pointing
-somewhere unexpected.
+**Overrides seem ignored** — `ocg layers` shows exactly which files were found.
+Check `OPENCODE_GEAR_USER_CONFIG` / `OPENCODE_GEAR_PROJECT_CONFIG` (or their
+legacy names) are not pointing somewhere unexpected.
 
 ## Repository layout
 
 ```text
 opencode-gear/
-  bin/oc                 bash entry point (`oc` command)
-  bin/oc_config.py       configuration builder (stdlib-only Python)
+  Cargo.toml             crate manifest; builds the `ocg` binary
+  src/main.rs            binary entry point
+  src/lib.rs             library root
+  src/cli.rs             argument parsing, environment, dispatch
+  src/config.rs          layered configuration and paths
+  src/defaults.rs        embedded defaults + optional on-disk gear home
+  src/model.rs           model registry and role resolution
+  src/prompt.rs          frontmatter, append and Lead rendering
+  src/validate.rs        whole-configuration validation
+  src/build.rs           deterministic OpenCode config generation
+  src/report.rs          status / routing / layers output
+  src/observability.rs   opt-in local routing trace
+  src/process.rs         the single place that executes a child process
   config/base.json        shared OpenCode config (providers, disabled built-ins)
   config/models.json      model/provider registry
   config/throttle.json    throttle level -> Lead model + reasoning variant
@@ -487,23 +512,25 @@ opencode-gear/
   config/permissions.json agent isolation profiles
   config/prompts/*.md     one prompt per role
   examples/               override file examples
-  tests/                  unit tests + CLI smoke tests
+  tests/                  Rust unit and integration tests
   docs/                   architecture, configuration, migration, troubleshooting
-  Makefile               `make test`, `make validate`
+  Makefile               `make test`, `make check`, `make validate`
 ```
 
 ## Tests
 
 ```bash
-make test        # python3 -m unittest discover -s tests -v  +  bash tests/test_cli.sh
+make check       # cargo fmt --check + cargo clippy -- -D warnings + cargo test
+make test        # cargo test
 make validate    # validate the shipped configuration
 ```
 
 The suite covers configuration parsing, throttle selection, Lead selection,
 EXPLORE (normal and deep), BUILD, VERIFY, DEBUG, provider binding,
 missing-provider and missing-model behaviour, variant validation, override
-precedence, isolation rules, the opt-in trace, and repository hygiene (no
-private tokens, no credential shapes, no absolute home paths).
+precedence, arbitrary roles, prompt appending, isolation rules, the opt-in
+trace, embedded-vs-disk parity, and repository hygiene (no private tokens, no
+credential shapes, no absolute home paths).
 
 ## Migrating from an older Gear/profile setup
 
@@ -527,7 +554,7 @@ Practical mapping:
 | Old per-gear duplicate consumer agents | one consumer agent per role, shared by all Leads |
 | Per-gear explorer/builder/verifier model swaps | `config/routing.json` |
 | "Mode" / provider-scope presets | project or user override files |
-| `oc use <mode>` interactive switching | `oc --throttle <level>`, `oc throttle <level>`, or Tab in the TUI |
+| `oc use <mode>` interactive switching | `ocg <level>` / `ocg --throttle <level>` / Tab in the TUI |
 
 If you have an existing `oc` that switched whole profiles, keep it working by
 leaving it on your `PATH` under a different name while you migrate, or map its
@@ -541,7 +568,7 @@ walkthrough.
 | Document | Contents |
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | The two axes, resolution pipeline, invariants, extension points |
-| [docs/configuration.md](docs/configuration.md) | Every registry, override shape, environment variable and builder command |
+| [docs/configuration.md](docs/configuration.md) | Every registry, override shape, environment variable and command |
 | [docs/migration.md](docs/migration.md) | Step-by-step migration from a whole-bundle Gear/profile setup |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Failure modes and how to diagnose them |
 
