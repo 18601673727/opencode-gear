@@ -22,7 +22,11 @@ fn base_command(cwd: &Path, work: &Path) -> Command {
         .env_remove("OC_GEAR_THROTTLE")
         .env_remove("OC_GEAR_HOME")
         .env_remove("OC_GEAR_TRACE")
-        .env_remove("OC_GEAR_OPENCODE_BIN");
+        .env_remove("OC_GEAR_OPENCODE_BIN")
+        .env_remove("OPENCODE_GEAR_OPENCODE")
+        .env_remove("OPENCODE_GEAR_OPENCODE_BIN")
+        .env_remove("OPENCODE_GEAR_API_BASE")
+        .env_remove("OPENCODE_GEAR_CACHE_DIR");
     command
 }
 

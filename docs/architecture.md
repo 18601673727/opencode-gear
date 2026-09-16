@@ -55,13 +55,73 @@ generated OpenCode config
 OPENCODE_CONFIG_CONTENT  →  opencode
 ```
 
-`ocg` never writes to the repository. The only persisted state is the default
-throttle level in the user config, and only via `ocg throttle <level>`.
+The config pipeline never writes to the repository. Its only persisted state
+is the default throttle level in the user config, and only via
+`ocg throttle <level>`. The runtime layer adds an optional project-local
+runtime tree and an update-check cache; see [Managed runtime](#managed-runtime)
+below.
 
 For development and tests, or to load a different set of defaults, set
 `OPENCODE_GEAR_HOME` (legacy `OC_GEAR_HOME`) to a directory containing `config/`.
 Otherwise the compiled-in defaults are used, which is what makes a released
 binary self-contained.
+
+## Managed runtime
+
+The config pipeline is pure: it never needs a process. The runtime layer is
+the opposite, so it is isolated behind three injected traits:
+
+```text
+HttpTransport   release metadata + archive downloads (reqwest blocking/rustls)
+Clock           update-check timestamps and install times
+ProcessHost     PATH lookup, `opencode --version`, and `opencode upgrade`
+```
+
+`RuntimeManager` combines those with the project root and the parsed `runtime`
+policy. It resolves exactly one executable per launch:
+
+```text
+explicit OPENCODE_GEAR_OPENCODE
+  -> existing managed project runtime
+  -> compatible system opencode on PATH
+  -> project-local bootstrap install
+```
+
+Invariants:
+
+- **One floor.** `OPENCODE_CONFIG_CONTENT` requires OpenCode `>= 1.18.0`; the
+  constant lives only in `runtime::policy`.
+- **Explicit is authoritative.** A broken explicit executable errors; it never
+  falls back to a managed or system runtime.
+- **Managed beats system.** Once a project is bootstrapped it stays
+  deterministic.
+- **No redundant install.** A compatible system runtime is used as-is when no
+  managed runtime exists. A due check runs OpenCode's own `opencode upgrade`
+  in place, never a managed copy.
+- **System runtimes upgrade themselves.** `ProcessHost::upgrade` is the only
+  path for an existing system runtime. If it fails, `ocg` warns and keeps the
+  old compatible runtime; if the system is incompatible and the upgrade fails,
+  it bootstraps a project-local runtime.
+- **`autoUpgrade` is optional-only.** Setting it to `false` disables the
+  optional system upgrades but never disables the required project-local
+  fallback for a missing or incompatible runtime.
+- **Pins are exact.** A `runtime.version` pin is never advanced, is managed
+  only (no system upgrade), and `ocg upgrade` preserves it.
+- **Checks are cached.** Successful *and* failed checks are cached for
+  `checkIntervalHours` in the platform cache directory, so launches do not
+  network (or re-upgrade) every time. `ocg upgrade` forces a check.
+- **Installs are atomic and fail closed.** Archives are staged in a sibling
+  directory, verified against the API `sha256:` digest (a missing digest is
+  refused), then moved into place; `active.json` is written atomically. The
+  recorded path is never trusted: the binary is re-derived from the semver and
+  must be executable.
+- **Self-update is safe.** `ocg upgrade` downloads the Gear binary plus
+  `SHA256SUMS`, verifies the checksum, runs the staged binary's `version` and
+  requires it to match the release, then renames it over the running
+  executable. Any failure leaves the installed CLI untouched.
+
+The update checks and self-update are the only network paths, and both are
+bypassed by `ocg version` and `ocg doctor`, which are strictly read-only.
 
 ## Why one agent per throttle level
 

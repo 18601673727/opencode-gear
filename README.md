@@ -36,9 +36,11 @@ specialists that are good at their one job and cheap enough to use often.
 ## Contents
 
 - [How it works](#how-it-works)
+- [Install](#install)
 - [Requirements](#requirements)
 - [Build from source](#build-from-source)
 - [Quick start](#quick-start)
+- [Managed runtime](#managed-runtime)
 - [Throttle semantics](#throttle-semantics)
 - [Consumer Router semantics](#consumer-router-semantics)
 - [Provider and model mapping](#provider-and-model-mapping)
@@ -94,9 +96,10 @@ project config                   (<project>/.opencode-gear.json)
 CLI / environment                (ocg high, --throttle, OPENCODE_GEAR_THROTTLE)
 ```
 
-Nothing is written back into the repository or into the project. The only
-persisted state is the default throttle level, and only when you ask for it
-with `ocg throttle <level>`.
+The config pipeline writes nothing back into the repository or the project.
+The persisted state is the default throttle level (only when you ask for it
+with `ocg throttle <level>`), plus the optional managed runtime and its update
+cache described in [Managed runtime](#managed-runtime).
 
 OpenCode binds exactly one model per agent, so the gear materialises:
 
@@ -108,15 +111,65 @@ OpenCode binds exactly one model per agent, so the gear materialises:
 Because the consumer agents do not depend on the throttle, switching throttle
 during a session cannot silently re-route BUILD or VERIFY.
 
+## Install
+
+One line, no `sudo`, no Homebrew, no Node, no `git`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/18601673727/opencode-gear/main/install.sh | sh
+```
+
+The installer downloads the `ocg` binary for your platform, verifies it
+against the release `SHA256SUMS`, and atomically installs it to
+`~/.local/bin/ocg`. It then prints the `PATH` line to add if that directory is
+not already on your `PATH`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+To pin a release, or to choose another directory:
+
+```bash
+OPENCODE_GEAR_VERSION=v0.2.0 sh install.sh
+OPENCODE_GEAR_INSTALL_DIR="$HOME/bin" sh install.sh
+```
+
+Supported platforms:
+
+| OS | Architecture | Artifact |
+| --- | --- | --- |
+| Linux | x86_64 / amd64 | `ocg-linux-x86_64` |
+| Linux | arm64 / aarch64 | `ocg-linux-arm64` |
+| macOS (Darwin) | x86_64 | `ocg-darwin-x86_64` |
+| macOS (Darwin) | arm64 / Apple silicon | `ocg-darwin-arm64` |
+
+The installer is a plain POSIX `sh` script using only `curl`, `mktemp` and
+`shasum`/`sha256sum`. It downloads into a unique temporary file inside the
+install directory, verifies the release `SHA256SUMS`, runs the staged binary's
+own `version` before replacing anything, and only then moves it into place.
+A failure at any step keeps the existing installation untouched. It never
+edits your shell startup files and never installs anything outside the install
+directory.
+
 ## Requirements
 
 | Requirement | Notes |
 | --- | --- |
-| Rust 1.74+ | Build-time only; the released `ocg` binary is self-contained. |
-| OpenCode | 1.18.x or newer. `ocg` uses `OPENCODE_CONFIG_CONTENT`. |
+| Rust 1.88+ | Build-time only; the released `ocg` binary is self-contained. |
+| OpenCode | **1.18.0 or newer.** `ocg` uses `OPENCODE_CONFIG_CONTENT`. |
 | OpenAI plan/credentials | For the Lead (`openai` provider). |
 | Volcano Coding Plan Pro | For the EXPLORE models (Kimi). Declared in `config/base.json`. |
 | OpenCode Go | For BUILD / VERIFY / DEBUG (DeepSeek and GLM). |
+
+`ocg` can install and manage OpenCode itself (see
+[Managed runtime](#managed-runtime)), so a separate OpenCode install is
+optional. You still need a compatible `opencode` on `PATH` if you prefer to
+manage it yourself.
+
+> The Rust test suite and the installer tests run on Linux here. macOS support
+> is provided by the release artifacts and the installer's Darwin mapping, but
+> it has **not** been runtime-tested on a real Mac in this repository.
 
 Authenticate the providers once with OpenCode itself:
 
@@ -139,8 +192,8 @@ cargo build --release
 ```
 
 Put `target/release/ocg` on your `PATH` (for example by copying it into a
-directory that is already there). Packaging and an installer are intentionally
-out of scope for this change.
+directory that is already there), or run `make package` to build the
+platform artifact and a local `SHA256SUMS`.
 
 `ocg` is the OpenCode Gear CLI. If you already have a different tool installed
 under a similar name, choose the name you invoke accordingly; `ocg` does not
@@ -160,6 +213,132 @@ ocg --dry-run               # print the merged OpenCode config, launch nothing
 Run these from any project directory. OpenCode starts in the current working
 directory, and project-local overrides are read from `.opencode-gear.json`
 there.
+
+## Managed runtime
+
+`ocg` is not only a config layer: it also decides which `opencode` executable
+to run, and can install and update a project-local one so a project does not
+depend on whatever happens to be on `PATH`.
+
+### Runtime precedence
+
+For every launch the executable is resolved in this exact order:
+
+```text
+1. explicit executable   OPENCODE_GEAR_OPENCODE (or compat aliases)
+2. managed project       <project>/.opencode-gear/runtime/opencode/...
+3. system PATH           an `opencode` on PATH, if >= 1.18.0
+4. project-local bootstrap   install a managed runtime for this project
+```
+
+Rules that fall out of this:
+
+- An explicit executable is authoritative. If it is missing or not
+  executable, `ocg` errors instead of silently falling back.
+- An existing managed runtime always wins over the system `opencode`, so a
+  project stays deterministic once bootstrapped.
+- If there is no managed runtime and the system `opencode` is compatible,
+  nothing is installed; the system runtime is used.
+- When a compatible system runtime has a **due** check, `ocg` runs OpenCode's
+  own `opencode upgrade`, reprobes the version, records the check and launches
+  the result. If the upgrade fails, `ocg` warns, records the failed check and
+  continues with the old compatible version.
+- An incompatible or unusable system `opencode` is upgraded with
+  `opencode upgrade` when `autoUpgrade` is on; if that fails or leaves it
+  incompatible, `ocg` bootstraps a project-local runtime.
+- `autoUpgrade: false` disables those optional system upgrades, but it does
+  **not** disable the project-local fallback: a missing or incompatible
+  runtime is still bootstrapped on launch.
+- The managed runtime is project-local: `<project>/.opencode-gear/` is created
+  and `.opencode-gear/` is appended once to the project `.gitignore`.
+
+The exact executable environment variable is `OPENCODE_GEAR_OPENCODE`. The
+Commit-1 `OPENCODE_GEAR_OPENCODE_BIN` and legacy `OC_GEAR_OPENCODE_BIN` names
+remain valid compatibility aliases; the canonical name wins.
+
+### Runtime policy
+
+Policy lives in a small top-level `runtime` object (never in the raw
+`opencode` config key):
+
+```jsonc
+{
+  "runtime": {
+    "channel": "latest",          // only supported channel
+    "autoUpgrade": true,          // upgrade managed runtimes when due
+    "checkIntervalHours": 24,     // update-check cache interval
+    "fallback": "project-local",  // bootstrap target
+    "version": "1.18.31"          // optional exact semver pin
+  }
+}
+```
+
+All fields are optional; the defaults above are used when the object is
+absent. `ocg validate` rejects an unknown channel, a non-boolean
+`autoUpgrade`, a non-positive `checkIntervalHours`, an unknown `fallback`, a
+non-semver pin, or a pin below the `1.18.0` floor.
+
+### Update checks and cache
+
+Update checks are cached for `checkIntervalHours` (default 24) in the platform
+cache directory:
+
+| OS | Cache directory |
+| --- | --- |
+| Linux | `~/.cache/opencode-gear/` (`$XDG_CACHE_HOME` respected) |
+| macOS | `~/Library/Caches/opencode-gear/` |
+
+A launch does **not** network on every start: it only checks when the cache is
+missing or older than the interval. Both successful and failed checks are
+recorded, so a runtime that just failed to upgrade is not retried on every
+launch within the interval. A failed check warns and keeps the working
+runtime. `ocg upgrade` ignores the cache and checks immediately.
+
+How a check is performed depends on the active source:
+
+- **System runtime:** `ocg` runs OpenCode's own `opencode upgrade`; it never
+  fetches a release itself and never replaces a system runtime with a managed
+  copy.
+- **Managed runtime:** `ocg` checks the GitHub release and installs the newer
+  managed version.
+
+Managed downloads **fail closed**: a release asset that lacks a `sha256:`
+digest is refused rather than installed unverified.
+
+### Pinning
+
+Set `runtime.version` to an exact semver (for example `"1.18.31"`) to pin a
+project to one OpenCode version. A pin never silently advances, is not
+replaced by the system runtime, and is preserved by `ocg upgrade`.
+
+### Runtime commands
+
+```bash
+ocg version   # Gear, platform, resolved OpenCode version/source/path (read-only)
+ocg doctor    # platform, PATH, project/config/routing, runtime, cache (read-only)
+ocg upgrade   # self-update Gear, then force-maintain the active OpenCode
+```
+
+`ocg version` and `ocg doctor` never install, upgrade or bootstrap anything.
+`ocg doctor` explains what a bootstrap would do when no runtime is present.
+
+### Runtime layout and cleanup
+
+```text
+<project>/.opencode-gear/runtime/opencode/
+  <version>/opencode     managed executable (atomic install)
+  active.json            pointer: version, path, installed_at
+```
+
+`active.json` records the version; the executable path is always re-derived
+from that version as `<version>/opencode`, so an arbitrary recorded path is
+never trusted. The binary must be executable; a partial or non-executable
+install is repaired on the next install.
+
+To remove a managed runtime, delete the project's `.opencode-gear/` directory.
+To remove the update-check cache, delete the cache directory above. Neither
+belongs in version control; the project `.gitignore` entry is added on first
+bootstrap.
 
 ## Throttle semantics
 
@@ -253,7 +432,7 @@ Model ids live in `config/models.json`; role assignments live in
 An override file is a partial copy of the gear registries. Everything is
 deep-merged, so you only write the keys you want to change. The top-level keys
 mirror the files in `config/`: `throttle`, `models`, `routing`, `permissions`,
-plus the gear-only extras `prompts`, `observability` and `opencode`.
+plus the gear-only extras `prompts`, `observability`, `runtime` and `opencode`.
 
 ```jsonc
 {
@@ -368,7 +547,9 @@ throttle [level]    print, or persist, the default throttle level
 validate            validate the merged configuration
 layers              show config layers and trace state
 build               print the resolved OpenCode config
-version             print the version
+version             Gear, platform and the resolved OpenCode runtime
+doctor              read-only platform/config/runtime/cache check
+upgrade             self-update Gear, then maintain the active OpenCode
 help                print usage
 ```
 
@@ -389,8 +570,11 @@ working explicitly.
 | `OPENCODE_GEAR_THROTTLE` (legacy `OC_GEAR_THROTTLE`) | default throttle level |
 | `OPENCODE_GEAR_USER_CONFIG` (legacy `OC_GEAR_USER_CONFIG`) | path to the user override file |
 | `OPENCODE_GEAR_PROJECT_CONFIG` (legacy `OC_GEAR_PROJECT_CONFIG`) | path to the project override file |
-| `OPENCODE_GEAR_OPENCODE_BIN` / `OC_GEAR_OPENCODE_BIN` | `opencode` binary to run |
+| `OPENCODE_GEAR_OPENCODE` | explicit `opencode` executable (authoritative) |
+| `OPENCODE_GEAR_OPENCODE_BIN` / `OC_GEAR_OPENCODE_BIN` | compatibility aliases for the explicit executable |
 | `OPENCODE_GEAR_TRACE` (legacy `OC_GEAR_TRACE`) | trace file, read only when observability is enabled |
+| `OPENCODE_GEAR_CACHE_DIR` | override the update-check cache directory |
+| `OPENCODE_GEAR_API_BASE` | override the GitHub API base (mirrors, tests) |
 
 ## Isolation and permissions
 
@@ -455,9 +639,17 @@ local file — never to a remote service:
 **`ocg: configuration is invalid`** — run `ocg validate`; the builder refuses to
 emit an invalid config, and the error names the offending key.
 
-**`opencode: command not found`** — `ocg` runs `opencode` from `PATH`. Set
-`OPENCODE_GEAR_OPENCODE_BIN=/path/to/opencode` (or the legacy
-`OC_GEAR_OPENCODE_BIN`).
+**`opencode` is not found or is too old** — `ocg` resolves a runtime in the
+order documented in [Managed runtime](#managed-runtime). Run `ocg doctor` to
+see the resolved source, then either install OpenCode (>= 1.18.0), let `ocg`
+bootstrap a project-local runtime, or point at an explicit executable:
+
+```bash
+export OPENCODE_GEAR_OPENCODE=/path/to/opencode
+```
+
+The Commit-1 `OPENCODE_GEAR_OPENCODE_BIN` and legacy `OC_GEAR_OPENCODE_BIN`
+names still work. A broken explicit path is an error, not a fallback.
 
 **Provider/model errors on launch** — the model names and provider ids move
 faster than this README. Check what your OpenCode actually exposes:
@@ -505,6 +697,14 @@ opencode-gear/
   src/report.rs          status / routing / layers output
   src/observability.rs   opt-in local routing trace
   src/process.rs         the single place that executes a child process
+  src/platform.rs        OS/arch normalization and release asset mapping
+  src/clock.rs           injectable time source
+  src/http.rs            blocking HTTP transport abstraction + reqwest impl
+  src/runtime/           managed OpenCode runtime (policy, resolve, install,
+                         cache, release, archive, self-update)
+  install.sh             portable POSIX installer
+  scripts/package-release.sh  local artifact + SHA256SUMS packaging
+  .github/workflows/     release build for the four supported targets
   config/base.json        shared OpenCode config (providers, disabled built-ins)
   config/models.json      model/provider registry
   config/throttle.json    throttle level -> Lead model + reasoning variant
@@ -512,25 +712,46 @@ opencode-gear/
   config/permissions.json agent isolation profiles
   config/prompts/*.md     one prompt per role
   examples/               override file examples
-  tests/                  Rust unit and integration tests
+  tests/                  Rust unit and integration tests + installer shell tests
   docs/                   architecture, configuration, migration, troubleshooting
-  Makefile               `make test`, `make check`, `make validate`
+  Makefile               `make test`, `make check`, `make validate`, `make package`
 ```
 
 ## Tests
 
 ```bash
-make check       # cargo fmt --check + cargo clippy -- -D warnings + cargo test
-make test        # cargo test
+make test        # cargo test + the installer shell tests
+make check       # cargo fmt --check + clippy -D warnings + make test
 make validate    # validate the shipped configuration
+make package     # build the current platform artifact + SHA256SUMS locally
 ```
 
-The suite covers configuration parsing, throttle selection, Lead selection,
-EXPLORE (normal and deep), BUILD, VERIFY, DEBUG, provider binding,
+The Rust suite covers configuration parsing, throttle selection, Lead
+selection, EXPLORE (normal and deep), BUILD, VERIFY, DEBUG, provider binding,
 missing-provider and missing-model behaviour, variant validation, override
 precedence, arbitrary roles, prompt appending, isolation rules, the opt-in
 trace, embedded-vs-disk parity, and repository hygiene (no private tokens, no
 credential shapes, no absolute home paths).
+
+The runtime suite uses an in-memory HTTP transport, a fake process host, a
+fixed clock and temporary directories to cover platform mappings, the four
+runtime sources, explicit/managed/system/missing resolution, fresh/expired/
+forced update checks, upgrade success and failure fallback, incompatible
+system runtimes, pins, safe install cleanup and atomic activation, Gear
+self-update checksum verification, and the `version`/`doctor`/`upgrade`
+commands. `tests/installer_test.sh` exercises `install.sh` offline with local
+fixtures.
+
+### Development workflow
+
+```bash
+cargo fmt
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+sh tests/installer_test.sh
+```
+
+The runtime tests never touch the network or the real home directory.
 
 ## Migrating from an older Gear/profile setup
 

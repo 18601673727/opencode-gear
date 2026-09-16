@@ -34,6 +34,7 @@ An override file uses the same top-level keys as the gear's `config/` files:
 | `permissions` | `config/permissions.json` | profiles, role bindings, isolation |
 | `prompts` | `config/prompts/` | role -> path or `{"text": "..."}` |
 | `observability` | — | `{ "enabled": bool, "path": "..." }` |
+| `runtime` | — | managed OpenCode runtime policy (see below) |
 | `opencode` | — | raw OpenCode config merged into the result last |
 
 Example:
@@ -157,6 +158,61 @@ without forking it:
 The gear keeps the unmodified prompt for every role, so an append-only override
 never has to restate the core prompt.
 
+## Runtime policy
+
+The managed OpenCode runtime is configured by the top-level `runtime` object.
+It is deliberately separate from the raw `opencode` config key.
+
+```json
+{
+  "runtime": {
+    "channel": "latest",
+    "autoUpgrade": true,
+    "checkIntervalHours": 24,
+    "fallback": "project-local",
+    "version": "1.18.31"
+  }
+}
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `channel` | `"latest"` | Only `latest` is supported today. |
+| `autoUpgrade` | `true` | Allow optional upgrades of an existing compatible runtime when a check is due. |
+| `checkIntervalHours` | `24` | How long an update check stays cached. |
+| `fallback` | `"project-local"` | Where a bootstrap install goes. |
+| `version` | absent | Exact semver pin; never advances, managed only (no system upgrade). |
+
+Validation rejects unknown values and a pin below the OpenCode `1.18.0` floor.
+
+Resolution order for a launch is: explicit `OPENCODE_GEAR_OPENCODE` -> existing
+managed project runtime -> compatible system `opencode` on `PATH` ->
+project-local bootstrap.
+
+- A compatible system runtime with a due check runs its own
+  `opencode upgrade`, reprobes the version and continues. A failed upgrade
+  warns and keeps the old compatible runtime.
+- An incompatible or unusable system runtime is upgraded with
+  `opencode upgrade` when `autoUpgrade` is on; if that fails or stays
+  incompatible, `ocg` bootstraps project-local.
+- `autoUpgrade: false` disables the optional upgrades only. A missing or
+  incompatible runtime is still bootstrapped, because the fallback is required.
+- A managed runtime checks the GitHub release and installs the newer managed
+  version. The release asset must carry a `sha256:` digest; a missing digest is
+  refused.
+
+The managed runtime lives at
+`<project>/.opencode-gear/runtime/opencode/<version>/opencode`, with
+`active.json` as the pointer. The executable path is always re-derived from the
+version and must be executable; an arbitrary recorded path is never trusted.
+The first bootstrap appends `.opencode-gear/` to the project `.gitignore`
+exactly once.
+
+The update cache lives in the platform cache directory
+(`~/.cache/opencode-gear/` on Linux, `~/Library/Caches/opencode-gear/` on
+macOS). Both successful and failed checks are recorded, so a runtime that just
+failed to upgrade is not retried within the interval.
+
 ## Environment variables
 
 `OPENCODE_GEAR_*` is canonical; the legacy `OC_GEAR_*` names are accepted as
@@ -168,8 +224,11 @@ fallbacks.
 | `OPENCODE_GEAR_THROTTLE` (legacy `OC_GEAR_THROTTLE`) | default throttle level |
 | `OPENCODE_GEAR_USER_CONFIG` (legacy `OC_GEAR_USER_CONFIG`) | path to the user override file |
 | `OPENCODE_GEAR_PROJECT_CONFIG` (legacy `OC_GEAR_PROJECT_CONFIG`) | path to the project override file |
-| `OPENCODE_GEAR_OPENCODE_BIN` / `OC_GEAR_OPENCODE_BIN` | `opencode` binary to run |
+| `OPENCODE_GEAR_OPENCODE` | explicit `opencode` executable (authoritative) |
+| `OPENCODE_GEAR_OPENCODE_BIN` / `OC_GEAR_OPENCODE_BIN` | compatibility aliases for the explicit executable |
 | `OPENCODE_GEAR_TRACE` (legacy `OC_GEAR_TRACE`) | trace file, read only when observability is enabled |
+| `OPENCODE_GEAR_CACHE_DIR` | override the update-check cache directory |
+| `OPENCODE_GEAR_API_BASE` | override the GitHub API base (mirrors, tests) |
 
 ## Commands
 
@@ -183,6 +242,9 @@ ocg status   [--throttle LEVEL] [--project DIR]
 ocg throttle [LEVEL] [--project DIR]
 ocg layers   [--project DIR]
 ocg trace    --event launch [--project DIR]
+ocg version  (read-only runtime report)
+ocg doctor   (read-only environment check)
+ocg upgrade  (self-update Gear, then maintain OpenCode)
 ```
 
 `build` (and `--dry-run`) prints the merged OpenCode config consumed through

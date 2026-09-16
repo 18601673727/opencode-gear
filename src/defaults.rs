@@ -139,7 +139,21 @@ pub fn load_defaults(source: &GearSource) -> Result<Value> {
         "prompts": prompts,
         "_prompt_defaults": prompt_defaults,
         "observability": {"enabled": false, "path": Value::Null},
+        "runtime": default_runtime(),
     }))
+}
+
+/// The built-in managed-runtime policy.
+///
+/// Kept in code (like `observability`) so a disk gear home does not need a new
+/// required file and existing gear homes keep working.
+pub fn default_runtime() -> Value {
+    json!({
+        "channel": crate::runtime::policy::Channel::Latest.as_str(),
+        "autoUpgrade": true,
+        "checkIntervalHours": crate::runtime::policy::DEFAULT_CHECK_INTERVAL_HOURS,
+        "fallback": crate::runtime::policy::Fallback::ProjectLocal.as_str(),
+    })
 }
 
 fn require_key(value: &Value, key: &str, label: &str) -> Result<()> {

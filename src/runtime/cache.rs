@@ -1,0 +1,168 @@
+//! Cached update checks.
+//!
+//! A due check records the last time we asked GitHub for the latest release
+//! and, when known, the latest version. The cache lives in the platform cache
+//! directory so a fresh install never networks on every launch.
+
+use crate::clock::Clock;
+use crate::error::{GearError, Result};
+use semver::Version;
+use serde_json::{json, Value};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+/// One cached update-check result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheRecord {
+    pub checked_at: i64,
+    pub version: Option<Version>,
+}
+
+impl CacheRecord {
+    /// Read the cache from `dir`, or `None` when there is nothing usable.
+    pub fn read(dir: &Path) -> Option<Self> {
+        let text = fs::read_to_string(cache_file(dir)).ok()?;
+        Self::parse(&text)
+    }
+
+    /// Parse a cache document. Malformed files are treated as absent.
+    pub fn parse(text: &str) -> Option<Self> {
+        let value: Value = serde_json::from_str(text).ok()?;
+        let checked_at = value.get("checked_at").and_then(Value::as_i64)?;
+        let version = value
+            .get("version")
+            .and_then(Value::as_str)
+            .and_then(super::policy::parse_exact_version);
+        Some(Self {
+            checked_at,
+            version,
+        })
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "checked_at": self.checked_at,
+            "version": self.version.as_ref().map(ToString::to_string),
+        })
+    }
+
+    /// Write the cache atomically (temp sibling + rename).
+    pub fn write(&self, dir: &Path) -> Result<()> {
+        fs::create_dir_all(dir)
+            .map_err(|error| GearError::io(format!("cannot create {}", dir.display()), error))?;
+        let target = cache_file(dir);
+        let text = format!("{}\n", self.to_json());
+        let parent = target.parent().unwrap_or(dir);
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".update-check-")
+            .tempfile_in(parent)
+            .map_err(|error| GearError::io(format!("cannot write {}", target.display()), error))?;
+        use std::io::Write;
+        temporary
+            .write_all(text.as_bytes())
+            .map_err(|error| GearError::write(&target, error))?;
+        temporary
+            .persist(&target)
+            .map_err(|error| GearError::write(&target, error.error))?;
+        Ok(())
+    }
+
+    /// Whether a check is due at `now`.
+    pub fn is_due(&self, now: i64, interval_hours: u64) -> bool {
+        due(Some(self), now, interval_hours, false)
+    }
+}
+
+/// The cache file inside a cache directory.
+pub fn cache_file(dir: &Path) -> PathBuf {
+    dir.join("update-check.json")
+}
+
+/// Whether an update check should run.
+pub fn due(record: Option<&CacheRecord>, now: i64, interval_hours: u64, force: bool) -> bool {
+    if force {
+        return true;
+    }
+    let Some(record) = record else {
+        return true;
+    };
+    let interval = (interval_hours as i64).saturating_mul(3_600);
+    now.saturating_sub(record.checked_at) >= interval
+}
+
+/// Whether a check is due given a clock and an optional cache directory.
+pub fn is_due(
+    cache_dir: Option<&Path>,
+    clock: &dyn Clock,
+    interval_hours: u64,
+    force: bool,
+) -> bool {
+    let record = cache_dir.and_then(CacheRecord::read);
+    due(record.as_ref(), clock.now_unix(), interval_hours, force)
+}
+
+/// The platform cache directory for Gear, when one can be determined.
+pub fn platform_cache_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|dirs| dirs.cache_dir().join("opencode-gear"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::FixedClock;
+
+    #[test]
+    fn absent_or_forced_checks_are_due() {
+        assert!(due(None, 1_000, 24, false));
+        let record = CacheRecord {
+            checked_at: 1_000,
+            version: Some(Version::new(1, 18, 31)),
+        };
+        assert!(due(Some(&record), 1_000, 24, true));
+    }
+
+    #[test]
+    fn fresh_checks_are_not_due_and_expired_checks_are() {
+        let record = CacheRecord {
+            checked_at: 1_000,
+            version: None,
+        };
+        let interval = 24;
+        assert!(!record.is_due(1_000 + 3_600, interval));
+        assert!(!record.is_due(1_000 + 23 * 3_600, interval));
+        assert!(record.is_due(1_000 + 24 * 3_600, interval));
+        assert!(record.is_due(1_000 + 100 * 3_600, interval));
+    }
+
+    #[test]
+    fn round_trips_through_disk_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = CacheRecord {
+            checked_at: 42,
+            version: Some(Version::new(1, 18, 31)),
+        };
+        record.write(dir.path()).unwrap();
+        assert_eq!(CacheRecord::read(dir.path()), Some(record));
+    }
+
+    #[test]
+    fn malformed_cache_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(cache_file(dir.path()), "not json").unwrap();
+        assert_eq!(CacheRecord::read(dir.path()), None);
+    }
+
+    #[test]
+    fn clock_facade_uses_the_injected_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        CacheRecord {
+            checked_at: 1_000,
+            version: None,
+        }
+        .write(dir.path())
+        .unwrap();
+        let clock = FixedClock::new(1_000 + 60);
+        assert!(!is_due(Some(dir.path()), &clock, 24, false));
+        assert!(is_due(Some(dir.path()), &clock, 24, true));
+    }
+}

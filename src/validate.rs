@@ -13,6 +13,8 @@ pub fn validate(effective: &Effective) -> Vec<String> {
     let data = &effective.data;
     let mut errors = Vec::new();
 
+    errors.extend(crate::runtime::policy::RuntimePolicy::validate(data));
+
     let empty = Map::new();
     let levels = data
         .get("throttle")

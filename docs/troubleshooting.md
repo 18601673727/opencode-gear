@@ -18,15 +18,81 @@ The errors name the offending key, for example:
   'deepseek-v4.1-flash'`.
 - `prompt file for role 'docs' not found: ...`.
 
-## `opencode: command not found`
+## `opencode` is missing or too old
 
-`ocg` runs `opencode` from `PATH`. Install it, or point the gear at it:
+`ocg` resolves a runtime in a fixed order: explicit executable, existing
+managed project runtime, compatible system `opencode` on `PATH`, then a
+project-local bootstrap. Diagnose it with:
 
 ```bash
-export OPENCODE_GEAR_OPENCODE_BIN=/path/to/opencode
+ocg doctor
+ocg version
 ```
 
-The legacy `OC_GEAR_OPENCODE_BIN` variable keeps working.
+To use a specific executable, set the canonical variable:
+
+```bash
+export OPENCODE_GEAR_OPENCODE=/path/to/opencode
+```
+
+The Commit-1 `OPENCODE_GEAR_OPENCODE_BIN` and legacy `OC_GEAR_OPENCODE_BIN`
+names keep working. A broken explicit path is an error rather than a silent
+fallback.
+
+A compatible system runtime is upgraded with OpenCode's own
+`opencode upgrade` when a check is due. Setting `runtime.autoUpgrade` to
+`false` disables that optional upgrade, but the required project-local
+fallback still runs: a missing or incompatible runtime is bootstrapped rather
+than left unusable.
+
+## Update checks seem stuck or slow
+
+Update checks are cached for `runtime.checkIntervalHours` (default 24) under
+the platform cache directory. Successful and failed checks are both recorded,
+so a runtime that just failed to upgrade is not retried on every launch. To
+force a check:
+
+```bash
+ocg upgrade
+```
+
+To reset the cache, delete `~/.cache/opencode-gear/` on Linux or
+`~/Library/Caches/opencode-gear/` on macOS. A failed check prints a warning
+and keeps the working runtime.
+
+## A managed install refuses to download
+
+Managed installs fail closed: a release asset without a `sha256:` digest is
+refused rather than installed unverified. This should not happen for official
+OpenCode releases; check `ocg doctor` and the GitHub release metadata if it
+does.
+
+## `ocg upgrade` did not change my system OpenCode
+
+For a system runtime, `ocg upgrade` runs `opencode upgrade` and never installs
+a managed copy or downgrades a newer system runtime. If `opencode upgrade`
+fails, the old compatible runtime is kept with a warning. A system runtime
+that is still incompatible falls back to a managed install.
+
+## A pinned OpenCode version will not move
+
+That is intended. `runtime.version` is an exact pin: it never advances, is
+never replaced by the system runtime, and is preserved by `ocg upgrade`.
+Remove the `version` field to return to the `latest` channel.
+
+## `ocg upgrade` could not self-update
+
+Self-update downloads the Gear binary and `SHA256SUMS` from this repository's
+releases and verifies the checksum before replacing the running executable. If
+it fails, the installed CLI is left untouched and the error is printed; the
+OpenCode runtime maintenance still runs. Re-run later, or reinstall with
+`install.sh`.
+
+## Managed runtime left behind
+
+Delete the project's `.opencode-gear/` directory to remove a project-local
+runtime and its `active.json`. Delete the platform cache directory to remove
+update-check state.
 
 ## Provider or model errors at launch
 

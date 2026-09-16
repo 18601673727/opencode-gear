@@ -6,15 +6,21 @@
 //! names are accepted as fallbacks.
 
 use crate::build;
+use crate::clock::{Clock, SystemClock};
 use crate::config;
 use crate::defaults::{load_defaults, GearSource};
 use crate::error::GearError;
+use crate::http::{HttpTransport, NoHttp, ReqwestHttp};
 use crate::json;
 use crate::model;
 use crate::observability;
-use crate::process::ProcessRunner;
+use crate::platform::Platform;
+use crate::process::{ProcessHost, ProcessRunner, SystemProcessHost};
 use crate::report;
+use crate::runtime::policy::RuntimePolicy;
+use crate::runtime::{self, install::Layout};
 use crate::validate;
+use semver::Version;
 use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -31,10 +37,16 @@ pub struct Env {
     pub throttle: Option<String>,
     pub user_config: Option<PathBuf>,
     pub project_config: Option<PathBuf>,
+    /// Explicit OpenCode executable. Canonical `OPENCODE_GEAR_OPENCODE`, with
+    /// `OPENCODE_GEAR_OPENCODE_BIN` and `OC_GEAR_OPENCODE_BIN` as aliases.
     pub opencode_bin: Option<OsString>,
     pub trace: Option<PathBuf>,
     pub xdg_config_home: Option<PathBuf>,
     pub home_dir: Option<PathBuf>,
+    /// Override for the GitHub API base (mirrors and tests).
+    pub api_base: Option<String>,
+    /// Override for the update-check cache directory.
+    pub cache_dir: Option<PathBuf>,
 }
 
 impl Env {
@@ -48,10 +60,16 @@ impl Env {
             throttle: env_string(&["OPENCODE_GEAR_THROTTLE", "OC_GEAR_THROTTLE"]),
             user_config: env_path(&["OPENCODE_GEAR_USER_CONFIG", "OC_GEAR_USER_CONFIG"]),
             project_config: env_path(&["OPENCODE_GEAR_PROJECT_CONFIG", "OC_GEAR_PROJECT_CONFIG"]),
-            opencode_bin: env_os(&["OPENCODE_GEAR_OPENCODE_BIN", "OC_GEAR_OPENCODE_BIN"]),
+            opencode_bin: env_os(&[
+                "OPENCODE_GEAR_OPENCODE",
+                "OPENCODE_GEAR_OPENCODE_BIN",
+                "OC_GEAR_OPENCODE_BIN",
+            ]),
             trace: env_path(&["OPENCODE_GEAR_TRACE", "OC_GEAR_TRACE"]),
             xdg_config_home: env_path(&["XDG_CONFIG_HOME"]),
             home_dir,
+            api_base: env_string(&["OPENCODE_GEAR_API_BASE"]),
+            cache_dir: env_path(&["OPENCODE_GEAR_CACHE_DIR"]),
         }
     }
 }
@@ -92,6 +110,8 @@ pub enum Command {
     Build,
     Trace(Option<String>),
     Version,
+    Doctor,
+    Upgrade,
     Help,
 }
 
@@ -293,6 +313,8 @@ where
         Some("dry-run") => Command::Build,
         Some("trace") => Command::Trace(event),
         Some("version") => Command::Version,
+        Some("doctor") => Command::Doctor,
+        Some("upgrade") => Command::Upgrade,
         Some("help") => Command::Help,
         Some(other) => {
             return Err(UsageError(format!(
@@ -328,7 +350,9 @@ Commands:
   validate              validate the merged configuration
   layers                show configuration layers and trace state
   build                 print the resolved OpenCode config
-  version               print the OpenCode Gear version
+  version               report Gear, platform and the resolved OpenCode runtime
+  doctor                check platform, config, runtime and cache (read-only)
+  upgrade               self-update Gear, then maintain the active OpenCode
   help                  show this help
 
 Options:
@@ -346,10 +370,15 @@ Environment:
   OPENCODE_GEAR_THROTTLE       default throttle level (overridden by --throttle)
   OPENCODE_GEAR_USER_CONFIG    user override file (default ~/.config/opencode-gear/config.json)
   OPENCODE_GEAR_PROJECT_CONFIG project override file (default <project>/.opencode-gear.json)
-  OPENCODE_GEAR_OPENCODE_BIN   opencode binary to run (default `opencode`)
+  OPENCODE_GEAR_OPENCODE       explicit opencode binary (wins over everything)
+  OPENCODE_GEAR_OPENCODE_BIN   compatibility alias for the same explicit binary
   OPENCODE_GEAR_TRACE          trace file; only read when observability is enabled
+  OPENCODE_GEAR_CACHE_DIR      override the update-check cache directory
+  OPENCODE_GEAR_API_BASE       override the GitHub API base (mirrors, tests)
 
-The legacy OC_GEAR_* names are still accepted as fallbacks.
+The legacy OC_GEAR_* names are still accepted as fallbacks (including
+OC_GEAR_OPENCODE_BIN). A broken explicit binary is authoritative and errors
+instead of silently falling back to another runtime.
 "#
 }
 
@@ -394,8 +423,7 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
             return Ok(0);
         }
         Command::Version => {
-            println!("OpenCode Gear {VERSION}");
-            return Ok(0);
+            return version_command(&cli, &env);
         }
         _ => {}
     }
@@ -515,6 +543,8 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
             }
             Ok(0)
         }
+        Command::Doctor => doctor_command(&effective, &cwd, &env),
+        Command::Upgrade => upgrade_command(&effective, &cwd, &env),
     }
 }
 
@@ -558,13 +588,363 @@ fn launch(
     if trace {
         observability::record_event(effective, "launch", level, env.trace.as_deref());
     }
-    let program = env
-        .opencode_bin
-        .clone()
-        .unwrap_or_else(|| OsString::from("opencode"));
-    let runner = ProcessRunner::new(program);
+    let http = ReqwestHttp::new().map_err(Failure::Gear)?;
+    let clock = SystemClock;
+    let process = SystemProcessHost;
+    let manager =
+        runtime_manager(cwd, effective, env, &http, &clock, &process).map_err(Failure::Gear)?;
+    let selection = manager.resolve_for_launch().map_err(Failure::Gear)?;
+    for warning in &selection.warnings {
+        eprintln!("ocg: warning: {warning}");
+    }
+    let runner = ProcessRunner::new(selection.path.into_os_string());
     runner.exec(args, cwd, &content).map_err(Failure::Gear)?;
     Ok(0)
+}
+
+/// Build a runtime manager from the effective config and environment.
+fn runtime_manager<'a>(
+    project_root: &Path,
+    effective: &config::Effective,
+    env: &Env,
+    http: &'a dyn HttpTransport,
+    clock: &'a SystemClock,
+    process: &'a dyn ProcessHost,
+) -> crate::error::Result<runtime::RuntimeManager<'a>> {
+    let policy = RuntimePolicy::from_config(&effective.data)?;
+    let platform = Platform::current()?;
+    let mut manager =
+        runtime::RuntimeManager::new(project_root, policy, platform, http, clock, process)
+            .with_explicit(env.opencode_bin.clone());
+    if let Some(cache_dir) = &env.cache_dir {
+        manager = manager.with_cache_dir(Some(cache_dir.clone()));
+    }
+    if let Some(api_base) = &env.api_base {
+        manager = manager.with_api_base(api_base.clone());
+    }
+    Ok(manager)
+}
+
+/// `ocg version`: report Gear, platform and the resolved runtime. Never
+/// installs, upgrades or writes the update cache.
+fn version_command(cli: &Cli, env: &Env) -> std::result::Result<i32, Failure> {
+    let project = cli
+        .project
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let platform = Platform::current().map_err(Failure::Gear)?;
+    let clock = SystemClock;
+    let process = SystemProcessHost;
+    let policy = RuntimePolicy::default();
+    let manager =
+        runtime::RuntimeManager::new(project, policy, platform, &NoHttp, &clock, &process)
+            .with_explicit(env.opencode_bin.clone());
+    let report = manager.resolve_for_report();
+
+    println!("OpenCode Gear {VERSION}");
+    println!("platform:        {}", platform.slug());
+    if report.installed() {
+        println!(
+            "opencode:        {} ({})",
+            describe_runtime_version(report.version.as_ref()),
+            report
+                .source
+                .map(|source| source.label())
+                .unwrap_or("unknown")
+        );
+        if let Some(path) = &report.path {
+            println!("runtime path:    {}", path.display());
+        }
+    } else {
+        println!("opencode:        not installed");
+        if let Some(error) = &report.error {
+            println!("runtime error:   {error}");
+        } else {
+            println!(
+                "runtime:         none; the next launch will bootstrap a project-local runtime"
+            );
+        }
+    }
+    for warning in &report.warnings {
+        println!("warning:         {warning}");
+    }
+    Ok(0)
+}
+
+fn describe_runtime_version(version: Option<&Version>) -> String {
+    version
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "unknown version".to_string())
+}
+
+fn check_line(status: &str, label: &str, detail: &str) {
+    println!("  {label:<16} [{status}] {detail}");
+}
+
+/// `ocg doctor`: read-only environment and runtime checks. Never installs,
+/// updates or writes the cache, and never prints secrets.
+fn doctor_command(
+    effective: &config::Effective,
+    project_root: &Path,
+    env: &Env,
+) -> std::result::Result<i32, Failure> {
+    let mut failures = 0usize;
+    println!("OpenCode Gear doctor");
+
+    let platform = match Platform::current() {
+        Ok(platform) => {
+            check_line("ok", "platform", &platform.slug());
+            Some(platform)
+        }
+        Err(error) => {
+            check_line("fail", "platform", &error.to_string());
+            failures += 1;
+            None
+        }
+    };
+
+    match std::env::current_exe() {
+        Ok(exe) => check_line("ok", "gear", &format!("{} (Gear {VERSION})", exe.display())),
+        Err(error) => {
+            check_line(
+                "fail",
+                "gear",
+                &format!("cannot determine the running executable: {error}"),
+            );
+            failures += 1;
+        }
+    }
+
+    let process = SystemProcessHost;
+    match process.find_in_path("ocg") {
+        Some(path) => check_line("ok", "gear on PATH", &path.display().to_string()),
+        None => check_line(
+            "warn",
+            "gear on PATH",
+            "not found; install with install.sh or add the install directory to PATH",
+        ),
+    }
+
+    if project_root.is_dir() {
+        check_line("ok", "project root", &project_root.display().to_string());
+    } else {
+        check_line(
+            "fail",
+            "project root",
+            &format!("{} is not a directory", project_root.display()),
+        );
+        failures += 1;
+    }
+
+    if effective.project_path.is_file() {
+        check_line(
+            "ok",
+            "project config",
+            &effective.project_path.display().to_string(),
+        );
+    } else {
+        check_line("info", "project config", "not present (optional)");
+    }
+
+    let errors = validate::validate(effective);
+    if errors.is_empty() {
+        let roles = model::role_specs(&effective.data)
+            .map(|roles| roles.len())
+            .unwrap_or(0);
+        check_line("ok", "config/routing", &format!("valid ({roles} roles)"));
+    } else {
+        check_line("fail", "config/routing", &errors.join("; "));
+        failures += 1;
+    }
+
+    let clock = SystemClock;
+    let policy = RuntimePolicy::from_config(&effective.data).unwrap_or_default();
+    let report = match platform {
+        Some(platform) => {
+            let manager = runtime::RuntimeManager::new(
+                project_root,
+                policy.clone(),
+                platform,
+                &NoHttp,
+                &clock,
+                &process,
+            )
+            .with_explicit(env.opencode_bin.clone());
+            manager.resolve_for_report()
+        }
+        None => runtime::RuntimeReport::default(),
+    };
+
+    if report.installed() {
+        check_line(
+            "ok",
+            "runtime",
+            &format!(
+                "{} ({}) {}",
+                describe_runtime_version(report.version.as_ref()),
+                report
+                    .source
+                    .map(|source| source.label())
+                    .unwrap_or("unknown"),
+                report
+                    .path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            ),
+        );
+    } else if let Some(error) = &report.error {
+        check_line("fail", "runtime", error);
+        failures += 1;
+    } else {
+        check_line(
+            "info",
+            "runtime",
+            &format!(
+                "not installed; `ocg` or `ocg upgrade` will bootstrap {}",
+                Layout::new(project_root).runtime_root().display()
+            ),
+        );
+    }
+    for warning in &report.warnings {
+        check_line("warn", "runtime", warning);
+    }
+
+    let runtime_root = Layout::new(project_root).runtime_root();
+    if is_writable_dir(&runtime_root) {
+        check_line(
+            "ok",
+            "runtime dir",
+            &format!("{} is writable", runtime_root.display()),
+        );
+    } else {
+        check_line(
+            "warn",
+            "runtime dir",
+            &format!("{} is not writable", runtime_root.display()),
+        );
+    }
+
+    let cache_dir = env
+        .cache_dir
+        .clone()
+        .or_else(runtime::cache::platform_cache_dir);
+    match cache_dir {
+        Some(dir) => match runtime::cache::CacheRecord::read(&dir) {
+            Some(record) => {
+                let age = (clock.now_unix() - record.checked_at).max(0);
+                let fresh = !runtime::cache::due(
+                    Some(&record),
+                    clock.now_unix(),
+                    policy.check_interval_hours,
+                    false,
+                );
+                check_line(
+                    "ok",
+                    "update cache",
+                    &format!(
+                        "{} ({}, checked {age}s ago)",
+                        dir.display(),
+                        if fresh { "fresh" } else { "expired" }
+                    ),
+                );
+            }
+            None => check_line(
+                "info",
+                "update cache",
+                &format!("{} (never checked)", dir.display()),
+            ),
+        },
+        None => check_line(
+            "warn",
+            "update cache",
+            "platform cache directory unavailable",
+        ),
+    }
+
+    Ok(if failures == 0 { 0 } else { 1 })
+}
+
+/// `ocg upgrade`: self-update Gear, then force-maintain the active OpenCode.
+fn upgrade_command(
+    effective: &config::Effective,
+    project_root: &Path,
+    env: &Env,
+) -> std::result::Result<i32, Failure> {
+    let platform = Platform::current().map_err(Failure::Gear)?;
+    let clock = SystemClock;
+    let process = SystemProcessHost;
+    let http = ReqwestHttp::new().map_err(Failure::Gear)?;
+    let manager = runtime_manager(project_root, effective, env, &http, &clock, &process)
+        .map_err(Failure::Gear)?;
+
+    let current = Version::parse(VERSION).map_err(|error| {
+        Failure::Gear(GearError::config(format!(
+            "invalid Gear version '{VERSION}': {error}"
+        )))
+    })?;
+    match std::env::current_exe() {
+        Ok(exe) => {
+            match runtime::self_update::self_update(
+                &http,
+                &manager.api_base,
+                &manager.gear_repo,
+                platform,
+                &exe,
+                &current,
+                &process,
+            ) {
+                Ok(outcome) if outcome.updated => {
+                    println!("Gear:      {} -> {}", outcome.from, outcome.to);
+                }
+                Ok(outcome) => println!("Gear:      {} (up to date)", outcome.from),
+                Err(error) => println!("Gear:      self-update skipped: {error}"),
+            }
+        }
+        Err(error) => println!(
+            "Gear:      self-update skipped: cannot determine the running executable: {error}"
+        ),
+    }
+
+    let outcome = manager.upgrade().map_err(Failure::Gear)?;
+    let before = match outcome.before.installed() {
+        true => format!(
+            "{} ({})",
+            describe_runtime_version(outcome.before.version.as_ref()),
+            outcome
+                .before
+                .source
+                .map(|source| source.label())
+                .unwrap_or("unknown")
+        ),
+        false => "not installed".to_string(),
+    };
+    let after = format!(
+        "{} ({}) {}",
+        describe_runtime_version(outcome.after.version.as_ref()),
+        outcome.after.source.label(),
+        outcome.after.path.display()
+    );
+    println!("OpenCode:  {before} -> {after}");
+    for warning in outcome.after.warnings.iter().chain(outcome.warnings.iter()) {
+        eprintln!("ocg: warning: {warning}");
+    }
+    Ok(0)
+}
+
+/// Whether a directory (or its nearest existing ancestor) is writable.
+fn is_writable_dir(path: &Path) -> bool {
+    let mut current = path;
+    loop {
+        match std::fs::metadata(current) {
+            Ok(metadata) => return !metadata.permissions().readonly(),
+            Err(_) => match current.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => current = parent,
+                _ => return false,
+            },
+        }
+    }
 }
 
 fn throttle_command(
