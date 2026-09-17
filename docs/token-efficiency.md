@@ -125,7 +125,7 @@ Read honestly:
 
 The spread across repeated runs reflects ordinary machine load, not a change in
 the fixture or the engine. The capsule byte count grew by 5 bytes versus the
-0.1.0 record because the engine-version string (`0.2.0-rc.2`) is embedded in
+0.1.0 record because the engine-version string (`0.2.0-rc.3`) is embedded in
 provenance; the content is otherwise unchanged.
 
 Warm still rebuilds the repo map and revalidates the index; it only skips

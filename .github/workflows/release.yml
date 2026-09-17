@@ -153,10 +153,55 @@ jobs:
           body: |
             OpenCode Gear ${{ github.ref_name }}
 
-            RC2 fixes macOS native release validation: filesystem-equivalent
-            temporary paths are now compared canonically, and native test
-            commands are aligned across Linux and macOS. It includes all OCG
-            v0.2 orchestration and token-efficiency features from RC1.
+            RC3 hardens runtime networking and makes the Lead throttle a
+            runtime invariant. It keeps all v0.2 orchestration, context,
+            verification and token-efficiency features.
+
+            Networking and updates
+
+            - Coherent proxy policy: one resolved proxy per command, with
+              precedence `--disable-proxy` > `OPENCODE_GEAR_DISABLE_PROXY` >
+              standard `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`
+              (upper- or lower-case) > macOS system proxy > direct.
+            - macOS static System Configuration proxy discovery through
+              `/usr/sbin/scutil --proxy` (static HTTP/HTTPS plus a safe
+              exception list).
+            - `--disable-proxy` and `OPENCODE_GEAR_DISABLE_PROXY=1` force direct
+              connections and strip every proxy variable from child processes.
+            - GitHub API rate-limit diagnostics: a refused request reports the
+              rate-limit resource, limit, remaining and reset instead of a bare
+              HTTP status.
+            - `GH_TOKEN` (preferred) then `GITHUB_TOKEN` are used for OCG's own
+              GitHub API requests, and are attached only to `api.github.com`.
+            - The system OpenCode upgrade runs
+              `opencode upgrade <resolved-version>`, so upstream does not need a
+              second latest-release lookup; a compatible system runtime is kept
+              when the lookup or the upgrade fails.
+
+            Runtime contracts
+
+            - Runtime provider/model preflight: a coding launch verifies that
+              the selected OpenCode runtime exposes every configured model, and
+              a missing active Lead model blocks the launch instead of silently
+              falling back to another model.
+            - Runtime Lead throttle enforcement: the selected agent, model and
+              reasoning variant are enforced on the actual Lead request, so
+              sticky model/variant state or a reused session cannot change it.
+              Consumer routing is unaffected.
+
+            Lead contracts
+
+            ```
+            low   lead-low   openai/gpt-5.6-sol   medium
+            mid   lead-mid   openai/gpt-5.6-sol   high
+            high  lead-high  openai/gpt-6-astra   high
+            ```
+
+            Known limitations
+
+            - PAC configuration is detected and reported, but not evaluated.
+            - OCG's own HTTP client does not consume SOCKS proxy URLs; a SOCKS
+              environment value is preserved for child OpenCode processes.
 
             The unpinned installer follows the latest stable release by design.
             Pin this candidate explicitly:
