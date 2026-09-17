@@ -144,6 +144,7 @@ pub fn load_defaults(source: &GearSource) -> Result<Value> {
         "verification": default_verification(),
         "capabilities": default_capabilities(),
         "telemetry": default_telemetry(),
+        "orchestration": default_orchestration(),
     }))
 }
 
@@ -187,6 +188,16 @@ pub fn default_capabilities() -> Value {
 /// remote mode to opt into.
 pub fn default_telemetry() -> Value {
     serde_json::to_value(crate::telemetry::TelemetryConfig::default()).unwrap_or_else(|_| json!({}))
+}
+
+/// The built-in orchestration policy.
+///
+/// Kept in code (like `context`, `verification` and `telemetry`) so a disk gear
+/// home keeps working without a new required file. The defaults are
+/// conservative: enabled, two Build retries and one Debug hand-off.
+pub fn default_orchestration() -> Value {
+    serde_json::to_value(crate::orchestration::OrchestrationConfig::default())
+        .unwrap_or_else(|_| json!({}))
 }
 
 fn require_key(value: &Value, key: &str, label: &str) -> Result<()> {

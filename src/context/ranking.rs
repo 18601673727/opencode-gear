@@ -135,6 +135,12 @@ pub struct ContextPlan {
     pub candidates: Vec<Candidate>,
     pub selected_files: Vec<String>,
     pub changed_paths: Vec<String>,
+    /// The bounded, real diff summary the plan was ranked against. Kept in the
+    /// plan so downstream role hand-offs can render an actual diff instead of a
+    /// fabricated reference. Optional for cache compatibility with plans written
+    /// before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<DiffSummary>,
     pub slices: Vec<ContextSlice>,
     pub candidate_bytes: usize,
     pub selected_bytes: usize,
@@ -547,6 +553,7 @@ pub fn assemble(
         candidates: ranked,
         selected_files,
         changed_paths,
+        diff: Some(diff.clone()),
         slices,
         candidate_bytes,
         selected_bytes,

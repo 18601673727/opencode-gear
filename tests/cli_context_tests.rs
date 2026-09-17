@@ -181,7 +181,7 @@ fn disabled_context_reports_no_work_and_writes_nothing() {
 
 #[cfg(unix)]
 #[test]
-fn run_does_not_prepare_context_by_default() {
+fn run_activates_orchestration_plugin_without_preparing_context() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = TestDir::new();
@@ -204,8 +204,16 @@ fn run_does_not_prepare_context_by_default() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(marker.is_file(), "the launch must still reach OpenCode");
+    // An ordinary launch now materializes the generated orchestration plugin
+    // (that is the activation), but it still does not build the context index.
     assert!(
-        !project.join(".opencode-gear").exists(),
-        "an ordinary launch must not prepare context or write gear state"
+        project
+            .join(".opencode-gear/orchestration/plugin/ocg-orchestration.js")
+            .is_file(),
+        "an ordinary launch must materialize the orchestration plugin"
+    );
+    assert!(
+        !project.join(".opencode-gear/index").exists(),
+        "an ordinary launch must not build the context index"
     );
 }

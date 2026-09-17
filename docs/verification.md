@@ -154,8 +154,9 @@ tool-schema activation is not currently claimed.
 `src/orchestration/checkpoint.rs` stores versioned JSON under
 `.opencode-gear/checkpoints/`:
 
-- phases `ExploreToBuild`, `BuildToVerify`, `VerifyToDebug`, `Decision`, in
-  canonical order;
+- phases `ExploreToBuild`, `BuildToVerify`, `VerifyToDebug`, `DebugToBuild`,
+  `Decision`, in canonical order (adding `DebugToBuild` is backward-compatible
+  with checkpoints written before it existed);
 - a `TaskCapsule`, Git state and a Git fingerprint, optional verification state,
   provenance, decisions and `created_at`;
 - a safe, deterministic id (`cp-<phase>-<hash>`, only `[a-z0-9-]`).
@@ -165,6 +166,44 @@ enforces the schema and revalidates the recorded sources and Git identity: a
 stale checkpoint is marked stale with reasons and is never silently reused. A
 corrupt checkpoint is counted and ignored by `list`, and it never blocks normal
 `ocg`.
+
+## Automated Build verification and the retry / Debug contract
+
+The orchestration controller (`src/orchestration/controller.rs`) reuses the
+explicit verification policy; it never invents a command:
+
+1. After a Build task, `after_build` runs the stage configured under
+   `verification` (`verification.defaultStage` unless a stage is named) through
+   the same structured, shell-free runner. If no command is configured it
+   reports `not-configured` and runs nothing.
+2. It checkpoints `BuildToVerify` with the structured report and produces a
+   typed `Build`→`Verify` `ModelHandoffCapsule` carrying the goal, changed
+   files, symbols, the diff identity and the distilled verification block
+   (stage, outcome, failed commands, failed tests, failing locations, raw-log
+   references, bounded distilled lines).
+3. A pass ends the task in the `Done` phase with **no** Debug recommendation.
+4. A failure allows up to `orchestration.maxBuildRetries` (default `2`) Build
+   retries. When the budget is exhausted the controller transitions to `Debug`
+   with an explainable reason (the stage, outcome, attempt/retry counts, the
+   number of failing commands and the first distilled location — never a
+   configured command string or raw output) and checkpoints `VerifyToDebug`.
+   Each Debug delegation counts against `maxDebugRetries`; once exceeded the
+   hand-off carries an explicit user-escalation instruction.
+5. The Debug hand-off contains only failures, evidence, the relevant bounded
+   diff, raw-log references and the distilled verification block;
+   `maxDebugRetries` bounds how many times Debug is handed the same task before
+   escalation.
+6. Returning the work from Debug to Build is a distinct `DebugToBuild`
+   transition: `prepare_handoff` checkpoints it with the current session capsule
+   and the last structured verification report, so fix constraints and failing
+   evidence travel with the fix rather than being lost.
+7. The post-Build Verify hand-off is built from a **refreshed** context plan
+   (current changed files, symbols and a real bounded diff) plus the
+   verification result, so it reflects the worktree at hand-off time rather than
+   at delegation time.
+
+This is deterministic policy, not a learned router. A Debug hand-off is a
+recommendation to the Lead; the controller never switches models on its own.
 
 ## Stable context ordering
 

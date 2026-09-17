@@ -2,7 +2,16 @@ name: release
 
 # Builds the four supported `ocg` artifacts and publishes them with a
 # SHA256SUMS file. Nothing is published for a normal push or a manual run:
-# the release step only runs for a `v*` tag.
+# the release job only runs for a `v*` tag.
+#
+# Reliability rules:
+#   - `verify` runs formatting, clippy, the full Rust suite, the installer shell
+#     tests and configuration validation before any build;
+#   - every artifact is built on a native runner for its OS/arch, with an
+#     explicit architecture assertion, a native host test run and a `version`
+#     smoke test of the final artifact;
+#   - the release job depends on every required job and only publishes `v*`
+#     tags, marking `-rc.*` releases as prereleases.
 on:
   push:
     tags:
@@ -10,31 +19,66 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build-linux:
+  verify:
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: formatting
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: test suite
+        run: cargo test --locked
+      - name: installer tests
+        run: sh tests/installer_test.sh
+      - name: validate shipped configuration
+        run: cargo run --quiet --locked -- validate
+
+  build-linux:
+    needs: verify
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
             artifact: ocg-linux-x86_64
+            runner: ubuntu-24.04
+            host_arch: x86_64
           - target: aarch64-unknown-linux-musl
             artifact: ocg-linux-arm64
+            runner: ubuntu-24.04-arm
+            host_arch: aarch64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: assert native runner architecture
+        run: test "$(uname -m)" = "${{ matrix.host_arch }}"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: taiki-e/setup-cross-toolchain-action@v1
         with:
           target: ${{ matrix.target }}
-      - run: cargo build --release --locked --target ${{ matrix.target }}
-      - run: cp target/${{ matrix.target }}/release/ocg ${{ matrix.artifact }}
+      # The native host tests must pass before the artifact is built. The runner
+      # matches the target architecture, so this is a real native run.
+      - name: native host tests
+        run: cargo test --locked
+      - name: build ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: smoke-run the final artifact
+        run: |
+          cp target/${{ matrix.target }}/release/ocg ${{ matrix.artifact }}
+          ./${{ matrix.artifact }} version
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -42,41 +86,56 @@ jobs:
           if-no-files-found: error
 
   build-darwin:
+    needs: verify
     permissions:
       contents: read
-    runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
             artifact: ocg-darwin-arm64
+            runner: macos-15
+            host_arch: arm64
           - target: x86_64-apple-darwin
             artifact: ocg-darwin-x86_64
+            runner: macos-15-intel
+            host_arch: x86_64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: assert native runner architecture
+        run: test "$(uname -m)" = "${{ matrix.host_arch }}"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - run: cargo build --release --locked --target ${{ matrix.target }}
-      - run: cp target/${{ matrix.target }}/release/ocg ${{ matrix.artifact }}
+      - name: native tests for the target
+        run: cargo test --locked --release --target ${{ matrix.target }}
+      - name: build ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: smoke-run the final artifact
+        run: |
+          cp target/${{ matrix.target }}/release/ocg ${{ matrix.artifact }}
+          ./${{ matrix.artifact }} version
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
           if-no-files-found: error
 
+  # Publishes only for a `v*` tag. `-rc.*` tags are prereleases.
   release:
+    needs: [verify, build-linux, build-darwin]
+    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
-    needs: [build-linux, build-darwin]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: checksums
+      - name: checksums of the final artifacts
         run: |
           cd dist
           sha256sum ocg-* > SHA256SUMS
@@ -87,6 +146,48 @@ jobs:
           path: dist/*
           if-no-files-found: error
       - uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
         with:
+          name: OpenCode Gear ${{ github.ref_name }}
           files: dist/*
+          prerelease: ${{ contains(github.ref, '-rc.') }}
+          body: |
+            OpenCode Gear ${{ github.ref_name }}
+
+            This release includes:
+
+            - **Rust-native OCG** — a single, self-contained Rust binary; all
+              ranking, projection, freshness, retry and telemetry policy lives
+              in Rust.
+            - **Managed OpenCode runtime** — discovery, project-local install,
+              pinned versions, cached update checks and self-update.
+            - **macOS and Linux installer** — POSIX `install.sh`, four
+              artifacts (linux x86_64/arm64, darwin x86_64/arm64) and a
+              verified SHA256SUMS.
+            - **Repository Context Engine** — deterministic repo map,
+              incremental symbol index, bounded git diff, ranking and a
+              context cache.
+            - **Task Capsules** — versioned, inspectable structured planning
+              state.
+            - **Verification and Log Distillation** — explicitly configured,
+              shell-free commands with bounded raw logs and deterministic
+              failure-focused summaries.
+            - **Local Efficiency Metrics** — `ocg stats` aggregates of byte,
+              token-provenance, index/cache and verification accounting.
+            - **Automatic activation** — an ordinary `ocg` launch generates a
+              thin OpenCode plugin adapter and exports the bridge environment;
+              `OPENCODE_GEAR_ORCHESTRATION=0` disables it entirely.
+            - **Compact role handoffs** — typed, role-masked
+              `ModelHandoffCapsule` projections bounded by absolute bytes and a
+              fraction of the rich source.
+            - **Local-only telemetry** — events are written under
+              `<project>/.opencode-gear/telemetry/`; there is no remote endpoint
+              and no prompt, source, command or log content is stored.
+
+            Installing a prerelease: the unpinned installer follows the latest
+            **stable** release by design. Pin this candidate explicitly:
+
+            ```bash
+            OPENCODE_GEAR_VERSION=${{ github.ref_name }} sh install.sh
+            ```
+
+            This is a release candidate intended for real-world testing.

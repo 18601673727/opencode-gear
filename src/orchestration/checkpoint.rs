@@ -29,16 +29,18 @@ pub enum Phase {
     ExploreToBuild,
     BuildToVerify,
     VerifyToDebug,
+    DebugToBuild,
     Decision,
 }
 
 impl Phase {
     /// Every phase, in order.
-    pub fn all() -> [Phase; 4] {
+    pub fn all() -> [Phase; 5] {
         [
             Phase::ExploreToBuild,
             Phase::BuildToVerify,
             Phase::VerifyToDebug,
+            Phase::DebugToBuild,
             Phase::Decision,
         ]
     }
@@ -49,7 +51,8 @@ impl Phase {
             Phase::ExploreToBuild => 0,
             Phase::BuildToVerify => 1,
             Phase::VerifyToDebug => 2,
-            Phase::Decision => 3,
+            Phase::DebugToBuild => 3,
+            Phase::Decision => 4,
         }
     }
 
@@ -58,6 +61,7 @@ impl Phase {
             Phase::ExploreToBuild => "explore_to_build",
             Phase::BuildToVerify => "build_to_verify",
             Phase::VerifyToDebug => "verify_to_debug",
+            Phase::DebugToBuild => "debug_to_build",
             Phase::Decision => "decision",
         }
     }
@@ -69,6 +73,7 @@ impl Phase {
             "explore_to_build" | "explore" | "build" => Some(Phase::ExploreToBuild),
             "build_to_verify" | "verify" => Some(Phase::BuildToVerify),
             "verify_to_debug" | "debug" => Some(Phase::VerifyToDebug),
+            "debug_to_build" => Some(Phase::DebugToBuild),
             "decision" => Some(Phase::Decision),
             _ => None,
         }
@@ -457,9 +462,24 @@ mod tests {
             Some(Phase::ExploreToBuild)
         );
         assert_eq!(Phase::parse("build_to_verify"), Some(Phase::BuildToVerify));
+        assert_eq!(Phase::parse("debug-to-build"), Some(Phase::DebugToBuild));
         assert_eq!(Phase::parse("nonsense"), None);
         let value = serde_json::to_value(Phase::VerifyToDebug).unwrap();
         assert_eq!(value, json!("verify_to_debug"));
+    }
+
+    #[test]
+    fn checkpoint_phase_expansion_is_backward_compatible() {
+        // Prior checkpoints stored the existing snake_case names. Adding a new
+        // variant must not break deserializing them, and the new variant must
+        // round-trip on its own.
+        let old: Phase = serde_json::from_str("\"verify_to_debug\"").unwrap();
+        assert_eq!(old, Phase::VerifyToDebug);
+        let old: Phase = serde_json::from_str("\"decision\"").unwrap();
+        assert_eq!(old, Phase::Decision);
+        let new: Phase = serde_json::from_str("\"debug_to_build\"").unwrap();
+        assert_eq!(new, Phase::DebugToBuild);
+        assert_eq!(serde_json::to_value(new).unwrap(), json!("debug_to_build"));
     }
 
     #[test]

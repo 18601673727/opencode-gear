@@ -15,5 +15,12 @@
   "telemetry": {
     "enabled": true,
     "localOnly": true
+  },
+  "orchestration": {
+    "enabled": true,
+    "maxBuildRetries": 2,
+    "maxDebugRetries": 1,
+    "maxHandoffBytes": 4096,
+    "maxHandoffRatioPercent": 40
   }
 }

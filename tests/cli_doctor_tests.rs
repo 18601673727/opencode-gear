@@ -21,7 +21,9 @@ fn base_command(cwd: &Path, work: &Path) -> Command {
         .env_remove("OPENCODE_GEAR_OPENCODE")
         .env_remove("OPENCODE_GEAR_OPENCODE_BIN")
         .env_remove("OC_GEAR_OPENCODE_BIN")
-        .env_remove("OPENCODE_GEAR_TELEMETRY");
+        .env_remove("OPENCODE_GEAR_TELEMETRY")
+        .env_remove("OPENCODE_GEAR_ORCHESTRATION")
+        .env_remove("OC_GEAR_ORCHESTRATION");
     command
 }
 
@@ -65,6 +67,12 @@ fn doctor_reports_the_new_sections_and_creates_nothing() {
         "telemetry",
         "tool capability planner",
         "sensitive-file exclusions",
+        "orchestration",
+        "orchestration plugin",
+        "orchestration state",
+        "projection",
+        "context activation",
+        "verification integration",
     ] {
         assert!(text.contains(label), "missing '{label}' in\n{text}");
     }

@@ -181,3 +181,57 @@ fn token_source_labels_are_stable() {
     assert!(TokenSource::ProviderReported.is_exact());
     assert!(!TokenSource::Estimated.is_exact());
 }
+
+#[test]
+fn older_events_without_orchestration_still_parse() {
+    // The orchestration block was added after schema version 1 was released.
+    // An old line must keep parsing, with the block defaulted.
+    let dir = tempfile::tempdir().unwrap();
+    let store = TelemetryStore::new(dir.path(), enabled());
+    fs::create_dir_all(store.dir()).unwrap();
+    let old = r#"{"schema_version":1,"timestamp":5,"task_id":"task-old","task_type":"context","outcome":"success"}"#;
+    fs::write(store.path(), format!("{old}\n")).unwrap();
+    let log = store.read();
+    assert_eq!(log.events.len(), 1);
+    assert_eq!(log.corrupt_lines, 0);
+    assert_eq!(log.events[0].orchestration, Default::default());
+    assert_eq!(log.events[0].task_id, "task-old");
+}
+
+#[test]
+fn orchestration_metrics_aggregate_and_render() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = TelemetryStore::new(dir.path(), enabled());
+    let mut event = Event::new("task-orch", 1);
+    event.task_type = Some("orchestration".to_string());
+    event.outcome = Outcome::Success;
+    event.orchestration.phase = Some("build".to_string());
+    event.orchestration.source = Some("lead".to_string());
+    event.orchestration.destination = Some("build".to_string());
+    event.orchestration.attempt = Some(2);
+    event.orchestration.rich_capsule_bytes = 20_000;
+    event.orchestration.handoff_capsule_bytes = 2_400;
+    event.orchestration.selected_source_bytes = 1_700;
+    event.orchestration.diff_context_bytes = 120;
+    event.orchestration.verification_context_bytes = 335;
+    event.orchestration.model_dynamic_context_bytes = 4_000;
+    event.orchestration.cache_hits = 1;
+    event.orchestration.index_hits = 118;
+    store.append(&event).unwrap();
+
+    let stats = TelemetryStats::collect(&store);
+    let orchestration = &stats.aggregate.orchestration;
+    assert_eq!(orchestration.transitions, 1);
+    assert_eq!(orchestration.build_attempts, 1);
+    assert_eq!(orchestration.retries, 1);
+    assert_eq!(orchestration.rich_capsule_bytes, 20_000);
+    assert_eq!(orchestration.handoff_capsule_bytes, 2_400);
+    assert_eq!(orchestration.model_dynamic_context_bytes, 4_000);
+    assert_eq!(orchestration.cache_hits, 1);
+    assert_eq!(orchestration.index_hits, 118);
+    assert_eq!(orchestration.phases.get("build"), Some(&1));
+    let text = stats.render();
+    assert!(text.contains("orchestration"), "{text}");
+    assert!(text.contains("rich capsule:   20000"), "{text}");
+    assert!(text.contains("phase:       build"), "{text}");
+}

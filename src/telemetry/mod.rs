@@ -24,8 +24,8 @@ pub mod tokens;
 pub use stats::{Aggregate, TelemetryStats};
 pub use store::{EventLog, TelemetryStore, TELEMETRY_DIR, TELEMETRY_FILE};
 pub use task::{
-    ContextMetrics, Event, LogMetrics, Outcome, RepoMetrics, VerificationMetrics,
-    EVENT_SCHEMA_VERSION, REDACTED,
+    ContextMetrics, Event, LogMetrics, OrchestrationMetrics, Outcome, RepoMetrics,
+    VerificationMetrics, EVENT_SCHEMA_VERSION, REDACTED,
 };
 pub use tokens::{TokenCount, TokenSource};
 

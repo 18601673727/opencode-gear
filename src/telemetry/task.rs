@@ -101,6 +101,52 @@ pub struct VerificationMetrics {
     pub stage: Option<String>,
 }
 
+/// Orchestration accounting for one phase transition. All byte counts are byte
+/// counts; no prompt, source slice or raw log content is copied. Every field is
+/// optional/defaulted so an older event without orchestration still parses.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OrchestrationMetrics {
+    /// The controller phase (`idle`, `explore`, `build`, `verify`, `debug`,
+    /// `done`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// The role that produced the context (`lead`, `explore`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The role the context was projected for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    /// The build/verify/debug attempt index (1-based) when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<usize>,
+    /// The retry index (0 for the first attempt) when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<usize>,
+    /// The byte size of the rich source context before projection.
+    pub rich_capsule_bytes: u64,
+    /// The byte size of the projected hand-off capsule.
+    pub handoff_capsule_bytes: u64,
+    /// The byte size of the selected source slices (kept outside the capsule).
+    pub selected_source_bytes: u64,
+    /// The byte size of the bounded git diff context.
+    pub diff_context_bytes: u64,
+    /// The byte size of the verification block attached to the hand-off.
+    pub verification_context_bytes: u64,
+    /// The byte size of the dynamic context suffix actually sent to the model.
+    pub model_dynamic_context_bytes: u64,
+    /// Context-cache hits observed in this transition.
+    pub cache_hits: usize,
+    /// Symbol-index reuse hits observed in this transition.
+    pub index_hits: usize,
+    /// Verification outcome (`passed`, `failed`, `not_run`) when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_outcome: Option<String>,
+    /// The explainable reason a Debug hand-off was recommended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug_reason: Option<String>,
+}
+
 /// Raw-versus-distilled log byte accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -153,6 +199,8 @@ pub struct Event {
     pub verification: VerificationMetrics,
     #[serde(default)]
     pub logs: LogMetrics,
+    #[serde(default)]
+    pub orchestration: OrchestrationMetrics,
     /// Selected capability names, never capability arguments or tool output.
     #[serde(default)]
     pub capabilities: Vec<String>,
@@ -179,6 +227,7 @@ impl Event {
             repo: RepoMetrics::default(),
             verification: VerificationMetrics::default(),
             logs: LogMetrics::default(),
+            orchestration: OrchestrationMetrics::default(),
             capabilities: Vec::new(),
             outcome: Outcome::Unknown,
         }
@@ -206,6 +255,12 @@ impl Event {
         if let Some(stage) = self.verification.stage.take() {
             self.verification.stage = Some(redact(&stage));
         }
+        self.orchestration.phase = redact_optional(self.orchestration.phase);
+        self.orchestration.source = redact_optional(self.orchestration.source);
+        self.orchestration.destination = redact_optional(self.orchestration.destination);
+        self.orchestration.verification_outcome =
+            redact_optional(self.orchestration.verification_outcome);
+        self.orchestration.debug_reason = redact_optional(self.orchestration.debug_reason);
         self
     }
 }

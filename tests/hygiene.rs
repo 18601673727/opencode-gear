@@ -44,6 +44,12 @@ fn is_text_file(path: &Path) -> bool {
         .file_name()
         .map(|name| name.to_string_lossy())
         .unwrap_or_default();
+    // The conversation buffer is intentionally git-ignored and must never be
+    // committed; it is not part of the published tree, so it is not scanned.
+    let buffer = concat!("forward_", "to_gpt.md");
+    if name == buffer {
+        return false;
+    }
     if name == "LICENSE" || name == ".gitignore" {
         return true;
     }
@@ -334,4 +340,33 @@ fn contains_email(text: &str) -> bool {
         }
     }
     false
+}
+
+/// When the repository is a real Git worktree, the conversation buffer must not
+/// be tracked. In a no-git tarball export (no `.git`) this test is a no-op, so
+/// it never fails an offline source-only checkout.
+#[test]
+fn conversation_buffer_is_not_tracked_when_a_worktree_is_available() {
+    let root = repo_root();
+    if !root.join(".git").exists() {
+        return;
+    }
+    let output = match std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .arg("ls-files")
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return,
+    };
+    if !output.status.success() {
+        return;
+    }
+    let tracked = String::from_utf8_lossy(&output.stdout);
+    let buffer = concat!("forward_", "to_gpt.md");
+    assert!(
+        !tracked.lines().any(|line| line == buffer),
+        "the conversation buffer must not be tracked by Git"
+    );
 }

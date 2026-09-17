@@ -52,6 +52,7 @@ specialists that are good at their one job and cheap enough to use often.
 - [Security and secrets](#security-and-secrets)
 - [Observability (optional)](#observability-optional)
 - [Repository context (optional)](#repository-context-optional)
+- [Orchestration (optional)](#orchestration-optional)
 - [Troubleshooting](#troubleshooting)
 - [Repository layout](#repository-layout)
 - [Tests](#tests)
@@ -135,6 +136,14 @@ To pin a release, or to choose another directory:
 OPENCODE_GEAR_VERSION=v0.2.0 sh install.sh
 OPENCODE_GEAR_INSTALL_DIR="$HOME/bin" sh install.sh
 ```
+
+> **Release candidates.** The unpinned installer deliberately follows the
+> **latest stable** release. While `v0.2.0-rc.1` is a prerelease, pin it
+> explicitly:
+>
+> ```bash
+> OPENCODE_GEAR_VERSION=v0.2.0-rc.1 sh install.sh
+> ```
 
 Supported platforms:
 
@@ -585,6 +594,8 @@ working explicitly.
 | `OPENCODE_GEAR_TRACE` (legacy `OC_GEAR_TRACE`) | trace file, read only when observability is enabled |
 | `OPENCODE_GEAR_CACHE_DIR` | override the update-check cache directory |
 | `OPENCODE_GEAR_API_BASE` | override the GitHub API base (mirrors, tests) |
+| `OPENCODE_GEAR_TELEMETRY` (legacy `OC_GEAR_TELEMETRY`) | force local telemetry off/on |
+| `OPENCODE_GEAR_ORCHESTRATION` (legacy `OC_GEAR_ORCHESTRATION`) | force orchestration off/on for this process (`0` emits no plugin and no state) |
 
 ## Isolation and permissions
 
@@ -663,15 +674,19 @@ ocg cache clean                           # clear the context cache only
 ocg stats                                  # local telemetry aggregate
 ```
 
-**Integration boundary.** Context is produced only when you ask for it, through
-`ocg context` or the library API. An ordinary `ocg` / `ocg run` launch does
-**not** build an index or write context state: the plan is not injected into
-OpenCode because OpenCode's public config contract has no generic "context
-blob" key, and `ocg` does not invent one. The shipped Lead prompt instead tells
-the agent to prefer the deterministic `ocg context <task>` /
-`ocg context symbols <query>` commands when it needs repository context. The
-subsystem fails soft: a failed cache write or a bounded git capture only
-produces a warning, never a lost plan.
+**Integration boundary.** Context is produced on demand through `ocg context` or
+the library API, and it is also the substrate for optional orchestration:
+when `orchestration.enabled` is true, an ordinary `ocg` / `ocg run` launch
+materializes a thin generated OpenCode plugin adapter and exports the bridge
+environment, so the running session can request bounded dynamic context and
+role hand-offs. The adapter performs no ranking or policy itself; every
+decision stays in the `ocg` Rust bridge (see
+[Orchestration](#orchestration-optional)). With orchestration disabled (the
+`OPENCODE_GEAR_ORCHESTRATION=0` escape hatch or `"orchestration":
+{"enabled": false}`) no plugin is emitted and launch writes no orchestration
+state. An ordinary launch never builds the context **index**: `ocg context`
+still owns that. The subsystem fails soft: a failed cache write or a bounded
+git capture only produces a warning, never a lost plan.
 
 Set `"context": {"enabled": false}` to disable it entirely. Then `ocg context`
 prints an informational message, returns success, and never reads, indexes or
@@ -692,6 +707,8 @@ State layout, alongside the managed runtime:
   cache/context/*.json        fine-grained plan cache
   logs/*.log                  raw verification logs (never swept by cache clean)
   checkpoints/*.json          phase checkpoints (inspectable JSON)
+  orchestration/state.json    bounded controller state (phases, attempts, findings)
+  orchestration/plugin/       generated OpenCode JS adapter (file:// plugin)
   telemetry/events.jsonl      local-only telemetry events (inspectable JSONL)
 ```
 
@@ -727,6 +744,124 @@ Telemetry is on by default and always local-only. Disable it with
 telemetry is reported as "no data" and never blocks a command. See
 [docs/telemetry.md](docs/telemetry.md) for the schema and privacy model, and
 [docs/token-efficiency.md](docs/token-efficiency.md) for one measured example.
+
+### Orchestration (optional)
+
+Orchestration moves a task through Explore → Build → Verify (→ Debug) without
+adding a second source of policy. **All ranking, projection, freshness, retry
+and telemetry logic lives in Rust**; the JavaScript that OpenCode loads is a
+thin, generated adapter. It is off only when you turn it off: set
+`"orchestration": {"enabled": false}` or `OPENCODE_GEAR_ORCHESTRATION=0`.
+
+> **Filesystem requirement (fail-fast).** An ordinary `ocg` / `ocg run` is a
+> coding session and **creates `<project>/.opencode-gear/` and requires it to be
+> writable**. If the adapter cannot be materialized, the launch fails clearly
+> rather than injecting a broken `file://` plugin. `OPENCODE_GEAR_ORCHESTRATION=0`
+> is the escape hatch when the project directory is read-only. `ocg models` is
+> **not** a coding session: it never materializes the plugin, never writes state
+> and does not require a writable project directory.
+
+How activation works (uses only supported OpenCode mechanisms):
+
+```text
+ocg launch
+  ├─ materializes <project>/.opencode-gear/orchestration/plugin/ocg-orchestration.js
+  ├─ injects its file:// URL into the generated config `plugin` array
+  │    (existing user plugins are preserved; never added twice)
+  └─ exports OPENCODE_GEAR_OCG + OPENCODE_GEAR_PROJECT to OpenCode
+
+OpenCode hook                adapter action (no policy)      Rust bridge
+  chat.message               append delimited suffix   ──▶  prepare_lead_context
+  tool.execute.before(task)  append hand-off to prompt ──▶  prepare_handoff
+  tool.execute.after(explore) append bounded summary  ──▶  consume_explore_result
+  tool.execute.after(build)  append verification note ──▶  after_build
+```
+
+The bridge is a hidden `ocg __bridge <event>` command. The adapter spawns it
+with a direct argv and JSON on stdin (never a shell), and swallows any bridge
+failure so it can never break a session. A stable delimiter
+(`<<<OCG:DYNAMIC_CONTEXT v1>>> … <<<OCG:END>>>`) is appended after the original
+prompt, so the user/agent prompt always stays first.
+
+Explore and ExploreDeep hand-offs also append a compact, advisory response
+contract asking for one JSON object (`goal`, `constraints`, `findings`,
+`files`, `symbols`). It is not a prompt rewrite, and the deterministic fallback
+parser still works if a model ignores it.
+
+The `chat.message` hook only injects dynamic context into the **Lead** session
+(`input.agent` absent or starting with `lead-`); consumer subagent sessions do
+not receive a duplicate Lead context. The task before/after hooks stay active in
+every session. The bridge reads and caps its stdin (4 MiB) before any early
+return, so a disabled or rejected payload never produces a BrokenPipe.
+
+Policy, honestly bounded:
+
+- **Typed hand-offs.** The rich planning state (`TaskCapsule` plus selected
+  source slices, a bounded diff and optional verification) is projected into a
+  compact `ModelHandoffCapsule` for one role transition. Each destination clears
+  the fields it does not need: Explore never sees verification failures or raw
+  logs, Build sees only high-confidence findings and fix feedback, Verify sees
+  the change and verification rather than exploratory narrative, Debug gets only
+  failures/evidence/verification/raw logs/the relevant bounded diff, and Docs
+  gets the goal, findings, files, decisions and verification. The projection
+  keeps required fields,
+  drops optional material deterministically and reports what it dropped.
+  Selected source is a *separate* dynamic-context block, never part of the
+  compact capsule, and it is not appended for a Debug delegation.
+- **Bounded (runtime optimization envelope).** Every hand-off is capped by
+  `maxHandoffBytes` (default `16384`) and as a percentage of the rich task
+  context (`maxHandoffRatioPercent`, default `60`). This is a size optimization,
+  **not** a correctness rule: required evidence (goal, hard constraints,
+  critical findings, changed files, failing locations) is never dropped to fit.
+  The deterministic release fixture deliberately configures a tighter
+  `4096` / `40%` regression gate to catch projection regressions.
+- **Retry then Debug.** After Build, `ocg` runs the stage configured under
+  `verification` (only trusted, structured commands). A pass ends the task with
+  no Debug. A failure allows up to `maxBuildRetries` (default `2`) Build
+  retries; when the budget is exhausted it recommends Debug with an explainable
+  reason (stage, outcome, attempt/retry count, failing-command count and first
+  distilled location — **no configured command string and no raw output**). Each
+  Debug delegation counts against `maxDebugRetries`; once exceeded, the hand-off
+  and dynamic context carry an explicit **user-escalation** instruction instead
+  of continuing automatically. The Build→Verify
+  hand-off is rebuilt from a refreshed context plan (current changed files,
+  symbols and a real bounded diff) plus the verification result. Debug receives
+  only failures, evidence, the relevant bounded diff, raw-log references and the
+  distilled verification block; returning from Debug to Build is a distinct
+  `DebugToBuild` transition with its own checkpoint and fix constraints.
+- **Real diff, not a reference.** The context plan preserves the actual
+  `DiffSummary` it ranked against; Build/Verify/Debug hand-offs carry a bounded,
+  deterministic rendering of its retained entries and hunks (with structural
+  truncation stated), filtered for sensitive paths and secret-shaped content.
+- **Secrets.** Every hand-off field is sanitized at the projection boundary:
+  secret-shaped task/goal/constraint/finding/verification/decision/evidence/
+  reference text is omitted or redacted, sensitive paths are dropped, and a
+  selected source slice whose *content* looks secret-shaped is dropped whole
+  even when its path is innocuous. This reuses the existing path classifier and
+  secret detector.
+- **Fail-soft.** Corrupt state, checkpoint or cache recovers to empty/rebuild,
+  never fatal.
+- **Advisory capabilities.** The capability plan is included in the dynamic
+  context as advice. Actual runtime permission enforcement remains OpenCode's
+  job; this version does **not** claim to sandbox or silently change agent
+  permissions.
+
+Configuration:
+
+```json
+{
+  "orchestration": {
+    "enabled": true,
+    "maxBuildRetries": 2,
+    "maxDebugRetries": 1,
+    "maxHandoffBytes": 16384,
+    "maxHandoffRatioPercent": 60
+  }
+}
+```
+
+There is no learned router and no automatic model switching. `ocg doctor`
+reports orchestration health read-only.
 
 ## Verification, checkpoints and capabilities (optional)
 
@@ -879,7 +1014,8 @@ opencode-gear/
   src/context/           deterministic local context engine (repo map, index,
                          symbols, git diff, ranking, cache, capsules)
   src/verification/      explicit verification, log distillation, test selection
-  src/orchestration/     versioned phase checkpoints
+  src/orchestration/     typed hand-offs, Rust controller/state, checkpoints,
+                         generated OpenCode plugin adapter and hidden bridge
   src/telemetry/         local-only JSONL events, token provenance, stats
   src/runtime/           managed OpenCode runtime (policy, resolve, install,
                          cache, release, archive, self-update)
@@ -986,8 +1122,8 @@ walkthrough.
 | [docs/architecture.md](docs/architecture.md) | The two axes, resolution pipeline, invariants, extension points |
 | [docs/configuration.md](docs/configuration.md) | Every registry, override shape, environment variable and command |
 | [docs/verification.md](docs/verification.md) | Verification, log distillation, test selection, capabilities/firewall, checkpoints, stable ordering |
-| [docs/telemetry.md](docs/telemetry.md) | Telemetry schema, privacy model, token provenance, `ocg stats`, doctor checks, deferred boundaries |
-| [docs/token-efficiency.md](docs/token-efficiency.md) | One recorded deterministic context and log-distillation measurement |
+| [docs/telemetry.md](docs/telemetry.md) | Telemetry schema, privacy model, token provenance, orchestration accounting, `ocg stats`, doctor checks, deferred boundaries |
+| [docs/token-efficiency.md](docs/token-efficiency.md) | Recorded deterministic context, log-distillation and orchestration hand-off measurements |
 | [docs/migration.md](docs/migration.md) | Step-by-step migration from a whole-bundle Gear/profile setup |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Failure modes and how to diagnose them |
 

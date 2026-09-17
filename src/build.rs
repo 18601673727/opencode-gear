@@ -188,5 +188,15 @@ pub fn build_opencode_config(effective: &Effective, level: &str) -> Result<Value
     if let Some(extra) = data.get("opencode").filter(|value| value.is_object()) {
         merged = deep_merge(&merged, extra);
     }
+
+    // Orchestration adds one generated `file://` plugin entry when it is
+    // enabled. User plugins are preserved; the adapter itself is materialized
+    // at launch, so config generation stays pure and read-only.
+    let orchestration = crate::orchestration::OrchestrationConfig::from_config(data)?;
+    if orchestration.enabled {
+        if let Some(uri) = crate::orchestration::plugin::plugin_uri(&effective.cwd) {
+            crate::orchestration::plugin::inject_plugin(&mut merged, &uri);
+        }
+    }
     Ok(merged)
 }

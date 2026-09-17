@@ -33,7 +33,8 @@ use std::path::Path;
 
 /// Explicit context preparation helper for callers that want to warm the index
 /// (the library API and tests). It is deliberately **not** called by an
-/// ordinary `ocg` / `ocg run` launch: context is only produced on demand.
+/// ordinary `ocg` / `ocg run` launch, which never builds the index; optional
+/// orchestration answers bridge calls from its own plan without warming it.
 ///
 /// Returns human-readable warnings. A broken or disabled context subsystem only
 /// produces a warning (or nothing at all when it is disabled).

@@ -7,7 +7,8 @@
 
 use crate::telemetry::store::{EventLog, TelemetryStore};
 use crate::telemetry::task::{
-    ContextMetrics, Event, LogMetrics, Outcome, RepoMetrics, VerificationMetrics,
+    ContextMetrics, Event, LogMetrics, OrchestrationMetrics, Outcome, RepoMetrics,
+    VerificationMetrics,
 };
 use crate::telemetry::tokens::{TokenCount, TokenSource};
 use serde::Serialize;
@@ -151,6 +152,70 @@ impl VerificationTotals {
     }
 }
 
+/// Orchestration transition totals. Byte counts are summed; phase and
+/// debug-reason maps are keyed by redacted label so the aggregate stays safe.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct OrchestrationTotals {
+    pub transitions: u64,
+    pub rich_capsule_bytes: u64,
+    pub handoff_capsule_bytes: u64,
+    pub selected_source_bytes: u64,
+    pub diff_context_bytes: u64,
+    pub verification_context_bytes: u64,
+    pub model_dynamic_context_bytes: u64,
+    pub build_attempts: u64,
+    pub verify_attempts: u64,
+    pub debug_attempts: u64,
+    pub retries: u64,
+    pub cache_hits: u64,
+    pub index_hits: u64,
+    pub phases: BTreeMap<String, usize>,
+    pub debug_reasons: BTreeMap<String, usize>,
+}
+
+impl OrchestrationTotals {
+    fn add(&mut self, metrics: OrchestrationMetrics) {
+        self.transitions += 1;
+        self.rich_capsule_bytes = self
+            .rich_capsule_bytes
+            .saturating_add(metrics.rich_capsule_bytes);
+        self.handoff_capsule_bytes = self
+            .handoff_capsule_bytes
+            .saturating_add(metrics.handoff_capsule_bytes);
+        self.selected_source_bytes = self
+            .selected_source_bytes
+            .saturating_add(metrics.selected_source_bytes);
+        self.diff_context_bytes = self
+            .diff_context_bytes
+            .saturating_add(metrics.diff_context_bytes);
+        self.verification_context_bytes = self
+            .verification_context_bytes
+            .saturating_add(metrics.verification_context_bytes);
+        self.model_dynamic_context_bytes = self
+            .model_dynamic_context_bytes
+            .saturating_add(metrics.model_dynamic_context_bytes);
+        self.cache_hits = self.cache_hits.saturating_add(metrics.cache_hits as u64);
+        self.index_hits = self.index_hits.saturating_add(metrics.index_hits as u64);
+        if let Some(phase) = metrics.phase.as_deref() {
+            *self.phases.entry(phase.to_string()).or_insert(0) += 1;
+            match phase {
+                "build" => self.build_attempts += 1,
+                "verify" => self.verify_attempts += 1,
+                "debug" => self.debug_attempts += 1,
+                _ => {}
+            }
+        }
+        if let Some(attempt) = metrics.attempt {
+            self.retries = self
+                .retries
+                .saturating_add(attempt.saturating_sub(1) as u64);
+        }
+        if let Some(reason) = metrics.debug_reason {
+            *self.debug_reasons.entry(reason).or_insert(0) += 1;
+        }
+    }
+}
+
 /// Raw-versus-distilled log totals.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct LogTotals {
@@ -170,7 +235,6 @@ impl LogTotals {
         reduction_percent(self.reduction_bytes, self.raw_bytes)
     }
 }
-
 /// The project aggregate.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Aggregate {
@@ -182,6 +246,7 @@ pub struct Aggregate {
     pub repo: RepoTotals,
     pub verification: VerificationTotals,
     pub logs: LogTotals,
+    pub orchestration: OrchestrationTotals,
     pub capabilities: BTreeMap<String, usize>,
 }
 
@@ -203,6 +268,7 @@ impl Aggregate {
             aggregate.repo.add(event.repo);
             aggregate.verification.add(event.verification.clone());
             aggregate.logs.add(event.logs);
+            aggregate.orchestration.add(event.orchestration.clone());
             for name in &event.capabilities {
                 *aggregate.capabilities.entry(name.clone()).or_insert(0) += 1;
             }
@@ -226,6 +292,12 @@ pub struct EventSummary {
     pub provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
     pub duration_ms: u64,
     pub outcome: Outcome,
 }
@@ -240,6 +312,9 @@ impl EventSummary {
             role: event.role.clone(),
             provider: event.provider.clone(),
             model: event.model.clone(),
+            phase: event.orchestration.phase.clone(),
+            source: event.orchestration.source.clone(),
+            destination: event.orchestration.destination.clone(),
             duration_ms: event.duration_ms,
             outcome: event.outcome,
         }
@@ -393,6 +468,15 @@ impl TelemetryStats {
                 "  model:       {}\n",
                 latest.model.as_deref().unwrap_or("-")
             ));
+            out.push_str(&format!(
+                "  phase:       {}\n",
+                latest.phase.as_deref().unwrap_or("-")
+            ));
+            out.push_str(&format!(
+                "  route:       {} -> {}\n",
+                latest.source.as_deref().unwrap_or("-"),
+                latest.destination.as_deref().unwrap_or("-")
+            ));
             out.push_str(&format!("  duration:    {} ms\n", latest.duration_ms));
             out.push_str(&format!("  outcome:     {}\n", latest.outcome.as_str()));
         }
@@ -471,6 +555,60 @@ impl TelemetryStats {
             aggregate.logs.reduction_bytes,
             aggregate.logs.reduction_percent()
         ));
+
+        out.push_str("\norchestration (bytes unless noted):\n");
+        out.push_str(&format!(
+            "  transitions: {} (build {}, verify {}, debug {}, retries {})\n",
+            aggregate.orchestration.transitions,
+            aggregate.orchestration.build_attempts,
+            aggregate.orchestration.verify_attempts,
+            aggregate.orchestration.debug_attempts,
+            aggregate.orchestration.retries,
+        ));
+        out.push_str(&format!(
+            "  rich capsule:   {}\n",
+            aggregate.orchestration.rich_capsule_bytes
+        ));
+        out.push_str(&format!(
+            "  handoff capsule: {}\n",
+            aggregate.orchestration.handoff_capsule_bytes
+        ));
+        out.push_str(&format!(
+            "  selected source: {}\n",
+            aggregate.orchestration.selected_source_bytes
+        ));
+        out.push_str(&format!(
+            "  diff context:    {}\n",
+            aggregate.orchestration.diff_context_bytes
+        ));
+        out.push_str(&format!(
+            "  verification:    {}\n",
+            aggregate.orchestration.verification_context_bytes
+        ));
+        out.push_str(&format!(
+            "  model dynamic:   {}\n",
+            aggregate.orchestration.model_dynamic_context_bytes
+        ));
+        out.push_str(&format!(
+            "  cache hits:      {}\n",
+            aggregate.orchestration.cache_hits
+        ));
+        out.push_str(&format!(
+            "  index hits:      {}\n",
+            aggregate.orchestration.index_hits
+        ));
+        if !aggregate.orchestration.phases.is_empty() {
+            out.push_str("  phases:\n");
+            for (phase, count) in &aggregate.orchestration.phases {
+                out.push_str(&format!("    {phase}: {count}\n"));
+            }
+        }
+        if !aggregate.orchestration.debug_reasons.is_empty() {
+            out.push_str("  debug reasons:\n");
+            for (reason, count) in &aggregate.orchestration.debug_reasons {
+                out.push_str(&format!("    {reason}: {count}\n"));
+            }
+        }
 
         out.push_str("\noutcomes:\n");
         out.push_str(&format!("  success:     {}\n", aggregate.outcomes.success));

@@ -304,3 +304,54 @@ still load and later writes still succeed. `ocg doctor` shows the same corrupt
 count as a warning. To start over, delete
 `<project>/.opencode-gear/telemetry/events.jsonl` (or the whole
 `.opencode-gear/telemetry/` directory); nothing else depends on it.
+
+## Orchestration does not activate in an OpenCode session
+
+`ocg doctor` reports the read-only pieces to check:
+
+- `orchestration` should say `enabled`; `OPENCODE_GEAR_ORCHESTRATION=0` or
+  `"orchestration": {"enabled": false}` disables the whole layer, and a disabled
+  layer intentionally emits no plugin and writes no state.
+- `orchestration plugin` should point at
+  `<project>/.opencode-gear/orchestration/plugin/ocg-orchestration.js`. It is
+  materialized at launch; `ocg build` only previews the `file://` entry.
+- `runtime` must be a compatible OpenCode (`>= 1.18.0`); local JS plugins are a
+  supported mechanism in current OpenCode.
+
+The generated config is accepted by `opencode debug config`; the plugin also
+swallows every bridge error, so a broken bridge degrades to no dynamic context
+rather than a failed session.
+
+## The orchestration bridge reports `{ "ok": false }`
+
+That is the fail-soft contract. The adapter never surfaces an error into
+OpenCode. Common causes: the `ocg` bridge executable is not on
+`OPENCODE_GEAR_OCG`/`PATH`, the payload was empty, or orchestration is disabled.
+Run `ocg __bridge chat.message --project <dir>` with a JSON payload to test the
+Rust side directly; no model is involved.
+
+## A task keeps recommending Debug
+
+That is the deterministic retry policy, not a learned router. After a failed
+verification, `orchestration.maxBuildRetries` (default `2`) Build retries are
+allowed; when they are exhausted the controller recommends Debug with the
+stage, outcome, attempt/retry counts, failing-command count and first distilled
+location. Increase the retry budget only if the retries are actually productive,
+or fix the underlying failure.
+
+## `ocg` fails because the project directory is not writable
+
+An ordinary `ocg` / `ocg run` is a coding session and materializes the
+orchestration adapter under `<project>/.opencode-gear/`, so that directory must
+be writable. This is deliberate fail-fast behavior: a launch refuses to inject a
+`file://` plugin that does not exist. Set `OPENCODE_GEAR_ORCHESTRATION=0` (or
+`"orchestration": {"enabled": false}`) for a read-only project. `ocg models` is
+not a coding session and never materializes the plugin or writes state.
+
+## Repeated Debug delegations ask for the user
+
+Each Debug hand-off consumes a `maxDebugRetries` attempt (default `1`). Once the
+budget is exceeded the controller appends an explicit user-escalation
+instruction to the Debug hand-off and records the attempt in telemetry; it never
+keeps looping automatically. Raise `maxDebugRetries` only if repeated Debug
+passes are genuinely productive.

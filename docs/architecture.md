@@ -170,15 +170,17 @@ Invariants worth preserving:
   git identity must match. A poisoned entry is discarded.
 - **Fail-soft.** A failed cache write only warns and keeps the computed plan;
   the plan's `notes` carry the reason.
-- **Explicit production only.** An ordinary `ocg` / `ocg run` launch does not
-  prepare context, because the plan is not injected into OpenCode. Context is
-  produced by `ocg context` / `ocg context symbols` or the library API, and the
-  Lead prompt points the agent at those commands. `context.enabled: false` makes
-  `ocg context` a no-op that writes nothing.
-- **No invented OpenCode mechanism.** The plan is exposed through `ocg context`
-  and the library; it is not smuggled into the generated OpenCode config, which
-  has no generic context-blob key. Only mechanisms documented by OpenCode are
-  used.
+- **Explicit index production, optional activation.** The context *index* is
+  produced by `ocg context` / `ocg context symbols` or the library API, never by
+  a plain launch. When orchestration is enabled, a launch does materialize the
+  generated plugin adapter (see [Orchestration](#orchestration)) and can answer
+  the adapter's bridge calls with bounded dynamic context; that is activation,
+  not index construction. `context.enabled: false` makes `ocg context` a no-op
+  and makes the orchestration dynamic context empty.
+- **No invented OpenCode mechanism.** Activation uses the supported local JS
+  plugin contract; the generated adapter is injected through the config's
+  `plugin` array and calls the hidden `ocg __bridge` command. Nothing is
+  smuggled into an undocumented config key.
 
 `ocg cache clean` removes the cache subtree only; `runtime/`, `index/`, the
 raw verification `logs/` and `checkpoints/` are never touched by it. Creating
@@ -190,6 +192,64 @@ policy, repository map, capability/tool descriptions, task capsule, relevant
 symbols/source, current git diff, verification state) and embeds the capability
 plan and targeted-test proposal. The stable order is part of the contract and is
 covered by deterministic tests.
+
+## Orchestration
+
+Orchestration is the layer that carries a task across roles. It is deliberately
+split so policy cannot drift into the wrong language:
+
+```text
+Rust (authority)
+  controller/state   phases, attempts/retries, freshness, retry/Debug policy
+  projection         typed ModelHandoffCapsule, caps, secret defense
+  bridge             `ocg __bridge <event>` JSON translation + telemetry
+  plugin generator   materialize the adapter, inject the file:// URL
+
+JavaScript (transport only)
+  ocg-orchestration.js  appends delimited context/feedback, spawns the bridge
+```
+
+- **One authority.** The adapter does no ranking, projection or policy; it only
+  moves bytes between OpenCode hooks and the Rust bridge with a direct argv and
+  stdin (never a shell). The bridge drains and caps stdin (4 MiB) before any
+  early return, so a disabled or rejected payload cannot cause a BrokenPipe.
+- **No duplicate Lead context.** Only `chat.message` is scoped to the Lead
+  session (`input.agent` absent or starting with `lead-`); consumer subagent
+  sessions skip it, while `tool.execute.before/after` remain active everywhere.
+- **Typed hand-offs.** The rich `ProjectionInput` (a `TaskCapsule` plus
+  selected source slices, a bounded diff summary and an optional verification
+  block) is projected into a compact `ModelHandoffCapsule` for exactly one
+  source→destination transition. Each destination clears the fields it does not
+  need, so an Explore hand-off cannot leak verification residue and a Debug
+  hand-off cannot leak exploratory narrative. Required fields survive; optional
+  material is dropped deterministically and counted. Source slices are a
+  separate dynamic-context block.
+- **Bounded (runtime optimization envelope).** `orchestration.maxHandoffBytes`
+  (default `16384`) and `maxHandoffRatioPercent` (default `60`) bound every
+  capsule. These are size optimizations, not correctness rules: required
+  evidence is never dropped to satisfy them, and an overage is recorded. The
+  deterministic release fixture uses a tight `4096` / `40%` regression gate.
+- **Freshness.** Checkpoints are revalidated before reuse; a stale or corrupt
+  checkpoint is reported, not silently trusted. The post-Build Verify hand-off
+  is rebuilt from a refreshed context plan (current changed files, symbols and a
+  real bounded diff) plus the verification result.
+- **Retry then Debug.** `after_build` runs only the explicitly configured
+  verification commands, checkpoints Build→Verify, and either passes, allows a
+  bounded Build retry, or recommends Debug with an explainable reason. Debug
+  gets only failures, evidence, the relevant bounded diff, raw-log references and
+  the distilled verification block. Returning from Debug to Build is a distinct
+  `DebugToBuild` transition with its own checkpoint.
+- **Real diff.** The context plan preserves the actual `DiffSummary` it ranked
+  against; Build/Verify/Debug hand-offs render a bounded, deterministic view of
+  its retained entries and hunks, filtered for sensitive paths and secret-shaped
+  content, with structural truncation stated.
+- **Fail-soft.** Corrupt state, checkpoint or cache recovers; a disabled
+  orchestration emits no plugin, writes no state and records nothing.
+- **Capabilities stay advisory.** Capability narrowing is included as advice in
+  the dynamic context; runtime permission enforcement remains OpenCode's job.
+
+State lives under `.opencode-gear/orchestration/` and the adapter under
+`.opencode-gear/orchestration/plugin/`; both are ignored local state.
 
 ## Verification, distillation and checkpoints
 

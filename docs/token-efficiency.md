@@ -71,11 +71,35 @@ One run, first observation, debug test profile.
 | fixture modules | 120 |
 | candidate bytes | 12,729 |
 | selected bytes | 2,044 |
-| capsule bytes | 13,250 |
+| capsule bytes | 13,255 |
 | context reduction | 10,685 bytes (83.9%) |
 | raw log bytes | 14,399 |
 | distilled bytes | 666 |
 | log reduction | 13,733 bytes (95.4%) |
+
+Orchestration hand-offs, from the same fixture (task
+`update module_1 parse_1 parser`, Explore → Build → Verify → Debug):
+
+| Metric | Value |
+| --- | ---: |
+| candidate context bytes | 12,729 |
+| selected source bytes | 1,752 |
+| rich capsule bytes | 21,642 |
+| Explore → Build hand-off | 2,526 |
+| Build → Verify hand-off | 2,620 |
+| Verify → Debug hand-off | 1,079 |
+| model dynamic context bytes | 4,143 |
+
+This fixture deliberately configures the tight `4096`-byte / `40%` regression
+gate (not the runtime envelope of `16384` / `60%`). Every hand-off is below
+4,096 bytes and below 40% of the 21,642-byte rich task context (8,656 bytes).
+The Build → Verify figure is an actual typed `ModelHandoffCapsule` produced
+after automatic verification from a refreshed context plan (current changed
+files, symbols and a real bounded diff), not just the serialized verification
+block. The fixture also asserts that the goal, the hard constraint, the relevant
+symbol `parse_1`, a critical finding and the failing location
+`src/module_1.rs:4:5` survive the projection — evidence is not dropped to hit a
+byte target.
 
 Read honestly:
 
@@ -85,6 +109,9 @@ Read honestly:
 - **The capsule is not context slices.** It is the structured task capsule
   (task fingerprint, selected paths, symbols, verification state) and is larger
   than the small fixture's selected bytes.
+- **A hand-off is smaller still.** It is the compact projection of the rich
+  capsule *and* the selected source: source slices travel separately in the
+  dynamic context and never enter the compact capsule.
 - **The estimated token count for this plan is `2044 / 4 = 511`** and is labelled
   `estimated` in telemetry. It is not a provider measurement.
 
@@ -92,12 +119,14 @@ Read honestly:
 
 | Stage | First run (ms) | Repeated runs (ms) |
 | --- | ---: | ---: |
-| cold (map + index + plan) | 12.578 | 12.55 – 12.86 |
-| warm unchanged (cache hit) | 8.341 | 8.23 – 8.45 |
-| incremental (one file changed) | 11.711 | 11.38 – 11.75 |
+| cold (map + index + plan) | 12.540 | 12.54 – 12.86 |
+| warm unchanged (cache hit) | 8.427 | 8.23 – 8.45 |
+| incremental (one file changed) | 11.472 | 11.32 – 11.75 |
 
 The spread across repeated runs reflects ordinary machine load, not a change in
-the fixture or the engine.
+the fixture or the engine. The capsule byte count grew by 5 bytes versus the
+0.1.0 record because the engine-version string (`0.2.0-rc.1`) is embedded in
+provenance; the content is otherwise unchanged.
 
 Warm still rebuilds the repo map and revalidates the index; it only skips
 ranking, slicing and file reads. That is why warm is faster but not free.
@@ -108,14 +137,18 @@ ranking, slicing and file reads. That is why warm is faster but not free.
 cargo test --test measurement_tests -- --nocapture
 ```
 
-The test prints one block:
+The test prints two blocks:
 
 ```text
 OCG_MEASUREMENT version=1 fixture_modules=120
-context candidates=12729 selected=2044 capsule=13250 reduction=10685 reduction_percent=83.9
+context candidates=12729 selected=2044 capsule=13255 reduction=10685 reduction_percent=83.9
 log raw=14399 distilled=666 reduction=13733 reduction_percent=95.4
-timing cold_ms=12.578 warm_ms=8.341 incremental_ms=11.711
+timing cold_ms=12.540 warm_ms=8.427 incremental_ms=11.472
 OCG_MEASUREMENT_END
+OCG_ORCHESTRATION_MEASUREMENT version=1 fixture_modules=120
+candidate_context_bytes=12729 selected_source_bytes=1752 rich_capsule_bytes=21642
+explore_to_build_handoff_bytes=2526 build_to_verify_handoff_bytes=2620 verify_to_debug_handoff_bytes=1079 model_dynamic_context_bytes=4143
+OCG_ORCHESTRATION_MEASUREMENT_END
 ```
 
 ## Limitations

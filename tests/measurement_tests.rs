@@ -12,10 +12,16 @@
 //! The fixture is intentionally small and uniform: it is one representative
 //! sample on one machine, not a benchmark and not universal.
 
+use opencode_gear::capabilities::CapabilityConfig;
 use opencode_gear::clock::FixedClock;
 use opencode_gear::context::{ContextConfig, ContextEngine};
-use opencode_gear::process::FakeGitHost;
+use opencode_gear::orchestration::config::OrchestrationConfig;
+use opencode_gear::orchestration::controller::Controller;
+use opencode_gear::orchestration::handoff::Role;
+use opencode_gear::process::{FakeCaptureRunner, FakeGitHost};
+use opencode_gear::verification::config::VerificationConfig;
 use opencode_gear::verification::distill::distill;
+use serde_json::json;
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -165,4 +171,178 @@ fn measurement_context_and_log_distillation() {
     );
     println!("timing cold_ms={cold_ms:.3} warm_ms={warm_ms:.3} incremental_ms={incremental_ms:.3}");
     println!("OCG_MEASUREMENT_END");
+}
+
+/// Deterministic orchestration hand-off measurement.
+///
+/// Drives the same 120-module fixture through Explore → Build → Verify → Debug
+/// with a fixed clock and fakes, and asserts that every hand-off capsule fits
+/// the absolute cap and the ratio cap while keeping the required fields.
+#[test]
+fn measurement_orchestration_handoffs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fixture(root);
+
+    let task = "update module_1 parse_1 parser";
+    let verification = VerificationConfig::from_config(&json!({
+        "verification": {
+            "stages": {"normal": {"commands": [{"program": "cargo", "args": ["test"]}]}},
+            "defaultStage": "normal"
+        }
+    }))
+    .unwrap();
+    let git = FakeGitHost::new();
+    let clock = FixedClock::new(2_000);
+    // The deterministic release fixture deliberately uses the tight
+    // 4096-byte / 40% regression gate, not the runtime optimization envelope.
+    let fixture_config = OrchestrationConfig {
+        enabled: true,
+        max_handoff_bytes: 4096,
+        max_handoff_ratio_percent: 40,
+        ..OrchestrationConfig::default()
+    };
+    let controller = Controller::new(
+        root,
+        fixture_config,
+        ContextConfig::default(),
+        CapabilityConfig::default(),
+        verification,
+        &git,
+        &clock,
+    );
+
+    // Cold context plan for the candidate/selected byte figures.
+    let engine = ContextEngine::new(root, ContextConfig::default(), &git, &clock);
+    let plan = engine.plan(task, None).unwrap();
+    let candidate_context_bytes = plan.plan.candidate_bytes as u64;
+    let selected_source_bytes = plan.plan.selected_bytes as u64;
+    assert!(candidate_context_bytes > selected_source_bytes);
+
+    controller
+        .prepare_lead_context("measurement", task)
+        .unwrap();
+    let explore = controller
+        .prepare_handoff("measurement", Role::Explore, task)
+        .unwrap();
+    assert!(explore.metrics.model_dynamic_context_bytes > 0);
+
+    let explore_result = json!({
+        "goal": "make parse_1 safe",
+        "constraints": ["never break the public API"],
+        "findings": [
+            {"summary": "parse_1 is recursive", "severity": "critical", "source": "src/module_1.rs"}
+        ],
+        "files": ["src/module_1.rs"],
+        "symbols": [{"name": "parse_1"}]
+    })
+    .to_string();
+    controller
+        .consume_explore_result("measurement", &explore_result)
+        .unwrap();
+
+    let build = controller
+        .prepare_handoff("measurement", Role::Build, task)
+        .unwrap();
+    let rich_capsule_bytes = build.metrics.rich_capsule_bytes;
+    let explore_to_build_handoff_bytes = build.capsule.measured_bytes() as u64;
+    let model_dynamic_context_bytes = build.metrics.model_dynamic_context_bytes;
+    // Required fields survive.
+    assert_eq!(build.capsule.goal.as_deref(), Some("make parse_1 safe"));
+    assert!(build
+        .capsule
+        .hard_constraints
+        .iter()
+        .any(|constraint| constraint == "never break the public API"));
+    assert!(build
+        .capsule
+        .symbols
+        .iter()
+        .any(|symbol| symbol.name == "parse_1"));
+    assert!(build.capsule.findings.iter().any(
+        |finding| finding.severity == opencode_gear::orchestration::handoff::Severity::Critical
+    ));
+
+    // Build → Verify: run a failing verification and capture the distilled
+    // verification block that is attached to the report.
+    let runner = FakeCaptureRunner::new().with_failure(
+        "cargo",
+        &["test"],
+        101,
+        "error[E0308]: mismatched types\n --> src/module_1.rs:4:5\n",
+    );
+    let first = controller
+        .after_build("measurement", &runner, None)
+        .unwrap();
+    assert!(
+        matches!(
+            &first.decision,
+            opencode_gear::orchestration::controller::BuildDecision::RetryBuild { .. }
+        ),
+        "expected a bounded Build retry"
+    );
+    // Build→Verify is an actual typed capsule, not just the raw verification
+    // block.
+    let verify_handoff = first
+        .verify_handoff
+        .as_ref()
+        .expect("a completed verification must produce a Build→Verify capsule");
+    let verification_bytes = verify_handoff.measured_bytes() as u64;
+    let verify_rich_bytes = first.metrics.rich_capsule_bytes.max(1);
+    // Exhaust the build budget to reach the Debug recommendation.
+    let second = controller
+        .after_build("measurement", &runner, None)
+        .unwrap();
+    assert!(matches!(
+        &second.decision,
+        opencode_gear::orchestration::controller::BuildDecision::RetryBuild { .. }
+    ));
+    let third = controller
+        .after_build("measurement", &runner, None)
+        .unwrap();
+    let (verify_to_debug_handoff_bytes, debug_rich_bytes, failing_location) = match third.decision {
+        opencode_gear::orchestration::controller::BuildDecision::Debug { handoff, .. } => (
+            handoff.capsule.measured_bytes() as u64,
+            handoff.metrics.rich_capsule_bytes.max(1),
+            handoff
+                .capsule
+                .first_failing_location()
+                .map(|location| location.display())
+                .unwrap_or_default(),
+        ),
+        other => panic!("expected debug, got {other:?}"),
+    };
+    assert!(
+        failing_location.contains("src/module_1.rs"),
+        "failing location must survive: {failing_location}"
+    );
+
+    for (label, bytes, rich) in [
+        (
+            "explore_to_build",
+            explore_to_build_handoff_bytes,
+            rich_capsule_bytes,
+        ),
+        ("build_to_verify", verification_bytes, verify_rich_bytes),
+        (
+            "verify_to_debug",
+            verify_to_debug_handoff_bytes,
+            debug_rich_bytes,
+        ),
+    ] {
+        assert!(bytes <= 4096, "{label} handoff {bytes} exceeds 4096");
+        assert!(
+            bytes <= rich * 40 / 100,
+            "{label} handoff {bytes} exceeds 40% of rich {rich}"
+        );
+    }
+
+    println!("OCG_ORCHESTRATION_MEASUREMENT version=1 fixture_modules={MODULES}");
+    println!(
+        "candidate_context_bytes={candidate_context_bytes} selected_source_bytes={selected_source_bytes} rich_capsule_bytes={rich_capsule_bytes}"
+    );
+    println!(
+        "explore_to_build_handoff_bytes={explore_to_build_handoff_bytes} build_to_verify_handoff_bytes={verification_bytes} verify_to_debug_handoff_bytes={verify_to_debug_handoff_bytes} model_dynamic_context_bytes={model_dynamic_context_bytes}"
+    );
+    println!("OCG_ORCHESTRATION_MEASUREMENT_END");
 }

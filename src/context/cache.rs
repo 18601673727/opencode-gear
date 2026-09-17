@@ -331,6 +331,7 @@ mod tests {
             candidates: vec![],
             selected_files: vec![path.to_string()],
             changed_paths: vec![],
+            diff: None,
             slices: vec![crate::context::ranking::ContextSlice {
                 path: path.to_string(),
                 start_line: 1,

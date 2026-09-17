@@ -44,7 +44,7 @@ Each line is an object with `schema_version: 1`:
 | `timestamp` | Unix seconds |
 | `task_id` | a caller-supplied safe id or a deterministic SHA-256 prefix (`task-<hex>`), never a raw prompt |
 | `session_id` | optional caller-supplied id; absent when unknown |
-| `task_type` | `context` or `verification` |
+| `task_type` | `context`, `verification` or `orchestration` |
 | `role` | routing role when known, otherwise absent |
 | `provider`, `model` | provider/model when known, otherwise absent |
 | `input_tokens`, `output_tokens` | a [`TokenCount`](#token-provenance) whose source distinguishes exact, estimated and unavailable values |
@@ -53,6 +53,7 @@ Each line is an object with `schema_version: 1`:
 | `repo` | `files`, `symbols`, `index_reused`, `index_updated`, `cache_hit` |
 | `verification` | `enabled`, `ran`, `attempts`, `passed`, `failed`, `not_run`, `targeted_candidates`, `stage` |
 | `logs` | `raw_bytes`, `distilled_bytes`, `reduction_bytes` |
+| `orchestration` | phase/source/destination, attempt/retry, rich/hand-off/selected-source/diff/verification/model-dynamic byte counts, cache/index hits, verification outcome, debug reason |
 | `capabilities` | selected capability names only (no arguments, no tool output) |
 | `outcome` | `success`, `failure` or `unknown` |
 
@@ -96,6 +97,24 @@ input count for the selected context; `ocg verify` records unknown tokens.
   did not run);
 - the wall duration and stage name.
 - **Command strings and captured output are never stored.**
+
+## What the orchestration bridge records
+
+Each `ocg __bridge` call appends one `task_type: "orchestration"` event with an
+`orchestration` block:
+
+- `phase`, `source`, `destination` and `attempt`/`retry`;
+- `rich_capsule_bytes` (the rich source context), `handoff_capsule_bytes` (the
+  projected capsule), `selected_source_bytes`, `diff_context_bytes`,
+  `verification_context_bytes` and `model_dynamic_context_bytes`;
+- `cache_hits` and `index_hits`;
+- `verification_outcome` and, when a Debug hand-off is recommended,
+  `debug_reason`.
+
+The debug reason is generated only from the stage, outcome, attempt/retry
+counts, the number of failing commands and the first distilled source location.
+It never contains a configured command string or any raw output. A disabled
+orchestration emits no bridge event at all (and no plugin).
 
 ## Privacy enforcement
 

@@ -261,11 +261,15 @@ sensitive files (`.env`, `.envrc`, key material, `id_rsa`/`id_ed25519`,
 `credentials*`, `secrets*`, `auth*`, `token*`, known OpenCode credential
 locations); only their path metadata is indexed.
 
-An ordinary `ocg` / `ocg run` launch does not prepare context. Use
+An ordinary `ocg` / `ocg run` launch does not build the context index. Use
 `ocg context <task>` (or the library API); the shipped Lead prompt tells the
-agent to prefer those commands. Cached plans are only returned after their
-source slices, dependency fingerprints and git identity are re-verified, and a
-failed cache write leaves the computed plan intact with a warning note.
+agent to prefer those commands. When orchestration is enabled a launch does
+materialize the generated plugin and answers its bridge calls with bounded
+dynamic context (see [Orchestration policy](#orchestration-policy)); the index
+itself is still only built by `ocg context`. Cached plans are only returned
+after their source slices, dependency fingerprints and git identity are
+re-verified, and a failed cache write leaves the computed plan intact with a
+warning note.
 
 Token counts in plans and capsules are always **estimates** (`bytes / 4`) and
 are labelled as such.
@@ -334,7 +338,7 @@ The optional top-level `telemetry` object controls local event collection:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `true` | Record an event for `ocg context` and `ocg verify`. |
+| `enabled` | `true` | Record an event for `ocg context`, `ocg verify` and the orchestration bridge. |
 | `localOnly` | `true` | Must stay `true`; there is no remote mode, and `false` is rejected by `ocg validate`. |
 
 Events are appended to `<project>/.opencode-gear/telemetry/events.jsonl`. The
@@ -343,6 +347,44 @@ headers or absolute paths; secret-shaped metadata is redacted before it is
 written. A telemetry failure warns and never blocks a command. Set
 `"enabled": false` or `OPENCODE_GEAR_TELEMETRY=0` to disable collection. See
 [telemetry.md](telemetry.md).
+
+## Orchestration policy
+
+The optional top-level `orchestration` object controls the Rust orchestration
+controller and whether a launch generates/injects the OpenCode plugin adapter:
+
+```json
+{
+  "orchestration": {
+    "enabled": true,
+    "maxBuildRetries": 2,
+    "maxDebugRetries": 1,
+    "maxHandoffBytes": 16384,
+    "maxHandoffRatioPercent": 60
+  }
+}
+```
+
+| Field | Default | Bounds | Meaning |
+| --- | --- | --- | --- |
+| `enabled` | `true` | boolean | Generate and inject the adapter; run the controller. Disabled emits no plugin and writes no state. |
+| `maxBuildRetries` | `2` | `0`–`10` | Build retries after a failed verification, before Debug is recommended. |
+| `maxDebugRetries` | `1` | `0`–`5` | Debug hand-offs before the controller reports escalation. |
+| `maxHandoffBytes` | `16384` | `512`–`65536` | Absolute cap on a projected hand-off capsule. |
+| `maxHandoffRatioPercent` | `60` | `1`–`100` | Hand-off cap as a percentage of the rich source context. |
+
+`maxHandoffBytes` / `maxHandoffRatioPercent` are a **runtime size envelope**,
+not a correctness rule: required evidence (goal, hard constraints, critical
+findings, changed files, failing locations) is never dropped to satisfy them,
+and an overage is recorded in the capsule's `omitted` notes. The deterministic
+release fixture configures a much tighter `4096` / `40%` gate explicitly to
+catch projection regressions; that gate is not the default.
+
+`OPENCODE_GEAR_ORCHESTRATION=0` (legacy `OC_GEAR_ORCHESTRATION`) force-disables
+orchestration for one process. `ocg doctor` reports the read-only state of the
+plugin, state file, projection and verification integration. See
+[architecture.md](architecture.md) for the mechanism and
+[verification.md](verification.md) for the retry/Debug contract.
 
 ## Environment variables
 
@@ -361,6 +403,11 @@ fallbacks.
 | `OPENCODE_GEAR_CACHE_DIR` | override the update-check cache directory |
 | `OPENCODE_GEAR_API_BASE` | override the GitHub API base (mirrors, tests) |
 | `OPENCODE_GEAR_TELEMETRY` (legacy `OC_GEAR_TELEMETRY`) | `0`/`1` to force local telemetry off/on |
+| `OPENCODE_GEAR_ORCHESTRATION` (legacy `OC_GEAR_ORCHESTRATION`) | `0`/`1` to force orchestration off/on for one process |
+
+`OPENCODE_GEAR_OCG` and `OPENCODE_GEAR_PROJECT` are exported *to OpenCode* by
+`ocg` at launch so the generated adapter can find the bridge and the project;
+they are not read from the ambient environment.
 
 ## Commands
 

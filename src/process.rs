@@ -36,15 +36,25 @@ impl ProcessRunner {
     ///
     /// `OPENCODE_CONFIG_CONTENT` carries the generated config;
     /// `OPENCODE_CONFIG` is removed so a stale file path cannot override it.
-    /// On Unix this `exec`s so signals and exit codes behave exactly like the
-    /// historical shell wrapper.
-    pub fn exec(&self, args: &[OsString], cwd: &Path, config_content: &str) -> Result<()> {
+    /// `extra_env` carries additional variables (for example the orchestration
+    /// bridge's executable and project). On Unix this `exec`s so signals and
+    /// exit codes behave exactly like the historical shell wrapper.
+    pub fn exec(
+        &self,
+        args: &[OsString],
+        cwd: &Path,
+        config_content: &str,
+        extra_env: &[(OsString, OsString)],
+    ) -> Result<()> {
         let mut command = Command::new(&self.program);
         command
             .args(args)
             .current_dir(cwd)
             .env("OPENCODE_CONFIG_CONTENT", config_content)
             .env_remove("OPENCODE_CONFIG");
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
 
         #[cfg(unix)]
         {

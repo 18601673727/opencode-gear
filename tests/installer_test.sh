@@ -50,6 +50,16 @@ check_eq "artifact darwin/x86_64" "$(ocg_artifact_for darwin x86_64)" "ocg-darwi
 check_eq "artifact linux/arm64" "$(ocg_artifact_for linux arm64)" "ocg-linux-arm64"
 check_eq "artifact linux/x86_64" "$(ocg_artifact_for linux x86_64)" "ocg-linux-x86_64"
 
+# --- explicit prerelease pin ------------------------------------------------
+# `OPENCODE_GEAR_VERSION` may pin a prerelease tag verbatim; a bare version gets
+# a leading `v`. The Darwin arm64 artifact mapping must stay exact.
+OCG_VERSION="v0.2.0-rc.1"
+check_eq "explicit prerelease tag is honored" "$(ocg_resolve_tag)" "v0.2.0-rc.1"
+OCG_VERSION="0.2.0-rc.1"
+check_eq "bare prerelease version gains a v" "$(ocg_resolve_tag)" "v0.2.0-rc.1"
+check_eq "Darwin arm64 prerelease artifact" "$(ocg_artifact_for darwin arm64)" "ocg-darwin-arm64"
+OCG_VERSION=""
+
 uname() {
     case "$1" in
         -s) printf 'Darwin\n' ;;

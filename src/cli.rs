@@ -57,6 +57,8 @@ pub struct Env {
     pub cache_dir: Option<PathBuf>,
     /// `OPENCODE_GEAR_TELEMETRY` on/off override.
     pub telemetry: Option<String>,
+    /// `OPENCODE_GEAR_ORCHESTRATION` on/off escape hatch.
+    pub orchestration: Option<String>,
 }
 
 impl Env {
@@ -81,6 +83,7 @@ impl Env {
             api_base: env_string(&["OPENCODE_GEAR_API_BASE"]),
             cache_dir: env_path(&["OPENCODE_GEAR_CACHE_DIR"]),
             telemetry: env_string(&["OPENCODE_GEAR_TELEMETRY", "OC_GEAR_TELEMETRY"]),
+            orchestration: env_string(&["OPENCODE_GEAR_ORCHESTRATION", "OC_GEAR_ORCHESTRATION"]),
         }
     }
 }
@@ -126,6 +129,8 @@ pub enum Command {
     Verify(Vec<OsString>),
     Tools(Vec<OsString>),
     Checkpoint(Vec<OsString>),
+    /// Hidden/internal: the generated plugin's bridge. Never advertised.
+    Bridge(Vec<OsString>),
     Version,
     Doctor,
     Upgrade,
@@ -348,6 +353,7 @@ where
         Some("verify") => Command::Verify(rest),
         Some("tools") => Command::Tools(rest),
         Some("checkpoint") => Command::Checkpoint(rest),
+        Some("__bridge") => Command::Bridge(rest),
         Some("version") => Command::Version,
         Some("doctor") => Command::Doctor,
         Some("upgrade") => Command::Upgrade,
@@ -421,6 +427,7 @@ Environment:
   OPENCODE_GEAR_CACHE_DIR      override the update-check cache directory
   OPENCODE_GEAR_API_BASE       override the GitHub API base (mirrors, tests)
   OPENCODE_GEAR_TELEMETRY      0/1 to force local telemetry off/on
+  OPENCODE_GEAR_ORCHESTRATION  0/1 to force orchestration off/on for this process
 
 The legacy OC_GEAR_* names are still accepted as fallbacks (including
 OC_GEAR_OPENCODE_BIN). A broken explicit binary is authoritative and errors
@@ -515,6 +522,13 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
         env.home_dir.clone(),
     )
     .map_err(Failure::Gear)?;
+    let mut effective = effective;
+    // The orchestration escape hatch is applied to the effective config so that
+    // build, dry-run, launch and the bridge all agree for one process.
+    crate::orchestration::OrchestrationConfig::apply_env_override(
+        &mut effective.data,
+        env.orchestration.as_deref(),
+    );
     let level = model::resolve_throttle(
         &effective.data,
         cli.throttle.as_deref(),
@@ -529,14 +543,14 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
 
     match &cli.command {
         Command::Help | Command::Version => Ok(0),
-        Command::Launch => launch(&effective, &cwd, &level, &[], true, &env),
+        Command::Launch => launch(&effective, &cwd, &level, &[], true, true, &env),
         Command::Run(args) => {
             let forwarded = prepend_subcommand("run", args);
-            launch(&effective, &cwd, &level, &forwarded, true, &env)
+            launch(&effective, &cwd, &level, &forwarded, true, true, &env)
         }
         Command::Models(args) => {
             let forwarded = prepend_subcommand("models", args);
-            launch(&effective, &cwd, &level, &forwarded, false, &env)
+            launch(&effective, &cwd, &level, &forwarded, false, false, &env)
         }
         Command::Status => {
             validate::require_valid(&effective).map_err(Failure::Gear)?;
@@ -596,6 +610,7 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
         Command::Verify(args) => verify_command(&effective, &cwd, args, &env, cli.pretty),
         Command::Tools(args) => tools_command(&effective, args, cli.pretty),
         Command::Checkpoint(args) => checkpoint_command(&effective, &cwd, args, cli.pretty),
+        Command::Bridge(args) => bridge_command(&effective, &cwd, args, &env),
         Command::Upgrade => upgrade_command(&effective, &cwd, &env),
     }
 }
@@ -629,9 +644,15 @@ fn launch(
     level: &str,
     args: &[OsString],
     trace: bool,
+    coding_session: bool,
     env: &Env,
 ) -> std::result::Result<i32, Failure> {
-    let resolved = build::build_opencode_config(effective, level).map_err(Failure::Gear)?;
+    let mut resolved = build::build_opencode_config(effective, level).map_err(Failure::Gear)?;
+    // `ocg models` is not a coding session: it must not require the
+    // orchestration plugin to exist or the project directory to be writable.
+    if !coding_session {
+        crate::orchestration::plugin::remove_ocg_plugin(&mut resolved);
+    }
     let content = serde_json::to_string(&resolved).map_err(|error| {
         Failure::Gear(GearError::config(format!(
             "cannot serialize the OpenCode config: {error}"
@@ -650,8 +671,65 @@ fn launch(
         eprintln!("ocg: warning: {warning}");
     }
     let runner = ProcessRunner::new(selection.path.into_os_string());
-    runner.exec(args, cwd, &content).map_err(Failure::Gear)?;
+    // Materialize the adapter *before* exec: if it cannot be written, the
+    // generated `file://` plugin would be broken, so fail clearly instead of
+    // launching an integration that cannot work. A non-coding session (for
+    // example `ocg models`) skips this entirely.
+    let extra_env = if coding_session {
+        orchestration_env(effective, cwd).map_err(Failure::Gear)?
+    } else {
+        Vec::new()
+    };
+    runner
+        .exec(args, cwd, &content, &extra_env)
+        .map_err(Failure::Gear)?;
     Ok(0)
+}
+
+/// Materialize the generated plugin and export the exact bridge environment.
+///
+/// This is the only place `launch` writes local state, and it only happens when
+/// orchestration is enabled. Disabled orchestration returns an empty vector, so
+/// no plugin, no file and no variable reaches OpenCode. A materialization
+/// failure is returned so the launch aborts rather than injecting a `file://`
+/// URL that does not resolve.
+fn orchestration_env(
+    effective: &config::Effective,
+    cwd: &Path,
+) -> crate::error::Result<Vec<(OsString, OsString)>> {
+    let enabled = crate::orchestration::OrchestrationConfig::from_config(&effective.data)
+        .map(|config| config.enabled)
+        .unwrap_or(false);
+    if !enabled {
+        return Ok(Vec::new());
+    }
+    let path = crate::orchestration::plugin::materialize(cwd)?;
+    let mut env = Vec::new();
+    let exe = std::env::current_exe().map_err(|error| {
+        GearError::io(
+            "cannot determine the orchestration bridge executable",
+            error,
+        )
+    })?;
+    env.push((OsString::from("OPENCODE_GEAR_OCG"), exe.into_os_string()));
+    env.push((
+        OsString::from("OPENCODE_GEAR_PROJECT"),
+        cwd.as_os_str().to_os_string(),
+    ));
+    // The plugin starts a fresh `ocg __bridge` process. Preserve the exact
+    // resolved override paths from this launch so CLI `--user-config` and
+    // `--project-config` layers remain authoritative inside that process too.
+    env.push((
+        OsString::from("OPENCODE_GEAR_USER_CONFIG"),
+        effective.user_path.as_os_str().to_os_string(),
+    ));
+    env.push((
+        OsString::from("OPENCODE_GEAR_PROJECT_CONFIG"),
+        effective.project_path.as_os_str().to_os_string(),
+    ));
+    // Defense in depth: the exported path is the one just materialized.
+    debug_assert!(path.is_file());
+    Ok(env)
 }
 
 /// Build a runtime manager from the effective config and environment.
@@ -1110,9 +1188,133 @@ fn doctor_command(
         ),
     }
 
+    // Orchestration: read-only health of the generated integration. Doctor
+    // never launches OpenCode, never runs a bridge and never mutates state.
+    match crate::orchestration::OrchestrationConfig::from_config(&effective.data) {
+        Ok(config) => {
+            check_line(
+                if config.enabled { "ok" } else { "info" },
+                "orchestration",
+                &format!(
+                    "{}; build retries {}; debug retries {}; handoff <= {} bytes / {}%",
+                    if config.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                    config.max_build_retries,
+                    config.max_debug_retries,
+                    config.max_handoff_bytes,
+                    config.max_handoff_ratio_percent
+                ),
+            );
+            if config.enabled {
+                let plugin = crate::orchestration::plugin::plugin_path(project_root);
+                if plugin.is_file() {
+                    check_line(
+                        "ok",
+                        "orchestration plugin",
+                        &format!(
+                            "{} (mechanism: file:// JS adapter injected via config.plugin; hooks: chat.message, tool.execute.before/after)",
+                            plugin.display()
+                        ),
+                    );
+                } else {
+                    check_line(
+                        "info",
+                        "orchestration plugin",
+                        "not materialized yet (written at the next `ocg` launch)",
+                    );
+                }
+                let loaded = crate::orchestration::state::load(project_root);
+                if !loaded.exists {
+                    check_line(
+                        "info",
+                        "orchestration state",
+                        "not present (created by the bridge on first use)",
+                    );
+                } else if loaded.corrupt {
+                    check_line(
+                        "warn",
+                        "orchestration state",
+                        "corrupt or unsupported; the next bridge call starts from empty state",
+                    );
+                } else {
+                    let checkpoints = loaded
+                        .state
+                        .sessions
+                        .values()
+                        .map(|session| session.checkpoints.len())
+                        .sum::<usize>();
+                    check_line(
+                        "ok",
+                        "orchestration state",
+                        &format!(
+                            "{} session(s); {} checkpoint reference(s)",
+                            loaded.state.sessions.len(),
+                            checkpoints
+                        ),
+                    );
+                }
+                let limits = crate::orchestration::projection::ProjectionLimits {
+                    max_bytes: config.max_handoff_bytes,
+                    ratio_percent: config.max_handoff_ratio_percent,
+                };
+                let capsule = crate::orchestration::projection::project(
+                    &crate::orchestration::handoff::ProjectionInput::default(),
+                    crate::orchestration::handoff::Role::Lead,
+                    crate::orchestration::handoff::Role::Build,
+                    "health",
+                    "health",
+                    limits,
+                );
+                check_line(
+                    if capsule.measured_bytes() <= limits.max_bytes {
+                        "ok"
+                    } else {
+                        "warn"
+                    },
+                    "projection",
+                    &format!(
+                        "handoff schema reachable ({} bytes, cap {})",
+                        capsule.measured_bytes(),
+                        limits.max_bytes
+                    ),
+                );
+                let context_enabled = ContextConfig::from_config(&effective.data)
+                    .map(|context| context.enabled)
+                    .unwrap_or(false);
+                check_line(
+                    if context_enabled { "ok" } else { "info" },
+                    "context activation",
+                    if context_enabled {
+                        "context preparation is active for orchestration"
+                    } else {
+                        "context.enabled=false; orchestration runs with an empty dynamic context"
+                    },
+                );
+                let verification_ready = VerificationConfig::from_config(&effective.data)
+                    .map(|verification| {
+                        verification.enabled
+                            && verification.command_count(&verification.default_stage) > 0
+                    })
+                    .unwrap_or(false);
+                check_line(
+                    if verification_ready { "ok" } else { "info" },
+                    "verification integration",
+                    if verification_ready {
+                        "after Build, the configured verification stage runs and feeds the retry policy"
+                    } else {
+                        "no trusted command in the default stage; after Build reports not-configured"
+                    },
+                );
+            }
+        }
+        Err(error) => check_line("warn", "orchestration", &error.to_string()),
+    }
+
     Ok(if failures == 0 { 0 } else { 1 })
 }
-
 /// `ocg upgrade`: self-update Gear, then force-maintain the active OpenCode.
 fn upgrade_command(
     effective: &config::Effective,
@@ -1702,7 +1904,7 @@ fn save_checkpoint(
                 phase = Phase::parse(value);
                 if phase.is_none() {
                     return Err(usage_failure(format!(
-                        "unknown phase '{value}' (expected explore-to-build, build-to-verify, verify-to-debug, decision)"
+                        "unknown phase '{value}' (expected explore-to-build, build-to-verify, verify-to-debug, debug-to-build, decision)"
                     )));
                 }
                 index += 2;
@@ -1796,6 +1998,121 @@ fn save_checkpoint(
     let path = checkpoint.save(project_root).map_err(Failure::Gear)?;
     println!("checkpoint saved: {} ({})", checkpoint.id, path.display());
     Ok(0)
+}
+
+/// `ocg __bridge <event>`: the hidden JSON bridge the generated plugin calls.
+///
+/// It never fails the process: a bad payload, a disabled policy or a controller
+/// error all become `{"ok":false,...}` on stdout, so the adapter can fail soft.
+fn bridge_command(
+    effective: &config::Effective,
+    project_root: &Path,
+    args: &[OsString],
+    env: &Env,
+) -> std::result::Result<i32, Failure> {
+    let event = args
+        .first()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let value = bridge_payload(effective, project_root, &event, env);
+    println!(
+        "{}",
+        serde_json::to_string(&value).unwrap_or_else(|_| "{\"ok\":false}".to_string())
+    );
+    Ok(0)
+}
+
+/// Build the bridge reply. Fail-soft by construction.
+fn bridge_payload(
+    effective: &config::Effective,
+    project_root: &Path,
+    event: &str,
+    env: &Env,
+) -> Value {
+    // Always consume stdin first, even on the disabled/early-return paths, so
+    // the generated adapter's writer never sees a BrokenPipe. The read is
+    // capped and overflow is rejected fail-soft.
+    let (payload, oversized) = read_stdin_json(BRIDGE_MAX_STDIN_BYTES);
+    if oversized {
+        return json!({
+            "ok": false,
+            "error": format!("bridge payload exceeds the {BRIDGE_MAX_STDIN_BYTES} byte cap"),
+        });
+    }
+    if event.is_empty() {
+        return json!({"ok": false, "error": "missing bridge event"});
+    }
+    let orchestration =
+        match crate::orchestration::OrchestrationConfig::from_config(&effective.data) {
+            Ok(config) => config,
+            Err(error) => return json!({"ok": false, "error": error.to_string()}),
+        };
+    if !orchestration.enabled {
+        return json!({"ok": false, "disabled": true, "context": ""});
+    }
+    let context = match ContextConfig::from_config(&effective.data) {
+        Ok(config) => config,
+        Err(error) => return json!({"ok": false, "error": error.to_string()}),
+    };
+    let capabilities = match CapabilityConfig::from_config(&effective.data) {
+        Ok(config) => config,
+        Err(error) => return json!({"ok": false, "error": error.to_string()}),
+    };
+    let verification = match VerificationConfig::from_config(&effective.data) {
+        Ok(config) => config,
+        Err(error) => return json!({"ok": false, "error": error.to_string()}),
+    };
+    let git = SystemGitHost;
+    let clock = SystemClock;
+    let controller = crate::orchestration::controller::Controller::new(
+        project_root,
+        orchestration,
+        context,
+        capabilities,
+        verification,
+        &git,
+        &clock,
+    );
+    let runner = SystemCaptureRunner;
+    let (telemetry_config, warnings) = telemetry_for(effective, env);
+    print_telemetry_warnings(&warnings);
+    let bridge =
+        crate::orchestration::bridge::BridgeContext::new(&controller, &runner, telemetry_config);
+    bridge.dispatch(event, &payload)
+}
+
+/// The hard cap on a bridge payload. The generated adapter never sends anything
+/// close to this; the cap protects against a hostile or broken caller and keeps
+/// memory bounded.
+pub const BRIDGE_MAX_STDIN_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read the bridge payload from stdin with a hard cap. Returns `(value,
+/// oversized)`. Empty or invalid input is `null`, never an error. When the
+/// input exceeds the cap it is drained (so the writer does not get a
+/// BrokenPipe) but not retained, and `oversized` is true.
+fn read_stdin_json(max_bytes: usize) -> (Value, bool) {
+    use std::io::Read;
+    let mut buffer = Vec::new();
+    {
+        let mut limited = std::io::stdin().lock().take(max_bytes as u64 + 1);
+        if limited.read_to_end(&mut buffer).is_err() {
+            return (Value::Null, false);
+        }
+    }
+    // Drain the rest without retaining it, so a larger writer can complete.
+    let mut sink = std::io::sink();
+    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut sink);
+    if buffer.len() > max_bytes {
+        return (Value::Null, true);
+    }
+    let text = String::from_utf8_lossy(&buffer);
+    if text.trim().is_empty() {
+        return (Value::Null, false);
+    }
+    match serde_json::from_str::<Value>(&text) {
+        Ok(value) => (value, false),
+        Err(_) => (Value::Null, false),
+    }
 }
 
 fn throttle_command(
