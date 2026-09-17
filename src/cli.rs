@@ -24,6 +24,7 @@ use crate::process::{
 use crate::report;
 use crate::runtime::policy::RuntimePolicy;
 use crate::runtime::{self, install::Layout};
+use crate::telemetry::{self, TelemetryConfig};
 use crate::validate;
 use crate::verification::runner::{execute, VerifyRequest};
 use crate::verification::Config as VerificationConfig;
@@ -54,6 +55,8 @@ pub struct Env {
     pub api_base: Option<String>,
     /// Override for the update-check cache directory.
     pub cache_dir: Option<PathBuf>,
+    /// `OPENCODE_GEAR_TELEMETRY` on/off override.
+    pub telemetry: Option<String>,
 }
 
 impl Env {
@@ -77,6 +80,7 @@ impl Env {
             home_dir,
             api_base: env_string(&["OPENCODE_GEAR_API_BASE"]),
             cache_dir: env_path(&["OPENCODE_GEAR_CACHE_DIR"]),
+            telemetry: env_string(&["OPENCODE_GEAR_TELEMETRY", "OC_GEAR_TELEMETRY"]),
         }
     }
 }
@@ -118,6 +122,7 @@ pub enum Command {
     Trace(Option<String>),
     Context(Vec<OsString>),
     Cache(Option<String>),
+    Stats(Vec<OsString>),
     Verify(Vec<OsString>),
     Tools(Vec<OsString>),
     Checkpoint(Vec<OsString>),
@@ -339,6 +344,7 @@ where
             rest.first()
                 .map(|value| value.to_string_lossy().into_owned()),
         ),
+        Some("stats") => Command::Stats(rest),
         Some("verify") => Command::Verify(rest),
         Some("tools") => Command::Tools(rest),
         Some("checkpoint") => Command::Checkpoint(rest),
@@ -383,6 +389,7 @@ Commands:
   context <task...>     build a deterministic local repository context plan
   context symbols <q>   find indexed symbols by name (diagnostic)
   cache clean|stats     manage the local context cache (never the runtime)
+  stats [--pretty]      read-only project telemetry aggregate (local only)
   verify [fast|normal|full]
                         run the configured trusted commands for a stage
   tools <task...>       show the capability plan / Tool Context Firewall view
@@ -413,6 +420,7 @@ Environment:
   OPENCODE_GEAR_TRACE          trace file; only read when observability is enabled
   OPENCODE_GEAR_CACHE_DIR      override the update-check cache directory
   OPENCODE_GEAR_API_BASE       override the GitHub API base (mirrors, tests)
+  OPENCODE_GEAR_TELEMETRY      0/1 to force local telemetry off/on
 
 The legacy OC_GEAR_* names are still accepted as fallbacks (including
 OC_GEAR_OPENCODE_BIN). A broken explicit binary is authoritative and errors
@@ -582,9 +590,10 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
             Ok(0)
         }
         Command::Doctor => doctor_command(&effective, &cwd, &env),
-        Command::Context(args) => context_command(&effective, &cwd, args, cli.pretty),
+        Command::Context(args) => context_command(&effective, &cwd, args, &env, cli.pretty),
         Command::Cache(action) => cache_command(&effective, &cwd, action.as_deref()),
-        Command::Verify(args) => verify_command(&effective, &cwd, args, cli.pretty),
+        Command::Stats(args) => stats_command(&effective, &cwd, args, &env, cli.pretty),
+        Command::Verify(args) => verify_command(&effective, &cwd, args, &env, cli.pretty),
         Command::Tools(args) => tools_command(&effective, args, cli.pretty),
         Command::Checkpoint(args) => checkpoint_command(&effective, &cwd, args, cli.pretty),
         Command::Upgrade => upgrade_command(&effective, &cwd, &env),
@@ -906,6 +915,201 @@ fn doctor_command(
         ),
     }
 
+    // Repository map / symbol index: inspect the existing artifact only. Doctor
+    // never builds, updates or trims an index.
+    let index_path = context::index::index_path(project_root);
+    let index = if index_path.is_file() {
+        match std::fs::read_to_string(&index_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<context::index::ContextIndex>(&text).ok())
+        {
+            Some(index) => {
+                check_line(
+                    "ok",
+                    "repository map/index",
+                    &format!(
+                        "{} file(s), {} symbol(s) at {}",
+                        index.metrics.files,
+                        index.metrics.symbols,
+                        index_path.display()
+                    ),
+                );
+                Some(index)
+            }
+            None => {
+                check_line(
+                    "warn",
+                    "repository map/index",
+                    &format!(
+                        "{} is unreadable or corrupt; the next `ocg context` rebuilds it",
+                        index_path.display()
+                    ),
+                );
+                None
+            }
+        }
+    } else {
+        check_line(
+            "info",
+            "repository map/index",
+            "not built (optional; `ocg context` builds it)",
+        );
+        None
+    };
+
+    match &index {
+        Some(index) => check_line(
+            "ok",
+            "symbol index",
+            &format!(
+                "{} symbol(s) across {} indexed file(s)",
+                index.metrics.symbols, index.metrics.files
+            ),
+        ),
+        None => check_line(
+            "info",
+            "symbol index",
+            "not built (optional; depends on the repository index)",
+        ),
+    }
+
+    // Context cache: read-only statistics.
+    let cache = context::cache::ContextCache::new(project_root);
+    let cache_stats = cache.stats();
+    let cache_exists = Path::new(&cache_stats.dir).exists();
+    if !cache_exists {
+        check_line("info", "context cache", "not present (optional)");
+    } else if cache_stats.corrupt > 0 {
+        check_line(
+            "warn",
+            "context cache",
+            &format!(
+                "{} entr(y/ies), {} corrupt (ignored and removed on reuse)",
+                cache_stats.entries, cache_stats.corrupt
+            ),
+        );
+    } else {
+        check_line(
+            "ok",
+            "context cache",
+            &format!(
+                "{} entr(y/ies), {} bytes",
+                cache_stats.entries, cache_stats.bytes
+            ),
+        );
+    }
+
+    // Task checkpoints: corrupt files are counted, never printed.
+    let (checkpoints, corrupt_checkpoints) = checkpoint::list(project_root);
+    if corrupt_checkpoints > 0 {
+        check_line(
+            "warn",
+            "task checkpoints",
+            &format!(
+                "{corrupt_checkpoints} corrupt checkpoint(s) ignored ({} readable)",
+                checkpoints.len()
+            ),
+        );
+    } else if checkpoints.is_empty() {
+        check_line("info", "task checkpoints", "none saved (optional)");
+    } else {
+        check_line(
+            "ok",
+            "task checkpoints",
+            &format!("{} checkpoint(s)", checkpoints.len()),
+        );
+    }
+
+    // Verification config: parse only, never run a command.
+    match VerificationConfig::from_config(&effective.data) {
+        Ok(config) => check_line(
+            if config.enabled { "ok" } else { "info" },
+            "verification config",
+            &format!(
+                "{}; default stage '{}'; {} configured command(s)",
+                if config.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                config.default_stage,
+                config
+                    .stages
+                    .values()
+                    .map(|stage| stage.commands.len())
+                    .sum::<usize>()
+            ),
+        ),
+        Err(error) => check_line("warn", "verification config", &error.to_string()),
+    }
+
+    // Telemetry storage: read-only, local-only, no state creation.
+    let (telemetry_config, _telemetry_warnings) = telemetry_for(effective, env);
+    let store = telemetry::TelemetryStore::new(project_root, telemetry_config);
+    let telemetry_log = store.read();
+    let telemetry_state = if !telemetry_config.enabled {
+        "disabled".to_string()
+    } else {
+        format!("enabled, {} event(s)", telemetry_log.events.len())
+    };
+    let telemetry_line = format!(
+        "{}; local-only; {}{}",
+        telemetry_state,
+        store.path().display(),
+        match (telemetry_log.corrupt_lines, telemetry_log.unsupported_lines,) {
+            (0, 0) => String::new(),
+            (corrupt, 0) => format!("; {corrupt} corrupt line(s) skipped"),
+            (0, unsupported) => {
+                format!("; {unsupported} unsupported schema line(s) skipped")
+            }
+            (corrupt, unsupported) => format!(
+                "; {corrupt} corrupt line(s) and {unsupported} unsupported schema line(s) skipped"
+            ),
+        }
+    );
+    if telemetry_log.corrupt_lines > 0 || telemetry_log.unsupported_lines > 0 {
+        check_line("warn", "telemetry", &telemetry_line);
+    } else if !telemetry_config.enabled || !store.exists() {
+        check_line("info", "telemetry", &telemetry_line);
+    } else {
+        check_line("ok", "telemetry", &telemetry_line);
+    }
+
+    // Capability planner: advisory only.
+    match CapabilityConfig::from_config(&effective.data) {
+        Ok(config) => check_line(
+            if config.enabled { "ok" } else { "info" },
+            "tool capability planner",
+            &format!(
+                "{}; {} custom capability name(s)",
+                if config.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                config.custom.len()
+            ),
+        ),
+        Err(error) => check_line("warn", "tool capability planner", &error.to_string()),
+    }
+
+    // Sensitive-file exclusions: summarise the current index only.
+    match &index {
+        Some(index) => {
+            let excluded = index.files.iter().filter(|file| file.excluded).count();
+            check_line(
+                "ok",
+                "sensitive-file exclusions",
+                &format!("{excluded} path(s) excluded from content in the current index"),
+            );
+        }
+        None => check_line(
+            "info",
+            "sensitive-file exclusions",
+            "applied by path during indexing; no index to summarise",
+        ),
+    }
+
     Ok(if failures == 0 { 0 } else { 1 })
 }
 
@@ -990,11 +1194,34 @@ fn is_writable_dir(path: &Path) -> bool {
     }
 }
 
+/// Resolve the telemetry policy without letting a broken policy block the
+/// command that owns it. A rejectable config (for example `localOnly=false`)
+/// disables collection with a warning; `ocg validate` still reports it.
+fn telemetry_for(effective: &config::Effective, env: &Env) -> (TelemetryConfig, Vec<String>) {
+    match TelemetryConfig::from_config(&effective.data) {
+        Ok(config) => (
+            config.with_env_override(env.telemetry.as_deref()),
+            Vec::new(),
+        ),
+        Err(error) => (
+            TelemetryConfig::disabled(),
+            vec![format!("telemetry disabled: {error}")],
+        ),
+    }
+}
+
+fn print_telemetry_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("ocg: warning: {warning}");
+    }
+}
+
 /// `ocg context <task...>` and `ocg context symbols <query>`.
 fn context_command(
     effective: &config::Effective,
     project_root: &Path,
     args: &[OsString],
+    env: &Env,
     pretty: bool,
 ) -> std::result::Result<i32, Failure> {
     let config = ContextConfig::from_config(&effective.data).map_err(Failure::Gear)?;
@@ -1041,10 +1268,53 @@ fn context_command(
             "context needs a task description (for example: ocg context fix the parser)",
         ));
     }
+    let started = std::time::Instant::now();
     let outcome = engine.plan(&task, None).map_err(Failure::Gear)?;
+    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     for warning in &outcome.warnings {
         eprintln!("ocg: warning: {warning}");
     }
+
+    // Local telemetry: byte and estimate accounting only, never the task text.
+    let (telemetry_config, telemetry_warnings) = telemetry_for(effective, env);
+    print_telemetry_warnings(&telemetry_warnings);
+    let capsule_bytes = outcome
+        .plan
+        .capsule
+        .as_ref()
+        .and_then(|capsule| serde_json::to_vec(capsule).ok())
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or(0);
+    let capabilities = outcome
+        .plan
+        .capabilities
+        .capabilities
+        .iter()
+        .map(|entry| entry.capability.name())
+        .collect();
+    let event = telemetry::Event {
+        task_id: telemetry::Event::hashed_task_id(&format!("context|{task}")),
+        task_type: Some("context".to_string()),
+        timestamp: clock.now_unix(),
+        duration_ms,
+        input_tokens: telemetry::TokenCount::estimated(outcome.plan.estimated_tokens as u64),
+        context: telemetry::ContextMetrics::new(
+            outcome.plan.candidate_bytes as u64,
+            outcome.plan.selected_bytes as u64,
+            capsule_bytes,
+        ),
+        repo: telemetry::RepoMetrics {
+            files: outcome.index_report.metrics.files,
+            symbols: outcome.index_report.metrics.symbols,
+            index_reused: outcome.index_report.metrics.reused,
+            index_updated: outcome.index_report.metrics.updated,
+            cache_hit: Some(outcome.from_cache),
+        },
+        capabilities,
+        outcome: telemetry::Outcome::Success,
+        ..telemetry::Event::new(String::new(), clock.now_unix())
+    };
+    print_telemetry_warnings(&telemetry::record(project_root, &telemetry_config, event));
     if pretty {
         let value = serde_json::to_value(&outcome.plan).map_err(|error| {
             Failure::Gear(GearError::config(format!(
@@ -1113,11 +1383,48 @@ fn cache_command(
     }
 }
 
+/// `ocg stats [--pretty]`: read-only local telemetry aggregate. Offline, never
+/// creates state and never reads the network.
+fn stats_command(
+    effective: &config::Effective,
+    project_root: &Path,
+    args: &[OsString],
+    env: &Env,
+    pretty: bool,
+) -> std::result::Result<i32, Failure> {
+    if !args.is_empty() {
+        let joined = args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Err(usage_failure(format!(
+            "stats takes no arguments; got: {joined}"
+        )));
+    }
+    let (config, warnings) = telemetry_for(effective, env);
+    print_telemetry_warnings(&warnings);
+    let store = telemetry::TelemetryStore::new(project_root, config);
+    let stats = telemetry::TelemetryStats::collect(&store);
+    if pretty {
+        let value = serde_json::to_value(&stats).map_err(|error| {
+            Failure::Gear(GearError::config(format!(
+                "cannot serialize the telemetry stats: {error}"
+            )))
+        })?;
+        print_config(&value, true)?;
+    } else {
+        print!("{}", stats.render());
+    }
+    Ok(0)
+}
+
 /// `ocg verify [fast|normal|full]`: run only configured trusted commands.
 fn verify_command(
     effective: &config::Effective,
     project_root: &Path,
     args: &[OsString],
+    env: &Env,
     pretty: bool,
 ) -> std::result::Result<i32, Failure> {
     let config = VerificationConfig::from_config(&effective.data).map_err(Failure::Gear)?;
@@ -1171,6 +1478,7 @@ fn verify_command(
     };
 
     let runner = SystemCaptureRunner;
+    let started = std::time::Instant::now();
     let mut report = execute(&VerifyRequest {
         root: project_root,
         config: &config,
@@ -1180,7 +1488,24 @@ fn verify_command(
         test_proposal: proposal,
     })
     .map_err(Failure::Gear)?;
+    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     report.notes.extend(extra_notes);
+
+    // Local telemetry: attempt/byte accounting only, never a command string or
+    // any captured output.
+    let (telemetry_config, telemetry_warnings) = telemetry_for(effective, env);
+    print_telemetry_warnings(&telemetry_warnings);
+    let event = telemetry::Event {
+        task_id: telemetry::Event::hashed_task_id(&format!("verify|{}", report.stage)),
+        task_type: Some("verification".to_string()),
+        timestamp: clock.now_unix(),
+        duration_ms,
+        verification: telemetry::verification_metrics(&report),
+        logs: telemetry::log_metrics(project_root, &report),
+        outcome: telemetry::verification_outcome(&report),
+        ..telemetry::Event::new(String::new(), clock.now_unix())
+    };
+    print_telemetry_warnings(&telemetry::record(project_root, &telemetry_config, event));
 
     if pretty {
         let value = serde_json::to_value(&report).map_err(|error| {

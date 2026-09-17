@@ -276,3 +276,31 @@ They are under `<project>/.opencode-gear/logs/`. They are pruned to
 `verification.maxLogStorageBytes` (oldest first) and `ocg cache clean` never
 removes them. Removing `.opencode-gear/` removes them with the rest of the local
 state.
+
+## `ocg stats` says "no telemetry events recorded yet"
+
+That is the intended output when no event exists yet. `ocg stats` is read-only
+and never creates `.opencode-gear/`. Run `ocg context <task>` or
+`ocg verify <stage>` first, or check that collection is enabled:
+
+```bash
+ocg stats --pretty        # inspect enabled/local_only/path
+ocg doctor                # read-only telemetry check line
+```
+
+If `enabled` is `no`, either the project config sets
+`{"telemetry": {"enabled": false}}` or `OPENCODE_GEAR_TELEMETRY=0` is set.
+
+## `telemetry.localOnly=false` is rejected
+
+There is no remote telemetry mode. `ocg validate` reports it and `ocg context` /
+`ocg verify` disable collection with a warning. Remove the override or set
+`localOnly` to `true`.
+
+## `ocg stats` reports corrupt telemetry lines
+
+A partially written or hand-edited line is skipped and counted; good events
+still load and later writes still succeed. `ocg doctor` shows the same corrupt
+count as a warning. To start over, delete
+`<project>/.opencode-gear/telemetry/events.jsonl` (or the whole
+`.opencode-gear/telemetry/` directory); nothing else depends on it.

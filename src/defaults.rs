@@ -143,6 +143,7 @@ pub fn load_defaults(source: &GearSource) -> Result<Value> {
         "context": default_context(),
         "verification": default_verification(),
         "capabilities": default_capabilities(),
+        "telemetry": default_telemetry(),
     }))
 }
 
@@ -180,6 +181,12 @@ pub fn default_verification() -> Value {
 pub fn default_capabilities() -> Value {
     serde_json::to_value(crate::capabilities::CapabilityConfig::default())
         .unwrap_or_else(|_| json!({}))
+}
+
+/// The built-in telemetry policy: local-only and enabled by default, with no
+/// remote mode to opt into.
+pub fn default_telemetry() -> Value {
+    serde_json::to_value(crate::telemetry::TelemetryConfig::default()).unwrap_or_else(|_| json!({}))
 }
 
 fn require_key(value: &Value, key: &str, label: &str) -> Result<()> {

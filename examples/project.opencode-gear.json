@@ -11,5 +11,9 @@
   },
   "prompts": {
     "lead": { "append": [".opencode/lead-policy.md"] }
+  },
+  "telemetry": {
+    "enabled": true,
+    "localOnly": true
   }
 }

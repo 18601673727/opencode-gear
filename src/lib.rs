@@ -25,5 +25,6 @@ pub mod process;
 pub mod prompt;
 pub mod report;
 pub mod runtime;
+pub mod telemetry;
 pub mod validate;
 pub mod verification;

@@ -196,4 +196,7 @@ destabilizing cache provenance.
   even if that one log alone exceeds the cap.
 - Bytes are preserved lossily, so invalid UTF-8 never panics a reader.
 - `ocg cache clean` removes the context cache only. It never deletes raw logs,
-  checkpoints, the index or the managed runtime.
+  checkpoints, the index, the local telemetry store or the managed runtime.
+- Each executed stage also appends one small local telemetry event (attempts,
+  outcome, raw/distilled byte sizes, duration). It records no command string and
+  no command output. See [telemetry.md](telemetry.md).

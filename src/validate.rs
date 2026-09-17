@@ -17,6 +17,7 @@ pub fn validate(effective: &Effective) -> Vec<String> {
     errors.extend(crate::context::ContextConfig::validate(data));
     errors.extend(crate::verification::Config::validate(data));
     errors.extend(crate::capabilities::CapabilityConfig::validate(data));
+    errors.extend(crate::telemetry::TelemetryConfig::validate(data));
 
     let empty = Map::new();
     let levels = data

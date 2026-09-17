@@ -158,7 +158,94 @@ fn no_secrets_or_absolute_home_paths() {
             "{} contains an email address",
             path.display()
         );
+        assert!(
+            !contains_bearer_token(&text),
+            "{} contains a Bearer token shape",
+            path.display()
+        );
+        assert!(
+            !contains_credential_assignment(&text),
+            "{} contains a credential assignment",
+            path.display()
+        );
+        assert!(
+            !contains_authorization_header(&text),
+            "{} contains an Authorization header value",
+            path.display()
+        );
     }
+}
+
+/// `Bearer <long-token>` anywhere in the text.
+fn contains_bearer_token(text: &str) -> bool {
+    contains_keyword_run(text, "bearer ", 20, |c| {
+        c.is_ascii_alphanumeric() || "._-".contains(c)
+    })
+}
+
+/// `Authorization: <scheme> <long-token>` in any casing.
+fn contains_authorization_header(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let mut search = lower.as_str();
+    while let Some(index) = search.find("authorization") {
+        let rest =
+            search[index + "authorization".len()..].trim_start_matches([' ', '\t', '"', '\'']);
+        if let Some(value) = rest.strip_prefix(':') {
+            let value = value.trim_start_matches([' ', '\t', '"', '\'']);
+            let count = value
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || "._-".contains(*c))
+                .count();
+            if count >= 20 {
+                return true;
+            }
+        }
+        search = &search[index + "authorization".len()..];
+    }
+    false
+}
+
+/// `password=`, `api_key=`, `secret=`, ... followed by a long value.
+fn contains_credential_assignment(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "password=",
+        "password:",
+        "passwd=",
+        "api_key=",
+        "apikey=",
+        "api-key=",
+        "client_secret=",
+        "client-secret=",
+        "secret=",
+        "access_key=",
+        "access-key=",
+        "token=",
+    ]
+    .iter()
+    .any(|keyword| {
+        contains_keyword_run(&lower, keyword, 12, |c| {
+            c.is_ascii_alphanumeric() || "._-+/=~".contains(c)
+        })
+    })
+}
+
+fn contains_keyword_run(
+    text: &str,
+    marker: &str,
+    minimum: usize,
+    allowed: impl Fn(char) -> bool,
+) -> bool {
+    let mut search = text;
+    while let Some(index) = search.find(marker) {
+        let rest = &search[index + marker.len()..];
+        let count = rest.chars().take_while(|c| allowed(*c)).count();
+        if count >= minimum {
+            return true;
+        }
+        search = &search[index + marker.len()..];
+    }
+    false
 }
 
 fn contains_aws_key(text: &str) -> bool {

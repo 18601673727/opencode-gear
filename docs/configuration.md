@@ -324,6 +324,26 @@ denied, and `ocg tools` / the context plan report the disabled state.
 Capability planning is a context/config diagnostic, not a security sandbox; see
 [verification.md](verification.md).
 
+## Telemetry policy
+
+The optional top-level `telemetry` object controls local event collection:
+
+```json
+{ "telemetry": { "enabled": true, "localOnly": true } }
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Record an event for `ocg context` and `ocg verify`. |
+| `localOnly` | `true` | Must stay `true`; there is no remote mode, and `false` is rejected by `ocg validate`. |
+
+Events are appended to `<project>/.opencode-gear/telemetry/events.jsonl`. The
+schema never includes prompts, source code, command strings, command output,
+headers or absolute paths; secret-shaped metadata is redacted before it is
+written. A telemetry failure warns and never blocks a command. Set
+`"enabled": false` or `OPENCODE_GEAR_TELEMETRY=0` to disable collection. See
+[telemetry.md](telemetry.md).
+
 ## Environment variables
 
 `OPENCODE_GEAR_*` is canonical; the legacy `OC_GEAR_*` names are accepted as
@@ -340,6 +360,7 @@ fallbacks.
 | `OPENCODE_GEAR_TRACE` (legacy `OC_GEAR_TRACE`) | trace file, read only when observability is enabled |
 | `OPENCODE_GEAR_CACHE_DIR` | override the update-check cache directory |
 | `OPENCODE_GEAR_API_BASE` | override the GitHub API base (mirrors, tests) |
+| `OPENCODE_GEAR_TELEMETRY` (legacy `OC_GEAR_TELEMETRY`) | `0`/`1` to force local telemetry off/on |
 
 ## Commands
 
@@ -356,6 +377,7 @@ ocg trace    --event launch [--project DIR]
 ocg context  <task...> [--pretty] [--project DIR]
 ocg context  symbols <query> [--project DIR]
 ocg cache    stats|clean [--project DIR]
+ocg stats    [--pretty] [--project DIR]
 ocg verify   [fast|normal|full] [--pretty] [--project DIR]
 ocg tools    <task...> [--pretty] [--project DIR]
 ocg checkpoint list|show <id>|save --phase P [--task T] [--decision D] [--pretty] [--project DIR]

@@ -551,13 +551,14 @@ build               print the resolved OpenCode config
 context <task...>   deterministic local repository context plan
 context symbols <q> find indexed symbols by name (diagnostic)
 cache clean|stats   manage the local context cache (never the runtime)
+stats [--pretty]    read-only local telemetry aggregate (offline)
 verify [fast|normal|full]
                     run only explicitly configured trusted commands
 tools <task...>     capability plan / Tool Context Firewall view (advisory)
 checkpoint list|show|save
                     inspect or record a versioned phase checkpoint
 version             Gear, platform and the resolved OpenCode runtime
-doctor              read-only platform/config/runtime/cache check
+doctor              read-only platform/config/runtime/state check
 upgrade             self-update Gear, then maintain the active OpenCode
 help                print usage
 ```
@@ -623,6 +624,9 @@ replaced per project.
 - Override files (`.opencode-gear.json`, `~/.config/opencode-gear/config.json`)
   are for routing and prompts only. Keep project privacy rules in your
   project's own agent instructions.
+- Local telemetry is local-only and never records prompts, source code, command
+  strings, command output or headers. Metadata that looks like a credential is
+  redacted before it is written. See [docs/telemetry.md](docs/telemetry.md).
 
 ## Observability (optional)
 
@@ -656,6 +660,7 @@ ocg context --pretty summarise the cache   # full plan as JSON
 ocg context symbols parse                  # symbol/definition diagnostic
 ocg cache stats                           # cache + index status
 ocg cache clean                           # clear the context cache only
+ocg stats                                  # local telemetry aggregate
 ```
 
 **Integration boundary.** Context is produced only when you ask for it, through
@@ -687,20 +692,41 @@ State layout, alongside the managed runtime:
   cache/context/*.json        fine-grained plan cache
   logs/*.log                  raw verification logs (never swept by cache clean)
   checkpoints/*.json          phase checkpoints (inspectable JSON)
+  telemetry/events.jsonl      local-only telemetry events (inspectable JSONL)
 ```
 
 Sensitive files (`.env`, `.envrc`, key material, `id_rsa`/`id_ed25519`,
 `credentials*`, `secrets*`, `auth*`, `token*`, known OpenCode credential
 locations, ...) are never read, parsed, sliced or cached — only their path
 metadata is indexed. `ocg cache clean` removes `cache/` only, never the
-runtime, the index, the verification logs or the checkpoints. Creating any
-state adds `.opencode-gear/` to the project `.gitignore` once, using the same
-idempotent helper the runtime uses.
+runtime, the index, the verification logs, the checkpoints or the telemetry.
+Creating any state adds `.opencode-gear/` to the project `.gitignore` once,
+using the same idempotent helper the runtime uses.
 
 The plan carries a stable conceptual section order — gear instructions, project
 policy, repository map, capability/tool descriptions, task capsule, relevant
 symbols/source, current git diff, verification state — and embeds the advisory
-capability plan and targeted-test proposal.
+capability plan and targeted-test proposal. Task capsules and phase checkpoints
+are structured, versioned JSON; `ocg checkpoint list|show|save` inspects them.
+
+### Local telemetry and stats
+
+`ocg context` and `ocg verify` append one small JSON object per run to
+`<project>/.opencode-gear/telemetry/events.jsonl`: byte sizes, estimated token
+counts, index/cache hits, verification attempts and outcomes, and durations.
+It is **local only** — no upload, no model API — and never records a prompt,
+source code, command string or command output. `ocg stats` reads it offline:
+
+```bash
+ocg stats            # project aggregate + latest event
+ocg stats --pretty   # same information as JSON
+```
+
+Telemetry is on by default and always local-only. Disable it with
+`{"telemetry": {"enabled": false}}` or `OPENCODE_GEAR_TELEMETRY=0`. Missing
+telemetry is reported as "no data" and never blocks a command. See
+[docs/telemetry.md](docs/telemetry.md) for the schema and privacy model, and
+[docs/token-efficiency.md](docs/token-efficiency.md) for one measured example.
 
 ## Verification, checkpoints and capabilities (optional)
 
@@ -852,6 +878,9 @@ opencode-gear/
   src/http.rs            blocking HTTP transport abstraction + reqwest impl
   src/context/           deterministic local context engine (repo map, index,
                          symbols, git diff, ranking, cache, capsules)
+  src/verification/      explicit verification, log distillation, test selection
+  src/orchestration/     versioned phase checkpoints
+  src/telemetry/         local-only JSONL events, token provenance, stats
   src/runtime/           managed OpenCode runtime (policy, resolve, install,
                          cache, release, archive, self-update)
   install.sh             portable POSIX installer
@@ -865,7 +894,8 @@ opencode-gear/
   config/prompts/*.md     one prompt per role
   examples/               override file examples
   tests/                  Rust unit and integration tests + installer shell tests
-  docs/                   architecture, configuration, migration, troubleshooting
+  docs/                   architecture, configuration, telemetry, verification,
+                          token efficiency, migration, troubleshooting
   Makefile               `make test`, `make check`, `make validate`, `make package`
 ```
 
@@ -901,6 +931,11 @@ system runtimes, pins, safe install cleanup and atomic activation, Gear
 self-update checksum verification, and the `version`/`doctor`/`upgrade`
 commands. `tests/installer_test.sh` exercises `install.sh` offline with local
 fixtures.
+
+The telemetry and state suites are deterministic and offline: token provenance
+(reported, estimated and unknown kept distinct), aggregation, corrupt-JSONL
+recovery, secret redaction, `ocg stats` output and read-only behavior,
+`ocg doctor` state checks, and a reproducible context/log measurement fixture.
 
 ### Development workflow
 
@@ -951,6 +986,8 @@ walkthrough.
 | [docs/architecture.md](docs/architecture.md) | The two axes, resolution pipeline, invariants, extension points |
 | [docs/configuration.md](docs/configuration.md) | Every registry, override shape, environment variable and command |
 | [docs/verification.md](docs/verification.md) | Verification, log distillation, test selection, capabilities/firewall, checkpoints, stable ordering |
+| [docs/telemetry.md](docs/telemetry.md) | Telemetry schema, privacy model, token provenance, `ocg stats`, doctor checks, deferred boundaries |
+| [docs/token-efficiency.md](docs/token-efficiency.md) | One recorded deterministic context and log-distillation measurement |
 | [docs/migration.md](docs/migration.md) | Step-by-step migration from a whole-bundle Gear/profile setup |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Failure modes and how to diagnose them |
 

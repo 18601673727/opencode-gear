@@ -141,7 +141,7 @@ capsules        versioned serde TaskCapsule for a later session
 
 Invariants worth preserving:
 
-- **Local and deterministic.** No network, no telemetry, no embeddings. Ordering
+- **Local and deterministic.** No network, no remote telemetry, no embeddings. Ordering
   is explicit (path, line, kind) and ranking uses integer scores, so the same
   tree always yields the same plan.
 - **Sensitive content never enters an artifact.** `.env`, key material,
@@ -225,6 +225,39 @@ Invariants worth preserving:
   reported without blocking `ocg`.
 
 The full detail lives in [verification.md](verification.md).
+
+## Local telemetry
+
+The optional context and verification flows record a small local event so the
+local reductions can be measured over time:
+
+```text
+events          <project>/.opencode-gear/telemetry/events.jsonl (one JSON/line)
+schema          task/session id, timestamps, task type, role/provider/model when
+                known, token counts with source, context/repo/verification/log
+                metrics, capability names, deterministic outcome
+tokens          provider_reported | opencode_reported | estimated | unknown
+privacy         no prompt/source/command/output/header; metadata redacted
+reader          `ocg stats` (offline, read-only, no state creation)
+doctor          read-only inspection; missing state is info, corruption a warn
+```
+
+Invariants worth preserving:
+
+- **Local only.** No upload, no model API, no network path. The store lives in
+  the project, not in a platform remote cache.
+- **Estimates stay labelled.** The only token number a local flow can produce is
+  an estimate (bytes / 4); it carries `source: "estimated"` and is never shown
+  as exact. Provider/OpenCode-reported values are schema-supported but need a
+  session hook that is not shipped.
+- **Fail soft.** A telemetry configuration, write or corruption problem warns
+  and never blocks context, verification or an ordinary launch.
+- **No decisions.** The schema is an input for a future budget/capability
+  feature; nothing here scores, routes or purchases. Those features are
+  explicitly deferred.
+
+The full detail lives in [telemetry.md](telemetry.md); one recorded measurement
+is in [token-efficiency.md](token-efficiency.md).
 
 ## Why one agent per throttle level
 
