@@ -364,6 +364,12 @@ mod tests {
             sensitive_excluded: 0,
             truncated: false,
             notes: vec![],
+            instructions: Default::default(),
+            policy: Default::default(),
+            capabilities: Default::default(),
+            capsule: None,
+            test_proposal: None,
+            verification: Default::default(),
         }
     }
 

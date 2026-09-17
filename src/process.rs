@@ -9,11 +9,13 @@
 //! spawning anything.
 
 use crate::error::{GearError, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// The `opencode` binary and how to run it.
 #[derive(Debug, Clone)]
@@ -545,6 +547,262 @@ impl GitHost for FakeGitHost {
     }
 }
 
+/// How a captured child process ended: an exit code, a signal, or something
+/// the platform did not report. Kept explicit so a killed process is never
+/// mistaken for an unknown success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessExit {
+    Code(i32),
+    Signal(i32),
+    Unknown,
+}
+
+impl ProcessExit {
+    pub fn is_success(self) -> bool {
+        matches!(self, ProcessExit::Code(0))
+    }
+
+    /// A stable, human-readable label. Never claims success for `Unknown`.
+    pub fn label(self) -> String {
+        match self {
+            ProcessExit::Code(code) => format!("exit {code}"),
+            ProcessExit::Signal(signal) => format!("signal {signal}"),
+            ProcessExit::Unknown => "unknown exit status".to_string(),
+        }
+    }
+}
+
+/// One bounded capture of an external command. Bytes are retained as raw
+/// bytes so invalid UTF-8 is preserved lossily by callers instead of being
+/// dropped; `*_truncated` records that a stream exceeded the cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedOutput {
+    pub exit: ProcessExit,
+    pub success: bool,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub duration_ms: u64,
+}
+
+impl CapturedOutput {
+    pub fn success(stdout: impl Into<Vec<u8>>) -> Self {
+        Self {
+            exit: ProcessExit::Code(0),
+            success: true,
+            stdout: stdout.into(),
+            stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration_ms: 1,
+        }
+    }
+
+    pub fn failure(code: i32, stderr: impl Into<Vec<u8>>) -> Self {
+        Self {
+            exit: ProcessExit::Code(code),
+            success: false,
+            stdout: Vec::new(),
+            stderr: stderr.into(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration_ms: 1,
+        }
+    }
+
+    pub fn stdout_lossy(&self) -> String {
+        String::from_utf8_lossy(&self.stdout).into_owned()
+    }
+
+    pub fn stderr_lossy(&self) -> String {
+        String::from_utf8_lossy(&self.stderr).into_owned()
+    }
+
+    pub fn truncated(&self) -> bool {
+        self.stdout_truncated || self.stderr_truncated
+    }
+}
+
+/// The one trait verification (and any future capture) uses to run a command
+/// without constructing a [`std::process::Command`] outside this module.
+///
+/// `max_bytes` bounds each stream independently and must be greater than zero.
+pub trait CaptureRunner: Send + Sync {
+    fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+        max_bytes: usize,
+    ) -> Result<CapturedOutput>;
+}
+
+/// The real capture runner, backed by `std::process::Command`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemCaptureRunner;
+
+fn process_exit(status: &std::process::ExitStatus) -> ProcessExit {
+    if let Some(code) = status.code() {
+        return ProcessExit::Code(code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return ProcessExit::Signal(signal);
+        }
+    }
+    ProcessExit::Unknown
+}
+
+impl CaptureRunner for SystemCaptureRunner {
+    fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+        max_bytes: usize,
+    ) -> Result<CapturedOutput> {
+        let max_bytes = max_bytes.max(1);
+        let start = Instant::now();
+        let mut child = Command::new(program)
+            .args(args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| GearError::io(format!("cannot run {program}"), error))?;
+
+        // Drain both streams concurrently to EOF, retaining only a bounded
+        // prefix. The child is never killed for being verbose: its own exit
+        // status stays authoritative and truncation is reported separately.
+        // Memory stays bounded; a genuinely non-terminating command is a
+        // documented limitation (there is no timeout).
+        let stdout_handle = child
+            .stdout
+            .take()
+            .map(|stdout| std::thread::spawn(move || read_drain_bounded(stdout, max_bytes)));
+        let (stderr_bytes, stderr_truncated) = match child.stderr.take() {
+            Some(stderr) => read_drain_bounded(stderr, max_bytes),
+            None => (Vec::new(), false),
+        };
+        let (stdout_bytes, stdout_truncated) = match stdout_handle {
+            Some(handle) => handle.join().unwrap_or_default(),
+            None => (Vec::new(), false),
+        };
+        let status = child
+            .wait()
+            .map_err(|error| GearError::io(format!("cannot wait for {program}"), error))?;
+        let duration_ms = start.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        Ok(CapturedOutput {
+            exit: process_exit(&status),
+            success: status.success(),
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+            stdout_truncated,
+            stderr_truncated,
+            duration_ms,
+        })
+    }
+}
+
+/// One exact-argument fake capture response.
+#[doc(hidden)]
+pub type FakeCaptureResponse = (String, Vec<String>, CapturedOutput);
+
+/// One recorded fake capture call.
+#[doc(hidden)]
+pub type FakeCaptureCall = (String, Vec<String>);
+
+/// A test-only capture runner: exact (program, args) responses plus call
+/// recording. Unmatched calls fail the spawn, which exercises the error path.
+#[doc(hidden)]
+#[derive(Debug, Default, Clone)]
+pub struct FakeCaptureRunner {
+    responses: Arc<Mutex<Vec<FakeCaptureResponse>>>,
+    calls: Arc<Mutex<Vec<FakeCaptureCall>>>,
+    default: Option<CapturedOutput>,
+}
+
+impl FakeCaptureRunner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_response(self, program: &str, args: &[&str], output: CapturedOutput) -> Self {
+        self.responses
+            .lock()
+            .expect("fake capture responses")
+            .push((
+                program.to_string(),
+                args.iter().map(|arg| arg.to_string()).collect(),
+                output,
+            ));
+        self
+    }
+
+    pub fn with_success(self, program: &str, args: &[&str], stdout: &str) -> Self {
+        self.with_response(
+            program,
+            args,
+            CapturedOutput::success(stdout.as_bytes().to_vec()),
+        )
+    }
+
+    pub fn with_failure(self, program: &str, args: &[&str], code: i32, stderr: &str) -> Self {
+        self.with_response(
+            program,
+            args,
+            CapturedOutput::failure(code, stderr.as_bytes().to_vec()),
+        )
+    }
+
+    /// The output returned for any command without an exact match.
+    pub fn with_default(mut self, output: CapturedOutput) -> Self {
+        self.default = Some(output);
+        self
+    }
+
+    pub fn calls(&self) -> Vec<FakeCaptureCall> {
+        self.calls.lock().expect("fake capture calls").clone()
+    }
+}
+
+impl CaptureRunner for FakeCaptureRunner {
+    fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        _cwd: &Path,
+        _max_bytes: usize,
+    ) -> Result<CapturedOutput> {
+        self.calls
+            .lock()
+            .expect("fake capture calls")
+            .push((program.to_string(), args.to_vec()));
+        let responses = self.responses.lock().expect("fake capture responses");
+        if let Some((_, _, output)) =
+            responses
+                .iter()
+                .find(|(expected_program, expected_args, _)| {
+                    expected_program == program && expected_args == args
+                })
+        {
+            return Ok(output.clone());
+        }
+        drop(responses);
+        match &self.default {
+            Some(output) => Ok(output.clone()),
+            None => Err(GearError::config(format!(
+                "{program} is not configured in this fake capture runner"
+            ))),
+        }
+    }
+}
+
 /// Whether a path points at an executable regular file.
 pub fn is_executable(path: &Path) -> bool {
     if !path.is_file() {
@@ -630,5 +888,110 @@ mod tests {
         let output = fake.run_bounded(&["big"], Path::new("."), 4).unwrap();
         assert_eq!(output.stdout, "0123");
         assert!(output.truncated);
+    }
+
+    #[test]
+    fn process_exit_labels_never_claim_success() {
+        assert!(ProcessExit::Code(0).is_success());
+        assert!(!ProcessExit::Code(1).is_success());
+        assert!(!ProcessExit::Signal(9).is_success());
+        assert!(!ProcessExit::Unknown.is_success());
+        assert_eq!(ProcessExit::Code(3).label(), "exit 3");
+        assert_eq!(ProcessExit::Signal(9).label(), "signal 9");
+        assert_eq!(ProcessExit::Unknown.label(), "unknown exit status");
+    }
+
+    #[test]
+    fn fake_capture_records_calls_and_returns_responses() {
+        let fake = FakeCaptureRunner::new()
+            .with_success("cargo", &["check"], "ok")
+            .with_failure("cargo", &["test"], 101, "nope");
+        let ok = fake
+            .run("cargo", &["check".to_string()], Path::new("."), 1024)
+            .unwrap();
+        assert!(ok.success);
+        assert_eq!(ok.exit, ProcessExit::Code(0));
+        assert_eq!(ok.stdout_lossy(), "ok");
+        let bad = fake
+            .run("cargo", &["test".to_string()], Path::new("."), 1024)
+            .unwrap();
+        assert!(!bad.success);
+        assert_eq!(bad.exit, ProcessExit::Code(101));
+        assert_eq!(bad.stderr_lossy(), "nope");
+        assert_eq!(
+            fake.calls(),
+            vec![
+                ("cargo".to_string(), vec!["check".to_string()]),
+                ("cargo".to_string(), vec!["test".to_string()]),
+            ]
+        );
+        assert!(fake.run("missing", &[], Path::new("."), 1024).is_err());
+    }
+
+    #[test]
+    fn lossy_conversion_preserves_invalid_utf8() {
+        let output = CapturedOutput {
+            exit: ProcessExit::Code(0),
+            success: true,
+            stdout: vec![0x66, 0xff, 0x6f],
+            stderr: vec![0x80],
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration_ms: 0,
+        };
+        assert_eq!(output.stdout_lossy(), "f\u{fffd}o");
+        assert_eq!(output.stderr_lossy(), "\u{fffd}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_capture_reports_status_and_streams() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("producer");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf 'out'\nprintf 'err' >&2\nexit 7\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let runner = SystemCaptureRunner;
+        let output = runner
+            .run(program.to_string_lossy().as_ref(), &[], dir.path(), 1024)
+            .unwrap();
+        assert_eq!(output.exit, ProcessExit::Code(7));
+        assert!(!output.success);
+        assert!(!output.truncated());
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_capture_bounds_runaway_output_and_keeps_the_exit_status() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("flood");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf 'abcdefghij'\nprintf 'stderr-flood' >&2\nexit 7\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let runner = SystemCaptureRunner;
+        let output = runner
+            .run(program.to_string_lossy().as_ref(), &[], dir.path(), 4)
+            .unwrap();
+        // Truncation is reported, but the command's own exit status is kept.
+        assert_eq!(output.exit, ProcessExit::Code(7));
+        assert!(!output.success);
+        assert!(output.stdout_truncated);
+        assert!(output.stderr_truncated);
+        assert_eq!(output.stdout, b"abcd");
+        assert_eq!(output.stderr, b"stde");
     }
 }

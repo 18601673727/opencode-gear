@@ -6,6 +6,7 @@
 //! names are accepted as fallbacks.
 
 use crate::build;
+use crate::capabilities::{CapabilityConfig, CapabilityEvidence, CapabilityPlan};
 use crate::clock::{Clock, SystemClock};
 use crate::config;
 use crate::context::{self, ContextConfig, ContextEngine};
@@ -15,12 +16,17 @@ use crate::http::{HttpTransport, NoHttp, ReqwestHttp};
 use crate::json;
 use crate::model;
 use crate::observability;
+use crate::orchestration::checkpoint::{self, Phase};
 use crate::platform::Platform;
-use crate::process::{ProcessHost, ProcessRunner, SystemGitHost, SystemProcessHost};
+use crate::process::{
+    ProcessHost, ProcessRunner, SystemCaptureRunner, SystemGitHost, SystemProcessHost,
+};
 use crate::report;
 use crate::runtime::policy::RuntimePolicy;
 use crate::runtime::{self, install::Layout};
 use crate::validate;
+use crate::verification::runner::{execute, VerifyRequest};
+use crate::verification::Config as VerificationConfig;
 use semver::Version;
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -112,6 +118,9 @@ pub enum Command {
     Trace(Option<String>),
     Context(Vec<OsString>),
     Cache(Option<String>),
+    Verify(Vec<OsString>),
+    Tools(Vec<OsString>),
+    Checkpoint(Vec<OsString>),
     Version,
     Doctor,
     Upgrade,
@@ -274,6 +283,16 @@ where
             break;
         }
         if text.starts_with('-') && text != "-" {
+            // Only commands that actually accept subcommand options may collect
+            // an unknown option. `checkpoint save --phase ...` does; every
+            // legacy command (validate, status, doctor, version, routing,
+            // layers, build, upgrade, cache, context, verify, ...) keeps the
+            // strict usage error it always had.
+            if command_token.as_deref() == Some("checkpoint") {
+                rest.push(args[index].clone());
+                index += 1;
+                continue;
+            }
             return Err(UsageError(format!(
                 "unknown option: {text} (try 'ocg help')"
             )));
@@ -320,6 +339,9 @@ where
             rest.first()
                 .map(|value| value.to_string_lossy().into_owned()),
         ),
+        Some("verify") => Command::Verify(rest),
+        Some("tools") => Command::Tools(rest),
+        Some("checkpoint") => Command::Checkpoint(rest),
         Some("version") => Command::Version,
         Some("doctor") => Command::Doctor,
         Some("upgrade") => Command::Upgrade,
@@ -361,6 +383,11 @@ Commands:
   context <task...>     build a deterministic local repository context plan
   context symbols <q>   find indexed symbols by name (diagnostic)
   cache clean|stats     manage the local context cache (never the runtime)
+  verify [fast|normal|full]
+                        run the configured trusted commands for a stage
+  tools <task...>       show the capability plan / Tool Context Firewall view
+  checkpoint list|show|save
+                        inspect, or create, a phase checkpoint
   version               report Gear, platform and the resolved OpenCode runtime
   doctor                check platform, config, runtime and cache (read-only)
   upgrade               self-update Gear, then maintain the active OpenCode
@@ -557,6 +584,9 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
         Command::Doctor => doctor_command(&effective, &cwd, &env),
         Command::Context(args) => context_command(&effective, &cwd, args, cli.pretty),
         Command::Cache(action) => cache_command(&effective, &cwd, action.as_deref()),
+        Command::Verify(args) => verify_command(&effective, &cwd, args, cli.pretty),
+        Command::Tools(args) => tools_command(&effective, args, cli.pretty),
+        Command::Checkpoint(args) => checkpoint_command(&effective, &cwd, args, cli.pretty),
         Command::Upgrade => upgrade_command(&effective, &cwd, &env),
     }
 }
@@ -977,7 +1007,13 @@ fn context_command(
     }
     let git = SystemGitHost;
     let clock = SystemClock;
-    let engine = ContextEngine::new(project_root, config, &git, &clock);
+    let capabilities = crate::capabilities::CapabilityConfig::from_config(&effective.data)
+        .map_err(Failure::Gear)?;
+    let verification =
+        crate::verification::Config::from_config(&effective.data).map_err(Failure::Gear)?;
+    let engine = ContextEngine::new(project_root, config, &git, &clock)
+        .with_capabilities(capabilities)
+        .with_verification(verification);
     let words: Vec<String> = args
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -1075,6 +1111,366 @@ fn cache_command(
             "unknown cache action: {other} (try 'ocg cache stats' or 'ocg cache clean')"
         ))),
     }
+}
+
+/// `ocg verify [fast|normal|full]`: run only configured trusted commands.
+fn verify_command(
+    effective: &config::Effective,
+    project_root: &Path,
+    args: &[OsString],
+    pretty: bool,
+) -> std::result::Result<i32, Failure> {
+    let config = VerificationConfig::from_config(&effective.data).map_err(Failure::Gear)?;
+    let words: Vec<String> = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    if words.len() > 1 {
+        return Err(usage_failure(format!(
+            "verify takes at most one stage (fast, normal or full); got: {}",
+            words.join(" ")
+        )));
+    }
+    let requested = words
+        .first()
+        .cloned()
+        .unwrap_or_else(|| config.default_stage.clone());
+    // Validate the stage name even when verification is disabled.
+    config.stage(&requested).map_err(Failure::Gear)?;
+
+    let clock = SystemClock;
+    let context_config = ContextConfig::from_config(&effective.data).map_err(Failure::Gear)?;
+    let mut extra_notes = Vec::new();
+
+    // An advisory proposal only; it is never executed here. When context is
+    // disabled nothing is indexed or read and the absence is stated explicitly.
+    let proposal = if !config.enabled {
+        None
+    } else if !context_config.enabled {
+        extra_notes.push(
+            "context is disabled (context.enabled=false); targeted-test selection was skipped and no context index was created"
+                .to_string(),
+        );
+        None
+    } else if config.include_test_proposal {
+        let git = SystemGitHost;
+        let capabilities = CapabilityConfig::from_config(&effective.data).map_err(Failure::Gear)?;
+        let engine = ContextEngine::new(project_root, context_config, &git, &clock)
+            .with_capabilities(capabilities)
+            .with_verification(config.clone());
+        match engine.targeted_tests() {
+            Ok(proposal) => Some(proposal),
+            Err(error) => {
+                eprintln!("ocg: warning: targeted test proposal skipped: {error}");
+                extra_notes.push(format!("targeted-test selection was skipped: {error}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let runner = SystemCaptureRunner;
+    let mut report = execute(&VerifyRequest {
+        root: project_root,
+        config: &config,
+        stage: requested,
+        runner: &runner,
+        clock: &clock,
+        test_proposal: proposal,
+    })
+    .map_err(Failure::Gear)?;
+    report.notes.extend(extra_notes);
+
+    if pretty {
+        let value = serde_json::to_value(&report).map_err(|error| {
+            Failure::Gear(GearError::config(format!(
+                "cannot serialize the verification report: {error}"
+            )))
+        })?;
+        print_config(&value, true)?;
+    } else {
+        print_verification_report(&report);
+    }
+    Ok(if report.failed() { 1 } else { 0 })
+}
+
+fn print_verification_report(report: &crate::verification::VerificationReport) {
+    println!(
+        "verification stage: {} ({})",
+        report.stage,
+        report.overall().as_str()
+    );
+    for note in &report.notes {
+        println!("note: {note}");
+    }
+    for result in &report.results {
+        println!(
+            "  [{}] {} ({} ms, {})",
+            if result.success { "ok" } else { "fail" },
+            result.display(),
+            result.duration_ms,
+            result.exit.label()
+        );
+        if !result.output.summary.is_empty() {
+            for line in result.output.summary.iter().take(20) {
+                println!("      {line}");
+            }
+        }
+        for note in &result.output.notes {
+            println!("      note: {note}");
+        }
+        if let Some(path) = &result.raw_log {
+            println!(
+                "      raw log: {path}{}",
+                if result.raw_truncated {
+                    " (truncated: retained prefix only)"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+    if let Some(proposal) = &report.test_proposal {
+        print!("{}", proposal.render());
+    }
+}
+
+/// `ocg tools <task...>`: the capability plan / firewall diagnostic.
+fn tools_command(
+    effective: &config::Effective,
+    args: &[OsString],
+    pretty: bool,
+) -> std::result::Result<i32, Failure> {
+    let config = CapabilityConfig::from_config(&effective.data).map_err(Failure::Gear)?;
+    let task = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
+    if task.is_empty() {
+        return Err(usage_failure(
+            "tools needs a task description (for example: ocg tools commit the fix)",
+        ));
+    }
+    let plan = CapabilityPlan::plan_config(
+        &task,
+        &CapabilityEvidence::default(),
+        &config.custom,
+        config.enabled,
+    );
+    if pretty {
+        let value = serde_json::to_value(&plan).map_err(|error| {
+            Failure::Gear(GearError::config(format!(
+                "cannot serialize the capability plan: {error}"
+            )))
+        })?;
+        print_config(&value, true)?;
+    } else {
+        print!("{}", plan.render());
+    }
+    Ok(0)
+}
+
+/// `ocg checkpoint list|show|save`.
+fn checkpoint_command(
+    effective: &config::Effective,
+    project_root: &Path,
+    args: &[OsString],
+    pretty: bool,
+) -> std::result::Result<i32, Failure> {
+    let words: Vec<String> = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let git = SystemGitHost;
+    match words.first().map(String::as_str) {
+        None | Some("list") => {
+            if words.len() > 1 {
+                return Err(usage_failure(format!(
+                    "checkpoint list takes no arguments; got: {}",
+                    words[1..].join(" ")
+                )));
+            }
+            let (summaries, corrupt) = checkpoint::list(project_root);
+            println!(
+                "checkpoints: {} ({} corrupt, ignored)",
+                summaries.len(),
+                corrupt
+            );
+            for summary in &summaries {
+                println!(
+                    "  {}  {}  {}",
+                    summary.created_at,
+                    summary.phase.as_str(),
+                    summary.id
+                );
+                println!("      task: {}", summary.task);
+            }
+            Ok(0)
+        }
+        Some("show") => {
+            if words.len() != 2 {
+                return Err(usage_failure(
+                    "checkpoint show needs exactly one checkpoint id (options such as --pretty may appear before or after it)",
+                ));
+            }
+            let id = &words[1];
+            if id.starts_with('-') {
+                return Err(usage_failure(format!(
+                    "unknown checkpoint show option: {id}"
+                )));
+            }
+            let loaded = checkpoint::load(project_root, id, &git).map_err(Failure::Gear)?;
+            if pretty {
+                let value = json!({
+                    "checkpoint": loaded.checkpoint,
+                    "stale": loaded.staleness.stale,
+                    "reasons": loaded.staleness.reasons,
+                });
+                print_config(&value, true)?;
+            } else {
+                println!(
+                    "checkpoint {} ({}) created_at {}",
+                    loaded.checkpoint.id,
+                    loaded.checkpoint.phase.as_str(),
+                    loaded.checkpoint.created_at
+                );
+                println!("task:        {}", loaded.checkpoint.capsule.task);
+                println!(
+                    "stale:       {}{}",
+                    loaded.staleness.stale,
+                    if loaded.staleness.reasons.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", loaded.staleness.reasons.join("; "))
+                    }
+                );
+            }
+            Ok(0)
+        }
+        Some("save") => save_checkpoint(effective, project_root, &words[1..]),
+        Some(other) => Err(usage_failure(format!(
+            "unknown checkpoint action: {other} (try 'list', 'show' or 'save')"
+        ))),
+    }
+}
+
+fn save_checkpoint(
+    effective: &config::Effective,
+    project_root: &Path,
+    args: &[String],
+) -> std::result::Result<i32, Failure> {
+    let mut phase: Option<Phase> = None;
+    let mut task: Option<String> = None;
+    let mut decisions: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        match argument.as_str() {
+            "--phase" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| usage_failure("checkpoint save --phase needs a value"))?;
+                phase = Phase::parse(value);
+                if phase.is_none() {
+                    return Err(usage_failure(format!(
+                        "unknown phase '{value}' (expected explore-to-build, build-to-verify, verify-to-debug, decision)"
+                    )));
+                }
+                index += 2;
+            }
+            "--task" => {
+                task = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| usage_failure("checkpoint save --task needs a value"))?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--decision" => {
+                decisions.push(
+                    args.get(index + 1)
+                        .ok_or_else(|| usage_failure("checkpoint save --decision needs a value"))?
+                        .clone(),
+                );
+                index += 2;
+            }
+            other => {
+                return Err(usage_failure(format!(
+                    "unknown checkpoint save option: {other}"
+                )))
+            }
+        }
+    }
+    let phase = phase.ok_or_else(|| usage_failure("checkpoint save needs --phase"))?;
+    let task = task.unwrap_or_else(|| "checkpoint".to_string());
+
+    let git = SystemGitHost;
+    let clock = SystemClock;
+    let snapshot = crate::context::gitdiff::GitSnapshot::collect(project_root, &git);
+    let git_fingerprint = crate::context::gitdiff::snapshot_fingerprint(&snapshot);
+
+    // Best-effort capsule from the current context plan; the checkpoint still
+    // saves without one if context is disabled or unavailable.
+    let (capsule, provenance) = {
+        let context_config = ContextConfig::from_config(&effective.data).map_err(Failure::Gear)?;
+        let capabilities = CapabilityConfig::from_config(&effective.data).map_err(Failure::Gear)?;
+        let verification =
+            VerificationConfig::from_config(&effective.data).map_err(Failure::Gear)?;
+        if context_config.enabled {
+            let engine = ContextEngine::new(project_root, context_config, &git, &clock)
+                .with_capabilities(capabilities)
+                .with_verification(verification);
+            match engine.plan(&task, None) {
+                Ok(outcome) => (
+                    outcome
+                        .plan
+                        .capsule
+                        .clone()
+                        .unwrap_or_else(|| crate::context::capsule::TaskCapsule::new(&task)),
+                    outcome.plan.provenance,
+                ),
+                Err(error) => {
+                    eprintln!("ocg: warning: checkpoint capsule built without context: {error}");
+                    (
+                        crate::context::capsule::TaskCapsule::new(&task),
+                        crate::context::freshness::Provenance::default(),
+                    )
+                }
+            }
+        } else {
+            (
+                crate::context::capsule::TaskCapsule::new(&task),
+                crate::context::freshness::Provenance::default(),
+            )
+        }
+    };
+
+    let decisions: Vec<crate::context::capsule::Decision> = decisions
+        .into_iter()
+        .map(|decision| crate::context::capsule::Decision {
+            decision,
+            rationale: None,
+            date: None,
+            date_unknown: true,
+        })
+        .collect();
+    let checkpoint = checkpoint::Checkpoint::build(
+        phase,
+        capsule,
+        snapshot.state.clone(),
+        git_fingerprint,
+        None,
+        provenance,
+        decisions,
+        clock.now_unix(),
+    );
+    let path = checkpoint.save(project_root).map_err(Failure::Gear)?;
+    println!("checkpoint saved: {} ({})", checkpoint.id, path.display());
+    Ok(0)
 }
 
 fn throttle_command(

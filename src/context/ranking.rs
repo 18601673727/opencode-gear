@@ -14,7 +14,6 @@ use crate::error::{GearError, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-
 /// The selected per-plan limits, echoed for transparency.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextLimits {
@@ -35,6 +34,67 @@ pub struct ContextLimits {
 pub struct PlanSection {
     pub name: String,
     pub order: u32,
+}
+
+/// The deterministic gear-instruction block of a plan. It lists only stable
+/// OCG commands; it does not inject anything into OpenCode's own config.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct GearInstructions {
+    pub engine_version: String,
+    pub commands: Vec<String>,
+    pub note: String,
+}
+
+/// Repository instruction / policy files detected at the project root.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PolicyState {
+    pub files: Vec<String>,
+    pub present: bool,
+    pub note: String,
+}
+
+impl PolicyState {
+    /// Repository policy files, in a stable order. Only existence is checked.
+    pub fn detect(root: &Path) -> Self {
+        const CANDIDATES: [&str; 8] = [
+            "AGENTS.md",
+            "CLAUDE.md",
+            "CONTRIBUTING.md",
+            "CONTRIBUTING.rst",
+            "CODE_OF_CONDUCT.md",
+            ".github/CONTRIBUTING.md",
+            "docs/CONTRIBUTING.md",
+            "docs/ARCHITECTURE.md",
+        ];
+        let files: Vec<String> = CANDIDATES
+            .iter()
+            .filter(|candidate| root.join(candidate).is_file())
+            .map(|candidate| candidate.to_string())
+            .collect();
+        let present = !files.is_empty();
+        let note = if present {
+            "the repository is authoritative for its own conventions and safety rules".to_string()
+        } else {
+            "no standard repository instruction file was detected".to_string()
+        };
+        Self {
+            files,
+            present,
+            note,
+        }
+    }
+}
+
+/// The computed capability/verification/test-proposal context attached to a
+/// plan. Kept separate from ranking so the ranking functions stay pure.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PlanEnrichment {
+    #[serde(default)]
+    pub capabilities: crate::capabilities::CapabilityPlan,
+    #[serde(default)]
+    pub verification: crate::verification::VerificationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_proposal: Option<crate::verification::TestProposal>,
 }
 
 /// One ranked file candidate.
@@ -85,6 +145,20 @@ pub struct ContextPlan {
     pub sensitive_excluded: usize,
     pub truncated: bool,
     pub notes: Vec<String>,
+    /// Stable conceptual sections: instructions, policy, map, capabilities,
+    /// capsule, symbols/source, git diff, verification state.
+    #[serde(default)]
+    pub instructions: GearInstructions,
+    #[serde(default)]
+    pub policy: PolicyState,
+    #[serde(default)]
+    pub capabilities: crate::capabilities::CapabilityPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capsule: Option<crate::context::capsule::TaskCapsule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_proposal: Option<crate::verification::TestProposal>,
+    #[serde(default)]
+    pub verification: crate::verification::VerificationState,
 }
 
 impl ContextPlan {
@@ -97,16 +171,19 @@ impl ContextPlan {
     }
 }
 
-/// The stable section order of a plan.
+/// The stable conceptual section order of a plan. This is the exact ordering
+/// contract: instructions, policy, repository map, capabilities, task capsule,
+/// symbols/source, git diff, verification state.
 pub fn sections() -> Vec<PlanSection> {
     [
-        "repo_map",
-        "task",
-        "symbols",
+        "gear_instructions",
+        "project_policy",
+        "repository_map",
+        "capabilities",
+        "task_capsule",
+        "symbols_source",
         "git_diff",
-        "candidates",
-        "slices",
-        "provenance",
+        "verification_state",
     ]
     .iter()
     .enumerate()
@@ -391,6 +468,7 @@ pub fn assemble(
     diff: &DiffSummary,
     mut ranked: Vec<Candidate>,
     config: &ContextConfig,
+    enrichment: PlanEnrichment,
     now: i64,
 ) -> Result<ContextPlan> {
     if !root.is_dir() {
@@ -444,6 +522,19 @@ pub fn assemble(
             .push("some eligible files were not selected because maxFiles was reached".to_string());
     }
     let repository_truncated = map.truncated || index.truncated;
+    let changed_paths = diff.changed_paths();
+    let policy = PolicyState::detect(root);
+    let instructions = GearInstructions {
+        engine_version: ENGINE_VERSION.to_string(),
+        commands: vec![
+            "ocg context <task>".to_string(),
+            "ocg verify <fast|normal|full>".to_string(),
+            "ocg tools <task>".to_string(),
+            "ocg checkpoint list".to_string(),
+        ],
+        note: "Gear produces deterministic plans and artifacts; OpenCode owns execution, conversation, provider and tool semantics.".to_string(),
+    };
+    let capsule = build_capsule(task, index, &ranked, diff, &enrichment, provenance.clone());
     Ok(ContextPlan {
         schema_version: SCHEMA_VERSION,
         engine_version: ENGINE_VERSION.to_string(),
@@ -455,7 +546,7 @@ pub fn assemble(
         sections: sections(),
         candidates: ranked,
         selected_files,
-        changed_paths: diff.changed_paths(),
+        changed_paths,
         slices,
         candidate_bytes,
         selected_bytes,
@@ -465,7 +556,75 @@ pub fn assemble(
         sensitive_excluded,
         truncated: truncated || diff.truncated || diff.capture_truncated || repository_truncated,
         notes,
+        instructions,
+        policy,
+        capabilities: enrichment.capabilities,
+        capsule,
+        test_proposal: enrichment.test_proposal,
+        verification: enrichment.verification,
     })
+}
+
+/// Build the task capsule embedded in a plan. It reflects what the plan knows
+/// and nothing more: no fabricated goal, decision or verification result.
+fn build_capsule(
+    task: &str,
+    index: &ContextIndex,
+    ranked: &[Candidate],
+    diff: &DiffSummary,
+    enrichment: &PlanEnrichment,
+    provenance: Provenance,
+) -> Option<crate::context::capsule::TaskCapsule> {
+    let mut capsule = crate::context::capsule::TaskCapsule::new(task);
+    let changed: std::collections::BTreeSet<String> = diff.changed_paths().into_iter().collect();
+    for candidate in ranked.iter().filter(|candidate| candidate.selected) {
+        capsule.files.push(crate::context::capsule::CapsuleFile {
+            path: candidate.path.clone(),
+            reason: Some(candidate.reasons.join(",")),
+            changed: changed.contains(&candidate.path),
+        });
+    }
+    capsule.files.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut symbols = Vec::new();
+    for candidate in ranked.iter().filter(|candidate| candidate.selected) {
+        if let Some(file) = index.file(&candidate.path) {
+            for symbol in &file.symbols {
+                if symbol.kind == crate::context::symbols::SymbolKind::Import {
+                    continue;
+                }
+                symbols.push(crate::context::symbols::SymbolRef::new(
+                    &candidate.path,
+                    symbol,
+                ));
+                if symbols.len() >= 200 {
+                    break;
+                }
+            }
+        }
+        if symbols.len() >= 200 {
+            break;
+        }
+    }
+    capsule.symbols = symbols;
+    capsule.git = diff.state.clone();
+    for command in enrichment
+        .verification
+        .stages
+        .iter()
+        .find(|stage| stage.name == enrichment.verification.default_stage)
+        .map(|stage| stage.commands.clone())
+        .unwrap_or_default()
+    {
+        capsule
+            .verification
+            .push(crate::context::capsule::Verification {
+                check: command,
+                status: "not_run".to_string(),
+            });
+    }
+    capsule.provenance = provenance;
+    capsule.recompute_size();
+    Some(capsule)
 }
 
 fn candidate_would_select(candidate: &Candidate, map: &RepoMap) -> bool {
@@ -544,5 +703,38 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason == "path:parser"));
+    }
+
+    #[test]
+    fn section_order_is_exact_and_stable() {
+        let names: Vec<String> = sections().into_iter().map(|section| section.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "gear_instructions",
+                "project_policy",
+                "repository_map",
+                "capabilities",
+                "task_capsule",
+                "symbols_source",
+                "git_diff",
+                "verification_state",
+            ]
+        );
+        // Orders are dense and increasing.
+        for (index, section) in sections().iter().enumerate() {
+            assert_eq!(section.order, index as u32);
+        }
+    }
+
+    #[test]
+    fn policy_detection_lists_only_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!PolicyState::detect(dir.path()).present);
+        std::fs::write(dir.path().join("AGENTS.md"), "# rules\n").unwrap();
+        std::fs::write(dir.path().join("README.md"), "# readme\n").unwrap();
+        let policy = PolicyState::detect(dir.path());
+        assert!(policy.present);
+        assert_eq!(policy.files, vec!["AGENTS.md".to_string()]);
     }
 }

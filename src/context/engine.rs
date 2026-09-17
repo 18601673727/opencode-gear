@@ -8,11 +8,13 @@ use crate::context::config::ContextConfig;
 use crate::context::freshness::{Provenance, ENGINE_VERSION, SCHEMA_VERSION};
 use crate::context::gitdiff::{self, DiffSummary, GitSnapshot};
 use crate::context::index::{self, ContextIndex, IndexReport};
-use crate::context::ranking::{self, ContextPlan};
-use crate::context::repomap::{self, RepoMap};
+use crate::context::ranking::{self, ContextPlan, PlanEnrichment};
+use crate::context::repomap::{self, FileKind, RepoMap};
 use crate::context::symbols::SymbolRef;
 use crate::error::Result;
 use crate::process::GitHost;
+use crate::verification::select::{propose, SourceChange, TestIndexEntry};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// One prepared context snapshot: the map, diff and index report.
@@ -37,6 +39,8 @@ pub struct PlanOutcome {
 pub struct ContextEngine<'a> {
     root: PathBuf,
     config: ContextConfig,
+    capabilities: crate::capabilities::CapabilityConfig,
+    verification: crate::verification::Config,
     git: &'a dyn GitHost,
     clock: &'a dyn Clock,
 }
@@ -51,9 +55,26 @@ impl<'a> ContextEngine<'a> {
         Self {
             root: root.into(),
             config,
+            capabilities: crate::capabilities::CapabilityConfig::default(),
+            verification: crate::verification::Config::default(),
             git,
             clock,
         }
+    }
+
+    /// Attach the planned capability policy.
+    pub fn with_capabilities(
+        mut self,
+        capabilities: crate::capabilities::CapabilityConfig,
+    ) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Attach the verification policy used for the state section and fallback.
+    pub fn with_verification(mut self, verification: crate::verification::Config) -> Self {
+        self.verification = verification;
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -62,6 +83,18 @@ impl<'a> ContextEngine<'a> {
 
     pub fn config(&self) -> &ContextConfig {
         &self.config
+    }
+
+    /// The combined configuration fingerprint used in cache keys. It covers the
+    /// context, capability and verification policies because all three shape a
+    /// plan.
+    pub fn cache_config_fingerprint(&self) -> String {
+        format!(
+            "{}|{}|{}",
+            self.config.fingerprint(),
+            self.capabilities.fingerprint(),
+            self.verification.fingerprint()
+        )
     }
 
     /// Build the repo map together with the git snapshot it depends on.
@@ -118,9 +151,10 @@ impl<'a> ContextEngine<'a> {
         let (index, index_report) = self.update_index(&map, &snapshot, previous.as_ref())?;
         let now = self.clock.now_unix();
         let query = format!("{task}|{}", role.unwrap_or(""));
+        let config_fingerprint = self.cache_config_fingerprint();
         let key = CacheKey::new(
             &index.repo_id,
-            &self.config.fingerprint(),
+            &config_fingerprint,
             &ranking::fingerprint_text(&query),
             &gitdiff::snapshot_fingerprint(&snapshot),
         );
@@ -141,6 +175,24 @@ impl<'a> ContextEngine<'a> {
         }
 
         let diff = self.diff(&snapshot, &index)?;
+        let test_proposal = if self.verification.include_test_proposal {
+            Some(self.test_proposal(&map, &index, &diff)?)
+        } else {
+            None
+        };
+        let enrichment = PlanEnrichment {
+            capabilities: crate::capabilities::CapabilityPlan::plan_config(
+                task,
+                &crate::capabilities::CapabilityEvidence {
+                    changed_paths: diff.changed_paths(),
+                    explicit: Vec::new(),
+                },
+                &self.capabilities.custom,
+                self.capabilities.enabled,
+            ),
+            verification: crate::verification::VerificationState::from_config(&self.verification),
+            test_proposal,
+        };
         let ranked = ranking::rank(&map, &index, &diff, task, &self.config);
         let mut plan = ranking::assemble(
             &self.root,
@@ -151,6 +203,7 @@ impl<'a> ContextEngine<'a> {
             &diff,
             ranked,
             &self.config,
+            enrichment,
             now,
         )?;
         let mut warnings = Vec::new();
@@ -170,6 +223,90 @@ impl<'a> ContextEngine<'a> {
             warnings,
             index_report,
         })
+    }
+
+    /// Build the conservative targeted-test proposal for the current diff.
+    ///
+    /// This is a deterministic heuristic over changed files, their declared
+    /// symbols and the test files whose indexed symbols have matching names. It
+    /// never runs anything and always reports `complete = false`.
+    pub fn test_proposal(
+        &self,
+        map: &RepoMap,
+        index: &ContextIndex,
+        diff: &DiffSummary,
+    ) -> Result<crate::verification::TestProposal> {
+        let mut source_changes = Vec::new();
+        let mut changed_symbols: Vec<String> = Vec::new();
+        for path in diff.changed_paths() {
+            let Some(entry) = map.file(&path) else {
+                continue;
+            };
+            if entry.sensitive || entry.binary {
+                continue;
+            }
+            let symbols: Vec<String> = index
+                .file(&path)
+                .map(|file| {
+                    file.symbols
+                        .iter()
+                        .filter(|symbol| symbol.kind != crate::context::symbols::SymbolKind::Import)
+                        .map(|symbol| symbol.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for name in &symbols {
+                if !changed_symbols.contains(name) {
+                    changed_symbols.push(name.clone());
+                }
+            }
+            source_changes.push(SourceChange {
+                path,
+                language: entry.language.clone(),
+                symbols,
+            });
+        }
+        changed_symbols.truncate(200);
+
+        // Index name matches come from the index, so no test file is read here.
+        let mut index_names: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for name in &changed_symbols {
+            for reference in index.probable_references(name, 200) {
+                if gitdiff::is_test_path(&reference.path) {
+                    index_names
+                        .entry(reference.path)
+                        .or_default()
+                        .push(name.clone());
+                }
+            }
+        }
+        let tests: Vec<TestIndexEntry> = map
+            .files
+            .iter()
+            .filter(|file| {
+                file.kind == FileKind::Test && !file.sensitive && !file.binary && !file.huge
+            })
+            .map(|file| TestIndexEntry {
+                path: file.path.clone(),
+                language: file.language.clone(),
+                index_names: index_names.get(&file.path).cloned().unwrap_or_default(),
+            })
+            .collect();
+        Ok(propose(
+            &source_changes,
+            &tests,
+            Some(self.verification.default_stage.as_str()),
+        ))
+    }
+
+    /// Convenience: build the proposal for the current working tree without a
+    /// task plan. Used by `ocg verify` to attach an advisory proposal.
+    pub fn targeted_tests(&self) -> Result<crate::verification::TestProposal> {
+        let (map, snapshot) = self.repo_map()?;
+        let previous = self.load_index();
+        let (index, _) = self.update_index(&map, &snapshot, previous.as_ref())?;
+        let diff = self.diff(&snapshot, &index)?;
+        self.test_proposal(&map, &index, &diff)
     }
 
     /// Search symbols by case-insensitive substring.

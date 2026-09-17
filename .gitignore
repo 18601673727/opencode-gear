@@ -16,3 +16,4 @@ forward_to_gpt.md
 .idea/
 .vscode/
 *.swp
+.opencode-gear/

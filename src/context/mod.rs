@@ -129,6 +129,34 @@ pub fn plan_text(plan: &ranking::ContextPlan) -> String {
             ));
         }
     }
+    if !plan.policy.files.is_empty() {
+        out.push_str(&format!(
+            "\nproject policy: {}\n",
+            plan.policy.files.join(", ")
+        ));
+    }
+    if !plan.capabilities.enabled {
+        out.push_str("capabilities: disabled\n");
+    } else if !plan.capabilities.capabilities.is_empty() {
+        let allowed: Vec<String> = plan
+            .capabilities
+            .capabilities
+            .iter()
+            .map(|entry| entry.capability.name())
+            .collect();
+        out.push_str(&format!("capabilities: {}\n", allowed.join(", ")));
+    }
+    if let Some(proposal) = &plan.test_proposal {
+        out.push_str(&format!(
+            "targeted tests: {} candidate(s), complete=false, fallback={}\n",
+            proposal.candidates.len(),
+            proposal.fallback.as_deref().unwrap_or("none")
+        ));
+    }
+    out.push_str(&format!(
+        "verification: stage={} ({})\n",
+        plan.verification.default_stage, plan.verification.note
+    ));
     if !plan.notes.is_empty() {
         out.push_str("\nnotes:\n");
         for note in &plan.notes {

@@ -8,6 +8,7 @@
 //! self-update). The `ocg` binary is a thin CLI over these modules.
 
 pub mod build;
+pub mod capabilities;
 pub mod cli;
 pub mod clock;
 pub mod config;
@@ -18,9 +19,11 @@ pub mod http;
 pub mod json;
 pub mod model;
 pub mod observability;
+pub mod orchestration;
 pub mod platform;
 pub mod process;
 pub mod prompt;
 pub mod report;
 pub mod runtime;
 pub mod validate;
+pub mod verification;

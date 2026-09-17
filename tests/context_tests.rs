@@ -586,7 +586,7 @@ fn cache_dependencies_only_include_relevant_files() {
     // The key holds identity + query; the entry carries the dependencies.
     let key = CacheKey::new(
         &outcome.plan.repo_id,
-        &config().fingerprint(),
+        &engine.cache_config_fingerprint(),
         &ranking::fingerprint_text("a|"),
         &gitdiff::snapshot_fingerprint(&GitSnapshot::not_a_repo()),
     );

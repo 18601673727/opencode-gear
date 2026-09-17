@@ -141,6 +141,8 @@ pub fn load_defaults(source: &GearSource) -> Result<Value> {
         "observability": {"enabled": false, "path": Value::Null},
         "runtime": default_runtime(),
         "context": default_context(),
+        "verification": default_verification(),
+        "capabilities": default_capabilities(),
     }))
 }
 
@@ -163,6 +165,21 @@ pub fn default_runtime() -> Value {
         "checkIntervalHours": crate::runtime::policy::DEFAULT_CHECK_INTERVAL_HOURS,
         "fallback": crate::runtime::policy::Fallback::ProjectLocal.as_str(),
     })
+}
+
+/// The built-in verification policy.
+///
+/// Kept in code so a disk gear home keeps working without a new required file.
+/// The schedule is deliberately empty: no command runs merely because a
+/// manifest exists.
+pub fn default_verification() -> Value {
+    serde_json::to_value(crate::verification::Config::default()).unwrap_or_else(|_| json!({}))
+}
+
+/// The built-in capability policy.
+pub fn default_capabilities() -> Value {
+    serde_json::to_value(crate::capabilities::CapabilityConfig::default())
+        .unwrap_or_else(|_| json!({}))
 }
 
 fn require_key(value: &Value, key: &str, label: &str) -> Result<()> {

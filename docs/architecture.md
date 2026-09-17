@@ -180,9 +180,51 @@ Invariants worth preserving:
   has no generic context-blob key. Only mechanisms documented by OpenCode are
   used.
 
-`ocg cache clean` removes the cache subtree only; `runtime/` and `index/` are
-never touched by it. Creating the index or cache adds `.opencode-gear/` to the
-project `.gitignore` once via the runtime's idempotent helper.
+`ocg cache clean` removes the cache subtree only; `runtime/`, `index/`, the
+raw verification `logs/` and `checkpoints/` are never touched by it. Creating
+the index or cache adds `.opencode-gear/` to the project `.gitignore` once via
+the runtime's idempotent helper.
+
+The plan carries a fixed conceptual section order (gear instructions, project
+policy, repository map, capability/tool descriptions, task capsule, relevant
+symbols/source, current git diff, verification state) and embeds the capability
+plan and targeted-test proposal. The stable order is part of the contract and is
+covered by deterministic tests.
+
+## Verification, distillation and checkpoints
+
+Verification is the explicit, configured half of the quality loop. It is a
+sibling of the context engine, not part of the model conversation:
+
+```text
+config          top-level `verification` policy, stages fast/normal/full
+commands        structured program + args, parsed without a shell
+capture         centralized in src/process.rs via the CaptureRunner trait
+distillation    progress/duplicate removal + errors/warnings/locations/tests
+raw logs        .opencode-gear/logs/, bounded and pruned, never committed
+tests proposal  conservative, complete=false, advisory only
+checkpoints     .opencode-gear/checkpoints/, versioned and freshness-checked
+```
+
+Invariants worth preserving:
+
+- **No command is discovered.** A manifest existing is never a reason to run
+  anything; all stages start empty. Commands come only from trusted
+  configuration or an explicit `ocg verify`.
+- **No shell.** Command strings are parsed by a strict word splitter; control
+  operators, pipelines, redirections and substitutions are rejected.
+- **No fabricated results.** Counts and conclusions are read from the output
+  only; an unreadable count is `None`, not zero.
+- **One process path.** Every child process, including verification and git,
+  is constructed in `src/process.rs`; tests inject fakes and spawn nothing.
+- **Advisory capabilities, not a sandbox.** The capability planner and Tool
+  Context Firewall describe an intended boundary in context/config. They do not
+  activate or enforce runtime tool schemas.
+- **Stale is explicit.** A checkpoint revalidates its sources and Git identity
+  on load; a stale one is marked and never silently reused, and a corrupt one is
+  reported without blocking `ocg`.
+
+The full detail lives in [verification.md](verification.md).
 
 ## Why one agent per throttle level
 

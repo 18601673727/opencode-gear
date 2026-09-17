@@ -270,6 +270,60 @@ failed cache write leaves the computed plan intact with a warning note.
 Token counts in plans and capsules are always **estimates** (`bytes / 4`) and
 are labelled as such.
 
+## Verification policy
+
+The optional verification subsystem is configured by the top-level
+`verification` object. Every field is optional. Stages start empty, so a
+manifest existing never causes a command to run.
+
+```json
+{
+  "verification": {
+    "enabled": true,
+    "defaultStage": "normal",
+    "stopOnFailure": true,
+    "maxRawLogBytes": 2000000,
+    "maxLogStorageBytes": 52428800,
+    "includeTestProposal": true,
+    "stages": {
+      "fast": { "commands": ["cargo fmt --check"] },
+      "normal": { "commands": ["cargo check", "cargo test"] },
+      "full": { "commands": [] }
+    }
+  }
+}
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Allow `ocg verify` to run configured commands. When false nothing runs and the result is `not_run`. |
+| `defaultStage` | `"normal"` | Stage used when the CLI does not name one; one of `fast`, `normal`, `full`. |
+| `stopOnFailure` | `true` | Stop the stage at the first failing command. |
+| `maxRawLogBytes` | `2000000` | Bound for each captured stdout/stderr stream (max 64 MiB). |
+| `maxLogStorageBytes` | `52428800` | Bound for `.opencode-gear/logs/`, oldest files pruned first (max 2 GiB). The log referenced by the current report is never pruned, so a single bounded log always survives. |
+| `includeTestProposal` | `true` | Attach the advisory targeted-test proposal to reports. |
+| `stages` | all empty | Per-stage `description` and `commands`. |
+
+A command is a `program` + `args` object, or a string parsed without a shell
+(`"cargo check"`). Shell control operators, pipelines and redirections are
+rejected. `ocg validate` reports violations.
+
+## Capability policy
+
+The optional top-level `capabilities` object registers custom capability names
+that a task may select by keyword:
+
+```json
+{ "capabilities": { "enabled": true, "custom": ["warehouse"] } }
+```
+
+With `enabled: false` the planner is disabled end-to-end: the plan carries
+`enabled = false` with no allowed capability, all built-ins and custom names are
+denied, and `ocg tools` / the context plan report the disabled state.
+
+Capability planning is a context/config diagnostic, not a security sandbox; see
+[verification.md](verification.md).
+
 ## Environment variables
 
 `OPENCODE_GEAR_*` is canonical; the legacy `OC_GEAR_*` names are accepted as
@@ -302,6 +356,9 @@ ocg trace    --event launch [--project DIR]
 ocg context  <task...> [--pretty] [--project DIR]
 ocg context  symbols <query> [--project DIR]
 ocg cache    stats|clean [--project DIR]
+ocg verify   [fast|normal|full] [--pretty] [--project DIR]
+ocg tools    <task...> [--pretty] [--project DIR]
+ocg checkpoint list|show <id>|save --phase P [--task T] [--decision D] [--pretty] [--project DIR]
 ocg version  (read-only runtime report)
 ocg doctor   (read-only environment check)
 ocg upgrade  (self-update Gear, then maintain OpenCode)

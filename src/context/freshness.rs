@@ -12,7 +12,7 @@ use std::path::Path;
 /// The engine version stamped into indexes, plans and capsules.
 pub const ENGINE_VERSION: &str = crate::cli::VERSION;
 /// The plan/index/cache schema version. Bumping it invalidates old artifacts.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// A path plus the fingerprint it had when an artifact was built.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

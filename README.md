@@ -551,6 +551,11 @@ build               print the resolved OpenCode config
 context <task...>   deterministic local repository context plan
 context symbols <q> find indexed symbols by name (diagnostic)
 cache clean|stats   manage the local context cache (never the runtime)
+verify [fast|normal|full]
+                    run only explicitly configured trusted commands
+tools <task...>     capability plan / Tool Context Firewall view (advisory)
+checkpoint list|show|save
+                    inspect or record a versioned phase checkpoint
 version             Gear, platform and the resolved OpenCode runtime
 doctor              read-only platform/config/runtime/cache check
 upgrade             self-update Gear, then maintain the active OpenCode
@@ -680,14 +685,104 @@ State layout, alongside the managed runtime:
   runtime/opencode/...        managed OpenCode (untouched by cache clean)
   index/context-index.json    inspectable, incrementally updated symbol index
   cache/context/*.json        fine-grained plan cache
+  logs/*.log                  raw verification logs (never swept by cache clean)
+  checkpoints/*.json          phase checkpoints (inspectable JSON)
 ```
 
 Sensitive files (`.env`, `.envrc`, key material, `id_rsa`/`id_ed25519`,
 `credentials*`, `secrets*`, `auth*`, `token*`, known OpenCode credential
 locations, ...) are never read, parsed, sliced or cached — only their path
 metadata is indexed. `ocg cache clean` removes `cache/` only, never the
-runtime or the index. Creating the index or cache adds `.opencode-gear/` to the
-project `.gitignore` once, using the same idempotent helper the runtime uses.
+runtime, the index, the verification logs or the checkpoints. Creating any
+state adds `.opencode-gear/` to the project `.gitignore` once, using the same
+idempotent helper the runtime uses.
+
+The plan carries a stable conceptual section order — gear instructions, project
+policy, repository map, capability/tool descriptions, task capsule, relevant
+symbols/source, current git diff, verification state — and embeds the advisory
+capability plan and targeted-test proposal.
+
+## Verification, checkpoints and capabilities (optional)
+
+`ocg` can run **only explicitly configured** checks, distill their output and
+record phase checkpoints. It never discovers a command from a manifest and never
+executes model output. All three subsystems are local and deterministic.
+
+```bash
+ocg verify normal                 # run the configured 'normal' commands
+ocg verify full --pretty          # structured JSON report
+ocg tools "write a SQL migration" # advisory capability plan
+ocg checkpoint list
+ocg checkpoint show <id>
+ocg checkpoint save --phase verify-to-debug --task "fix parser"
+```
+
+Configured commands are structured `program` + `args`. A convenience string
+such as `"cargo check"` is parsed by a strict, shell-free word splitter: shell
+control operators, pipelines, redirections and substitutions are rejected, and
+shell-interpreter escape hatches (`sh -c`, `bash -lc`, `cmd /c`,
+`powershell -Command`, ...) plus control characters are rejected in both forms.
+Nothing runs without configuration — all stages start empty.
+
+```json
+{
+  "verification": {
+    "defaultStage": "normal",
+    "stopOnFailure": true,
+    "maxRawLogBytes": 2000000,
+    "maxLogStorageBytes": 52428800,
+    "stages": {
+      "fast": { "commands": ["cargo fmt --check"] },
+      "normal": { "commands": ["cargo check", "cargo test"] },
+      "full": {
+        "commands": ["cargo clippy --all-targets --all-features -- -D warnings"]
+      }
+    }
+  },
+  "capabilities": { "enabled": true, "custom": [] }
+}
+```
+
+- **Log distillation** is deterministic: it removes progress noise, collapses
+  exact duplicate lines and repeated blocks, groups identical failures and
+  extracts errors, warnings, source locations, failed tests and test counts.
+  Counts are only reported when a known summary shape parses cleanly; they are
+  never inferred from an exit status.
+- **Raw logs** live under `.opencode-gear/logs/`, are bounded by
+  `verification.maxRawLogBytes` per stream and pruned to
+  `verification.maxLogStorageBytes` in total. Names are collision-resistant
+  (second + pid + monotonic sequence + content hash), pruning never deletes the
+  log the current report references, they stay inspectable and `ocg cache clean`
+  never removes them. Set `verification.enabled: false` to disable automation
+  entirely.
+- **Capture** drains stdout and stderr concurrently to EOF with a bounded
+  retained prefix: verbosity is never a false failure and the command's own exit
+  status stays authoritative. Truncation is stated explicitly. There is no
+  timeout yet (documented limitation).
+- **Targeted test selection** proposes candidate tests from changed files,
+  naming conventions and **index name matches** (same-name indexed symbols, not
+  proof of a textual reference). Every proposal is `complete = false` with
+  explicit evidence: an unselected test may still fail, and when nothing matches
+  the proposal reports the configured fallback stage.
+- **Capabilities / Tool Context Firewall** are a deterministic context and
+  config plan, *not* a security sandbox. A Git-only task exposes
+  `filesystem` + `git` only, a docs lookup exposes `filesystem` +
+  `documentation`/`web`, a DB task exposes `filesystem` + `database`, generic
+  coding exposes `filesystem` (adding `git` only with evidence) and an unknown
+  task never exposes `cloud`, `browser` or `database`. `capabilities.enabled:
+  false` disables planning entirely: no capability is allowed or exposed, and
+  `ocg tools` / the context plan report the disabled state. The mode does not
+  activate runtime tool schemas: OpenCode owns execution, conversation,
+  provider and tool semantics.
+- **Checkpoints** are versioned JSON with a task capsule, Git state
+  fingerprint, verification state, provenance, decisions and `created_at`.
+  Loading checks the schema and revalidates sources and Git identity: a stale
+  checkpoint is marked stale and is never silently reused; a corrupt one is
+  reported and ignored without ever blocking normal `ocg`.
+
+`ocg verify` is a deterministic complement to the independent VERIFY agent, not
+a replacement. The Lead prompt tells the model to prefer it for routine
+mechanical checks before spending verifier tokens.
 
 ## Troubleshooting
 
@@ -855,6 +950,7 @@ walkthrough.
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | The two axes, resolution pipeline, invariants, extension points |
 | [docs/configuration.md](docs/configuration.md) | Every registry, override shape, environment variable and command |
+| [docs/verification.md](docs/verification.md) | Verification, log distillation, test selection, capabilities/firewall, checkpoints, stable ordering |
 | [docs/migration.md](docs/migration.md) | Step-by-step migration from a whole-bundle Gear/profile setup |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Failure modes and how to diagnose them |
 

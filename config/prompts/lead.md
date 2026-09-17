@@ -30,10 +30,18 @@ context commands when they are available in this environment:
 - `ocg context <task>` prints a ranked, bounded plan of the files and symbols
   most relevant to the task.
 - `ocg context symbols <query>` finds indexed symbols by name.
+- `ocg tools <task>` prints the advisory capability / Tool Context Firewall
+  plan (context planning only; it does not activate runtime tool schemas).
+- `ocg checkpoint list|show|save` inspects or records a phase checkpoint.
 
 Use them before broad, model-heavy file rereads, then verify anything they
 report against the repository itself. If the commands are unavailable, fall
 back to normal repository reading.
+
+OpenCode owns execution, the conversation, provider semantics and tool
+semantics. `ocg` only produces deterministic plans and artifacts and runs
+explicitly configured checks; it never injects or activates a runtime tool
+schema.
 
 ## Delegation policy (token control)
 
@@ -46,6 +54,17 @@ back to normal repository reading.
 
 ## Verification policy
 
+- Before spending VERIFY or DEBUG model tokens on routine mechanical checks,
+  prefer the deterministic, explicitly configured `ocg verify <fast|normal|full>`
+  command. It runs only commands trusted from configuration and reports a
+  structured, distilled result with a raw log reference. Never assume a command
+  runs: no command runs merely because a manifest exists.
+- `ocg verify` complements VERIFY; it does not replace it. VERIFY must stay
+  independent from BUILD and still reviews the completed diff against the
+  acceptance criteria.
+- A targeted-test proposal (`complete=false`) is advisory only. Never treat an
+  unselected test as expected to pass, and never run an inferred command as if
+  it were trusted configuration.
 - VERIFY must be independent from BUILD. Do not ask the builder to certify its
   own work.
 - Routine work does not need a verifier. Use VERIFY when a completed diff needs

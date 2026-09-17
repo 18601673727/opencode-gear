@@ -219,3 +219,60 @@ Create `<project>/.opencode-gear.json`:
 
 Project configuration is not committed anywhere by the gear; whether you commit
 it is your project's decision.
+
+## `ocg verify` runs nothing
+
+Expected by default: all stages start empty and no command is discovered from a
+manifest. Configure the commands you trust, for example:
+
+```json
+{
+  "verification": {
+    "stages": { "normal": { "commands": ["cargo check", "cargo test"] } }
+  }
+}
+```
+
+`ocg verify` reports `not_run` with an explanatory note when no command is
+configured, and when `verification.enabled` is false.
+
+## `ocg verify` rejects my command
+
+The command string is parsed without a shell, so shell syntax is refused:
+control operators (`;`, `&&`, `||`), pipelines (`|`), redirections (`>`, `<`)
+and substitutions (`` ` ``, `$(...)`) are errors. Split the work into several
+commands, or use the explicit object form
+`{"program": "...", "args": ["..."]}`. `ocg validate` reports the exact
+problem.
+
+## `ocg verify` rejects my shell invocation
+
+Shell-interpreter escape hatches are refused in both the string and object
+forms: `sh`/`bash`/`dash`/`zsh`/`ksh`/`ash`/`busybox` with `-c`, `cmd[.exe]`
+with `/c` or `/k`, and `powershell`/`pwsh` with `-Command` or an
+encoded-command switch. Control characters and newlines in the program or
+arguments are also rejected. Put the logic in a script file and execute that
+path directly (`{"program": "./tools/check.sh"}`), or configure the real
+program and arguments.
+
+## Unknown options now error
+
+Only `checkpoint` accepts subcommand options such as `--phase` or `--task`.
+Every other command keeps a strict parse: `ocg validate --bogus`,
+`ocg status --bogus` and friends exit with status 2. Global options
+(`--pretty`, `--project`, `--throttle`, ...) still work anywhere. `ocg verify`
+accepts at most one positional stage argument.
+
+## A checkpoint is marked stale
+
+That is the intended behaviour. A checkpoint revalidates the source
+fingerprints and the Git state it was built from. If a source changed or the
+working tree moved, it is marked stale with reasons instead of being silently
+reused. Recompute the capsule and save a new checkpoint.
+
+## Where did my raw verification logs go?
+
+They are under `<project>/.opencode-gear/logs/`. They are pruned to
+`verification.maxLogStorageBytes` (oldest first) and `ocg cache clean` never
+removes them. Removing `.opencode-gear/` removes them with the rest of the local
+state.

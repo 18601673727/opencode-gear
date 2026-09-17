@@ -9,7 +9,13 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-const SKIP_DIRS: [&str; 4] = [".git", "target", "__pycache__", "node_modules"];
+const SKIP_DIRS: [&str; 5] = [
+    ".git",
+    "target",
+    "__pycache__",
+    "node_modules",
+    ".opencode-gear",
+];
 
 const TEXT_SUFFIXES: [&str; 11] = [
     ".md", ".json", ".rs", ".toml", ".sh", ".txt", ".yml", ".yaml", ".cfg", ".ini", ".lock",
