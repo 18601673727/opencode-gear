@@ -83,8 +83,20 @@ is not in the list, which stops invented reasoning levels from sneaking in.
 }
 ```
 
-All three levels must exist. Variant may be omitted to use the provider
-default.
+All three levels must exist and each Lead level must name its exact runtime
+variant; static validation (`ocg validate`, `ocg doctor`) requires it, because
+the runtime contract cannot be satisfied without one. OCG exports that resolved
+contract to its generated plugin, which enforces the selected Lead
+agent/model/variant at `chat.message`; sticky TUI or reused-session state cannot
+override it. Consumer requests are left unchanged.
+
+A coding launch also runs a read-only `opencode models` preflight against the
+generated config. A definitely missing active Lead model is a launch error, not
+a fallback opportunity. Missing non-active Lead tiers and consumer routes warn;
+if the probe itself cannot run, launch continues with a warning. `ocg doctor`
+reports all configured Lead tiers and consumer routes separately from static
+config validation. `ocg models` remains a plain pass-through and neither
+materializes nor loads the generated plugin.
 
 ### `config/routing.json`
 
@@ -380,8 +392,10 @@ release fixture configures a much tighter `4096` / `40%` gate explicitly to
 catch projection regressions; that gate is not the default.
 
 `OPENCODE_GEAR_ORCHESTRATION=0` (legacy `OC_GEAR_ORCHESTRATION`) force-disables
-orchestration for one process. `ocg doctor` reports the read-only state of the
-plugin, state file, projection and verification integration. See
+orchestration for one process. It is also the explicit no-hook path: no plugin
+is emitted, so Lead request enforcement is intentionally disabled as well.
+`ocg doctor` reports the read-only state of the plugin, state file, projection
+and verification integration. See
 [architecture.md](architecture.md) for the mechanism and
 [verification.md](verification.md) for the retry/Debug contract.
 
@@ -403,15 +417,49 @@ fallbacks.
 | `OPENCODE_GEAR_API_BASE` | override the GitHub API base (mirrors, tests) |
 | `OPENCODE_GEAR_TELEMETRY` (legacy `OC_GEAR_TELEMETRY`) | `0`/`1` to force local telemetry off/on |
 | `OPENCODE_GEAR_ORCHESTRATION` (legacy `OC_GEAR_ORCHESTRATION`) | `0`/`1` to force orchestration off/on for one process |
+| `OPENCODE_GEAR_DISABLE_PROXY` | `1`/`true`/`on`/`yes` to disable proxy use for one process |
+| `HTTP_PROXY`, `http_proxy`, `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`, `all_proxy`, `NO_PROXY`, `no_proxy` | standard proxy variables; used when no CLI disable and no truthy `OPENCODE_GEAR_DISABLE_PROXY` |
+| `GH_TOKEN` (preferred), `GITHUB_TOKEN` | optional token for OCG-owned GitHub API requests; attached only to `api.github.com` |
 
 `OPENCODE_GEAR_OCG` and `OPENCODE_GEAR_PROJECT` are exported *to OpenCode* by
 `ocg` at launch so the generated adapter can find the bridge and the project;
 they are not read from the ambient environment.
 
+## Proxy policy
+
+The effective proxy is resolved once per network-using command:
+
+```text
+1. --disable-proxy
+2. OPENCODE_GEAR_DISABLE_PROXY (truthy)
+3. a non-empty proxy variable, upper- or lower-case
+4. static macOS discovery (/usr/sbin/scutil --proxy)
+5. direct
+```
+
+Only `http://` and `https://` proxies are used by OCG's own client; an unusable
+value is ignored with a warning. A `socks*://` value is not interpreted (OCG
+does not enable SOCKS), but it is preserved verbatim for child processes so a
+working SOCKS setup keeps working. A PAC configuration is detected and reported
+but never interpreted. Static macOS discovery parses `HTTPProxy` /
+`HTTPSProxy` and a safe `ExceptionsList`; it runs only when the environment
+carries nothing.
+
+Proxy URLs and any credentials are never rendered in `Debug`, errors or
+diagnostics. `reqwest`'s hidden automatic discovery is always disabled before
+the typed resolved endpoints are installed. A child OpenCode process (launch,
+`upgrade`, `models`) receives the resolved values under both the upper- and
+lower-case names after all eight spellings are cleared, so a client that reads
+either convention sees the resolved policy; `--disable-proxy` and the
+environment switch clear all eight and set none.
+
+`ocg upgrade` additionally reads `GH_TOKEN` before `GITHUB_TOKEN` for its own
+GitHub API requests and never attaches it to a non-`api.github.com` host.
+
 ## Commands
 
 ```text
-ocg [low|mid|high] [--throttle LEVEL] [--project DIR] [--dry-run] [--pretty] [command] [args...]
+ocg [low|mid|high] [--throttle LEVEL] [--project DIR] [--dry-run] [--pretty] [--disable-proxy] [command] [args...]
 
 ocg build    [--pretty] [--throttle LEVEL] [--project DIR]
 ocg validate [--throttle LEVEL] [--project DIR]

@@ -74,8 +74,15 @@ the opposite, so it is isolated behind three injected traits:
 ```text
 HttpTransport   release metadata + archive downloads (reqwest blocking/rustls)
 Clock           update-check timestamps and install times
-ProcessHost     PATH lookup, `opencode --version`, and `opencode upgrade`
+ProcessHost     PATH lookup, version/model probes, and `opencode upgrade <target>`
 ```
+
+The HTTP client and every child process receive one `ProxySelection`, resolved
+from `--disable-proxy`, `OPENCODE_GEAR_DISABLE_PROXY`, the standard proxy
+variables, and static macOS discovery (in that order). Hidden automatic proxy
+discovery is always disabled first; only typed `http`/`https` endpoints are
+installed. A GitHub token (`GH_TOKEN` then `GITHUB_TOKEN`) is attached only to
+`api.github.com` requests and never rendered.
 
 `RuntimeManager` combines those with the project root and the parsed `runtime`
 policy. It resolves exactly one executable per launch:
@@ -98,10 +105,13 @@ Invariants:
 - **No redundant install.** A compatible system runtime is used as-is when no
   managed runtime exists. A due check runs OpenCode's own `opencode upgrade`
   in place, never a managed copy.
-- **System runtimes upgrade themselves.** `ProcessHost::upgrade` is the only
-  path for an existing system runtime. If it fails, `ocg` warns and keeps the
-  old compatible runtime; if the system is incompatible and the upgrade fails,
-  it bootstraps a project-local runtime.
+- **System runtimes upgrade themselves.** OCG resolves the latest OpenCode
+  release once through its own transport and then runs
+  `opencode upgrade <target>`; it never downloads a release archive for a
+  system runtime. If the lookup or the upgrade fails, a compatible system
+  runtime is kept and the failed check (including a rate-limited lookup) is
+  cached. If the system is incompatible and the upgrade fails, it bootstraps a
+  project-local runtime.
 - **`autoUpgrade` is optional-only.** Setting it to `false` disables the
   optional system upgrades but never disables the required project-local
   fallback for a missing or incompatible runtime.
@@ -206,16 +216,27 @@ Rust (authority)
   plugin generator   materialize the adapter, inject the file:// URL
 
 JavaScript (transport only)
-  ocg-orchestration.js  appends delimited context/feedback, spawns the bridge
+  ocg-orchestration.js  enforces Lead requests, appends context, spawns bridge
 ```
 
 - **One authority.** The adapter does no ranking, projection or policy; it only
   moves bytes between OpenCode hooks and the Rust bridge with a direct argv and
   stdin (never a shell). The bridge drains and caps stdin (4 MiB) before any
   early return, so a disabled or rejected payload cannot cause a BrokenPipe.
+- **Exact Lead request contract.** Rust resolves the active throttle to one
+  Lead agent/provider/model/variant and exports that typed contract at launch.
+  The supported `chat.message` hook writes it to mutable `output.message`
+  before OpenCode saves or executes the user request. This wins over sticky
+  model/variant and reused-session state without mutating global OpenCode state.
+  The guard leaves consumer subagent requests untouched.
+- **Runtime model preflight.** Coding launches probe `opencode models` with the
+  generated config but without loading the local plugin. A definitely missing
+  active Lead model blocks launch; probe failure is distinguished from absence
+  and remains nonfatal. Doctor reports every Lead tier and consumer route.
 - **No duplicate Lead context.** Only `chat.message` is scoped to the Lead
-  session (`input.agent` absent or starting with `lead-`); consumer subagent
-  sessions skip it, while `tool.execute.before/after` remain active everywhere.
+  session (the request agent starts with `lead-`); consumer subagent sessions
+  and requests with no identifiable agent skip it, while
+  `tool.execute.before/after` remain active everywhere.
 - **Typed hand-offs.** The rich `ProjectionInput` (a `TaskCapsule` plus
   selected source slices, a bounded diff summary and an optional verification
   block) is projected into a compact `ModelHandoffCapsule` for exactly one

@@ -113,6 +113,23 @@ OpenCode binds exactly one model per agent, so the gear materialises:
 Because the consumer agents do not depend on the throttle, switching throttle
 during a session cannot silently re-route BUILD or VERIFY.
 
+The shipped Lead request contracts are exact:
+
+| Throttle | Agent | Provider/model | Variant |
+| --- | --- | --- | --- |
+| low | `lead-low` | `openai/gpt-5.6-sol` | `medium` |
+| mid | `lead-mid` | `openai/gpt-5.6-sol` | `high` |
+| high | `lead-high` | `openai/gpt-6-astra` | `high` |
+
+Before a coding launch, OCG asks the selected OpenCode runtime for its model
+catalogue. A definitely missing active Lead model blocks the launch instead of
+silently falling back; an unavailable probe warns and continues. The generated
+plugin then enforces the selected Lead agent/model/variant on each mutable
+`chat.message`, so sticky TUI or reused-session state cannot change the request.
+Consumer subagent requests are not rewritten. The explicit no-hook escape hatch
+(`OPENCODE_GEAR_ORCHESTRATION=0` or `orchestration.enabled=false`) intentionally
+disables the generated plugin and therefore this runtime enforcement.
+
 ## Install
 
 One line, no `sudo`, no Homebrew, no Node, no `git`:
@@ -249,13 +266,14 @@ Rules that fall out of this:
   project stays deterministic once bootstrapped.
 - If there is no managed runtime and the system `opencode` is compatible,
   nothing is installed; the system runtime is used.
-- When a compatible system runtime has a **due** check, `ocg` runs OpenCode's
-  own `opencode upgrade`, reprobes the version, records the check and launches
-  the result. If the upgrade fails, `ocg` warns, records the failed check and
-  continues with the old compatible version.
+- When a compatible system runtime has a **due** check, `ocg` resolves the
+  latest release once, runs OpenCode's own `opencode upgrade <version>`,
+  reprobes the version, records the check and launches the result. If lookup or
+  upgrade fails, `ocg` warns, records the failed check and continues with the
+  old compatible version.
 - An incompatible or unusable system `opencode` is upgraded with
-  `opencode upgrade` when `autoUpgrade` is on; if that fails or leaves it
-  incompatible, `ocg` bootstraps a project-local runtime.
+  `opencode upgrade <resolved-version>` when `autoUpgrade` is on; if that fails
+  or leaves it incompatible, `ocg` bootstraps a project-local runtime.
 - `autoUpgrade: false` disables those optional system upgrades, but it does
   **not** disable the project-local fallback: a missing or incompatible
   runtime is still bootstrapped on launch.
@@ -306,9 +324,11 @@ runtime. `ocg upgrade` ignores the cache and checks immediately.
 
 How a check is performed depends on the active source:
 
-- **System runtime:** `ocg` runs OpenCode's own `opencode upgrade`; it never
-  fetches a release itself and never replaces a system runtime with a managed
-  copy.
+- **System runtime:** `ocg` resolves the latest OpenCode release through its own
+  HTTP transport and then runs OpenCode's own `opencode upgrade <version>`. A
+  compatible system runtime is kept if the lookup or the upgrade fails; OCG
+  never fetches a release archive itself for a system runtime and never
+  replaces a system runtime with a managed copy.
 - **Managed runtime:** `ocg` checks the GitHub release and installs the newer
   managed version.
 
@@ -325,7 +345,7 @@ replaced by the system runtime, and is preserved by `ocg upgrade`.
 
 ```bash
 ocg version   # Gear, platform, resolved OpenCode version/source/path (read-only)
-ocg doctor    # platform, PATH, project/config/routing, runtime, cache (read-only)
+ocg doctor    # static config, runtime models, proxy, runtime and cache (read-only)
 ocg upgrade   # self-update Gear, then force-maintain the active OpenCode
 ```
 
@@ -546,7 +566,7 @@ project-agnostic.
 ## Commands
 
 ```text
-ocg [low|mid|high] [--throttle low|mid|high] [--project DIR] [--dry-run] [command] [args...]
+ocg [low|mid|high] [--throttle low|mid|high] [--project DIR] [--dry-run] [--disable-proxy] [command] [args...]
 
 (none)              launch interactive OpenCode with the gear config
 run <args...>       launch `opencode run`
@@ -596,6 +616,45 @@ working explicitly.
 | `OPENCODE_GEAR_API_BASE` | override the GitHub API base (mirrors, tests) |
 | `OPENCODE_GEAR_TELEMETRY` (legacy `OC_GEAR_TELEMETRY`) | force local telemetry off/on |
 | `OPENCODE_GEAR_ORCHESTRATION` (legacy `OC_GEAR_ORCHESTRATION`) | force orchestration off/on for this process (`0` emits no plugin and no state) |
+| `OPENCODE_GEAR_DISABLE_PROXY` | `1`/`true`/`on`/`yes` disables all proxy use for this process |
+| `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` | standard proxy variables (upper- or lower-case); used only when `OPENCODE_GEAR_DISABLE_PROXY` is not truthy |
+| `GH_TOKEN` / `GITHUB_TOKEN` | optional token for OCG's own GitHub API requests (`GH_TOKEN` wins); sent only to `api.github.com` |
+
+## Proxy and network access
+
+OCG resolves exactly one proxy policy per launch, in this order:
+
+```text
+1. --disable-proxy on the command line
+2. OPENCODE_GEAR_DISABLE_PROXY=1/true/on/yes
+3. a non-empty HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY
+   (either spelling)
+4. static macOS discovery via /usr/sbin/scutil --proxy
+5. direct
+```
+
+- Only `http://` and `https://` proxy URLs are used by OCG's own HTTP client; an
+  unusable value is ignored with a warning.
+- A `socks*://` value is not interpreted by OCG (no SOCKS feature is enabled),
+  but it is preserved verbatim for child OpenCode processes so an existing
+  SOCKS setup is not silently broken.
+- A PAC configuration is detected and reported, but never interpreted.
+- The proxy URLs and any embedded credentials are never printed, logged or
+  written to a file.
+- OCG disables `reqwest`'s hidden automatic proxy discovery first and installs
+  only the resolved endpoints. Child OpenCode processes (launch, `upgrade`,
+  `models`) receive the resolved values under both the upper- and lower-case
+  names, with all eight spellings cleared first; `--disable-proxy` or the
+  environment switch clears all eight and exports none.
+
+## GitHub API token
+
+When OCG makes its own GitHub API requests (release metadata, self-update,
+system runtime maintenance) it uses `GH_TOKEN` first and `GITHUB_TOKEN` second.
+The token is attached only when the request host is exactly `api.github.com`;
+it is never attached to asset downloads on other hosts, never persisted and
+never placed in telemetry. Without a token, requests are anonymous and the
+public rate limit (and its reset) is reported in the error message.
 
 ## Isolation and permissions
 
@@ -632,6 +691,12 @@ replaced per project.
 - The repository's own tests scan the tree for common credential shapes,
   private-key headers and absolute home paths. Run `make test` before you push
   a fork.
+- `GH_TOKEN` / `GITHUB_TOKEN` are read from the environment for OCG's own
+  GitHub API requests. They are attached only to `api.github.com`, never
+  persisted, never written to telemetry, and never printed (the wrapper's
+  `Debug`/`Display` redacts them).
+- Proxy URLs and embedded credentials are likewise never rendered in
+  `Debug`, errors or diagnostics.
 - Override files (`.opencode-gear.json`, `~/.config/opencode-gear/config.json`)
   are for routing and prompts only. Keep project privacy rules in your
   project's own agent instructions.
@@ -790,9 +855,10 @@ contract asking for one JSON object (`goal`, `constraints`, `findings`,
 parser still works if a model ignores it.
 
 The `chat.message` hook only injects dynamic context into the **Lead** session
-(`input.agent` absent or starting with `lead-`); consumer subagent sessions do
-not receive a duplicate Lead context. The task before/after hooks stay active in
-every session. The bridge reads and caps its stdin (4 MiB) before any early
+(the request agent starts with `lead-`); consumer subagent sessions do not
+receive a duplicate Lead context, and a request whose agent cannot be
+established is left untouched. The task before/after hooks stay active in every
+session. The bridge reads and caps its stdin (4 MiB) before any early
 return, so a disabled or rejected payload never produces a BrokenPipe.
 
 Policy, honestly bounded:

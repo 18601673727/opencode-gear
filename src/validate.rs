@@ -56,6 +56,19 @@ pub fn validate(effective: &Effective) -> Vec<String> {
                 "throttle level '{level}' references unknown model '{model_key}'"
             ));
         }
+        // The Lead request contract is enforced at runtime with an explicit
+        // variant, so static validation must require it too. Otherwise a config
+        // could pass `validate`/`doctor` and still fail every coding launch.
+        if spec
+            .get("variant")
+            .and_then(Value::as_str)
+            .map(str::is_empty)
+            .unwrap_or(true)
+        {
+            errors.push(format!(
+                "throttle level '{level}' must define a runtime 'variant' (the Lead request contract is enforced with an explicit variant)"
+            ));
+        }
         validate_variant(
             data,
             spec,

@@ -46,6 +46,13 @@ fn write_project_file(root: &Path, relative: &str, content: &str) {
     fs::write(path, content).unwrap();
 }
 
+#[cfg(unix)]
+fn write_executable(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::write(path, body).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 #[test]
 fn doctor_reports_the_new_sections_and_creates_nothing() {
     let dir = TestDir::new();
@@ -158,4 +165,52 @@ fn doctor_warns_on_unsupported_telemetry_schema_without_printing_the_event() {
     let text = stdout(&output);
     assert!(text.contains("unsupported schema line"), "{text}");
     assert!(!text.contains("task-future"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_reports_static_config_separately_from_available_runtime_models() {
+    let dir = TestDir::new();
+    let project = dir.project();
+    let script = dir.join("fake-opencode.sh");
+    write_executable(
+        &script,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.18.31; exit 0; fi\nif [ \"$1\" = \"models\" ]; then printf '%s\\n' openai/gpt-5.6-sol openai/gpt-6-astra volcengine-coding/kimi-k2.7-code volcengine-coding/kimi-k3 opencode-go/deepseek-v4.1-flash opencode-go/glm-5.3-flash opencode-go/glm-5.3; exit 0; fi\nexit 2\n",
+    );
+    let output = base_command(&project, dir.path())
+        .env("OPENCODE_GEAR_OPENCODE", &script)
+        .args(["--disable-proxy", "doctor"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stdout(&output));
+    let text = stdout(&output);
+    assert!(text.contains("static config"), "{text}");
+    assert!(text.contains("runtime models"), "{text}");
+    assert!(
+        text.contains("openai/gpt-5.6-sol (variant medium)"),
+        "{text}"
+    );
+    assert!(text.contains("openai/gpt-6-astra (variant high)"), "{text}");
+    assert!(text.contains("disabled by CLI"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_distinguishes_missing_provider_and_missing_model() {
+    let dir = TestDir::new();
+    let project = dir.project();
+    let script = dir.join("fake-opencode-partial.sh");
+    write_executable(
+        &script,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.18.31; exit 0; fi\nif [ \"$1\" = \"models\" ]; then printf '%s\\n' openai/gpt-5.6-sol; exit 0; fi\nexit 2\n",
+    );
+    let output = base_command(&project, dir.path())
+        .env("OPENCODE_GEAR_OPENCODE", &script)
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "missing routes must fail doctor");
+    let text = stdout(&output);
+    assert!(text.contains("provider is not currently exposed"), "{text}");
+    assert!(text.contains("model is not currently exposed"), "{text}");
 }

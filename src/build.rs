@@ -189,11 +189,10 @@ pub fn build_opencode_config(effective: &Effective, level: &str) -> Result<Value
         merged = deep_merge(&merged, extra);
     }
 
-    // Orchestration adds one generated `file://` plugin entry when it is
-    // enabled. User plugins are preserved; the adapter itself is materialized
-    // at launch, so config generation stays pure and read-only.
-    let orchestration = crate::orchestration::OrchestrationConfig::from_config(data)?;
-    if orchestration.enabled {
+    // The generated adapter enforces the selected Lead request contract in
+    // addition to optional dynamic orchestration. Preserve the explicit
+    // no-hook escape hatch: disabled orchestration emits no OCG plugin.
+    if crate::orchestration::OrchestrationConfig::from_config(data)?.enabled {
         if let Some(uri) = crate::orchestration::plugin::plugin_uri(&effective.cwd) {
             crate::orchestration::plugin::inject_plugin(&mut merged, &uri);
         }

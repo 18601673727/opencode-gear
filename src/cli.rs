@@ -12,15 +12,18 @@ use crate::config;
 use crate::context::{self, ContextConfig, ContextEngine};
 use crate::defaults::{load_defaults, GearSource};
 use crate::error::GearError;
-use crate::http::{HttpTransport, NoHttp, ReqwestHttp};
+use crate::http::{GithubToken, HttpTransport, NoHttp, ProcessHttpEnv, ReqwestHttp};
 use crate::json;
 use crate::model;
 use crate::observability;
 use crate::orchestration::checkpoint::{self, Phase};
 use crate::platform::Platform;
+use crate::preflight::{Availability, ModelPreflight};
 use crate::process::{
     ProcessHost, ProcessRunner, SystemCaptureRunner, SystemGitHost, SystemProcessHost,
+    SystemStaticProxy,
 };
+use crate::proxy::{ProxyScheme, ProxySelection, ProxySource};
 use crate::report;
 use crate::runtime::policy::RuntimePolicy;
 use crate::runtime::{self, install::Layout};
@@ -59,6 +62,8 @@ pub struct Env {
     pub telemetry: Option<String>,
     /// `OPENCODE_GEAR_ORCHESTRATION` on/off escape hatch.
     pub orchestration: Option<String>,
+    /// `GH_TOKEN` (preferred) then `GITHUB_TOKEN` for OCG-owned GitHub calls.
+    pub github_token: Option<GithubToken>,
 }
 
 impl Env {
@@ -84,6 +89,7 @@ impl Env {
             cache_dir: env_path(&["OPENCODE_GEAR_CACHE_DIR"]),
             telemetry: env_string(&["OPENCODE_GEAR_TELEMETRY", "OC_GEAR_TELEMETRY"]),
             orchestration: env_string(&["OPENCODE_GEAR_ORCHESTRATION", "OC_GEAR_ORCHESTRATION"]),
+            github_token: crate::http::github_token_from_env(&ProcessHttpEnv),
         }
     }
 }
@@ -145,6 +151,8 @@ pub struct Cli {
     pub pretty: bool,
     pub user_config: Option<PathBuf>,
     pub project_config: Option<PathBuf>,
+    /// `--disable-proxy`: never use any proxy, ambient or system.
+    pub disable_proxy: bool,
     pub command: Command,
 }
 
@@ -181,6 +189,7 @@ where
     let mut user_config: Option<PathBuf> = None;
     let mut project_config: Option<PathBuf> = None;
     let mut command_token: Option<String> = None;
+    let mut disable_proxy = false;
     let mut rest: Vec<OsString> = Vec::new();
     let mut event: Option<String> = None;
 
@@ -263,6 +272,11 @@ where
         }
         if text == "--dry-run" {
             dry_run = true;
+            index += 1;
+            continue;
+        }
+        if text == "--disable-proxy" {
+            disable_proxy = true;
             index += 1;
             continue;
         }
@@ -372,6 +386,7 @@ where
         pretty,
         user_config,
         project_config,
+        disable_proxy,
         command,
     })
 }
@@ -380,7 +395,7 @@ fn usage() -> &'static str {
     r#"OpenCode Gear - project-agnostic multi-model orchestration for OpenCode
 
 Usage:
-  ocg [low|mid|high] [--throttle low|mid|high] [--project DIR] [--dry-run] [command] [args...]
+  ocg [low|mid|high] [--throttle low|mid|high] [--project DIR] [--dry-run] [--disable-proxy] [command] [args...]
 
 Commands:
   (none)                launch interactive OpenCode with the gear config
@@ -402,7 +417,7 @@ Commands:
   checkpoint list|show|save
                         inspect, or create, a phase checkpoint
   version               report Gear, platform and the resolved OpenCode runtime
-  doctor                check platform, config, runtime and cache (read-only)
+  doctor                check proxy, static config, runtime models and cache (read-only)
   upgrade               self-update Gear, then maintain the active OpenCode
   help                  show this help
 
@@ -411,6 +426,7 @@ Options:
   --throttle LEVEL      low | mid | high   (OpenAI Lead tier, this launch only)
   --project DIR         project directory used for project-local overrides
   --dry-run             print the merged OpenCode config instead of launching
+  --disable-proxy       never use a proxy (overrides env and system discovery)
   --pretty              pretty-print JSON output (build / --dry-run)
   --user-config PATH    user override file
   --project-config PATH project override file
@@ -427,7 +443,13 @@ Environment:
   OPENCODE_GEAR_CACHE_DIR      override the update-check cache directory
   OPENCODE_GEAR_API_BASE       override the GitHub API base (mirrors, tests)
   OPENCODE_GEAR_TELEMETRY      0/1 to force local telemetry off/on
-  OPENCODE_GEAR_ORCHESTRATION  0/1 to force orchestration off/on for this process
+  OPENCODE_GEAR_ORCHESTRATION  0/1 to force orchestration off/on (0 is no-hook)
+  OPENCODE_GEAR_DISABLE_PROXY  1/true/on/yes disables proxy use for this process
+  HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY
+                                standard proxy variables, upper- or lower-case; used when
+                                OPENCODE_GEAR_DISABLE_PROXY is not truthy
+  GH_TOKEN / GITHUB_TOKEN       optional GitHub API token (GH_TOKEN wins); sent only to
+                                api.github.com
 
 The legacy OC_GEAR_* names are still accepted as fallbacks (including
 OC_GEAR_OPENCODE_BIN). A broken explicit binary is authoritative and errors
@@ -543,14 +565,41 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
 
     match &cli.command {
         Command::Help | Command::Version => Ok(0),
-        Command::Launch => launch(&effective, &cwd, &level, &[], true, true, &env),
+        Command::Launch => launch(
+            &effective,
+            &cwd,
+            &level,
+            &[],
+            true,
+            true,
+            &env,
+            cli.disable_proxy,
+        ),
         Command::Run(args) => {
             let forwarded = prepend_subcommand("run", args);
-            launch(&effective, &cwd, &level, &forwarded, true, true, &env)
+            launch(
+                &effective,
+                &cwd,
+                &level,
+                &forwarded,
+                true,
+                true,
+                &env,
+                cli.disable_proxy,
+            )
         }
         Command::Models(args) => {
             let forwarded = prepend_subcommand("models", args);
-            launch(&effective, &cwd, &level, &forwarded, false, false, &env)
+            launch(
+                &effective,
+                &cwd,
+                &level,
+                &forwarded,
+                false,
+                false,
+                &env,
+                cli.disable_proxy,
+            )
         }
         Command::Status => {
             validate::require_valid(&effective).map_err(Failure::Gear)?;
@@ -603,7 +652,7 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
             }
             Ok(0)
         }
-        Command::Doctor => doctor_command(&effective, &cwd, &env),
+        Command::Doctor => doctor_command(&effective, &cwd, &level, &env, cli.disable_proxy),
         Command::Context(args) => context_command(&effective, &cwd, args, &env, cli.pretty),
         Command::Cache(action) => cache_command(&effective, &cwd, action.as_deref()),
         Command::Stats(args) => stats_command(&effective, &cwd, args, &env, cli.pretty),
@@ -611,7 +660,7 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
         Command::Tools(args) => tools_command(&effective, args, cli.pretty),
         Command::Checkpoint(args) => checkpoint_command(&effective, &cwd, args, cli.pretty),
         Command::Bridge(args) => bridge_command(&effective, &cwd, args, &env),
-        Command::Upgrade => upgrade_command(&effective, &cwd, &env),
+        Command::Upgrade => upgrade_command(&effective, &cwd, &env, cli.disable_proxy),
     }
 }
 
@@ -638,6 +687,7 @@ fn prepend_subcommand(subcommand: &str, args: &[OsString]) -> Vec<OsString> {
     forwarded
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch(
     effective: &config::Effective,
     cwd: &Path,
@@ -646,6 +696,7 @@ fn launch(
     trace: bool,
     coding_session: bool,
     env: &Env,
+    disable_proxy: bool,
 ) -> std::result::Result<i32, Failure> {
     let mut resolved = build::build_opencode_config(effective, level).map_err(Failure::Gear)?;
     // `ocg models` is not a coding session: it must not require the
@@ -653,6 +704,21 @@ fn launch(
     if !coding_session {
         crate::orchestration::plugin::remove_ocg_plugin(&mut resolved);
     }
+    let plugin_active = coding_session && crate::orchestration::plugin::has_ocg_plugin(&resolved);
+    let preflight_content = if coding_session {
+        let mut probe_config = resolved.clone();
+        // The model catalogue probe runs before local plugin materialization.
+        // Keep every user plugin/config entry, but do not ask OpenCode to load
+        // OCG's generated file before that file exists.
+        crate::orchestration::plugin::remove_ocg_plugin(&mut probe_config);
+        Some(serde_json::to_string(&probe_config).map_err(|error| {
+            Failure::Gear(GearError::config(format!(
+                "cannot serialize the OpenCode config for runtime model checks: {error}"
+            )))
+        })?)
+    } else {
+        None
+    };
     let content = serde_json::to_string(&resolved).map_err(|error| {
         Failure::Gear(GearError::config(format!(
             "cannot serialize the OpenCode config: {error}"
@@ -661,29 +727,70 @@ fn launch(
     if trace {
         observability::record_event(effective, "launch", level, env.trace.as_deref());
     }
-    let http = ReqwestHttp::new().map_err(Failure::Gear)?;
+    let proxy = resolve_proxy(disable_proxy);
+    for warning in proxy.warnings() {
+        eprintln!("ocg: warning: {warning}");
+    }
+    let proxy_env = proxy.child_env();
+    let http =
+        ReqwestHttp::with_policy(proxy.plan(), env.github_token.clone()).map_err(Failure::Gear)?;
     let clock = SystemClock;
     let process = SystemProcessHost;
-    let manager =
-        runtime_manager(cwd, effective, env, &http, &clock, &process).map_err(Failure::Gear)?;
+    let manager = runtime_manager(cwd, effective, env, &http, &clock, &process)
+        .map_err(Failure::Gear)?
+        .with_proxy_env(proxy_env.clone());
     let selection = manager.resolve_for_launch().map_err(Failure::Gear)?;
     for warning in &selection.warnings {
         eprintln!("ocg: warning: {warning}");
+    }
+    if coding_session {
+        let preflight = crate::preflight::probe(
+            &effective.data,
+            &process,
+            &selection.path,
+            cwd,
+            preflight_content.as_deref().unwrap_or(&content),
+            &proxy_env,
+        )
+        .map_err(Failure::Gear)?;
+        if let Some(error) = preflight.active_lead_failure(level) {
+            return Err(Failure::Gear(GearError::config(error)));
+        }
+        match &preflight {
+            ModelPreflight::Unavailable { reason } => {
+                eprintln!("ocg: warning: {reason}; continuing because the probe is unavailable")
+            }
+            ModelPreflight::Complete { .. } => {
+                let missing = preflight.missing_non_active_count(level);
+                if missing > 0 {
+                    eprintln!(
+                        "ocg: warning: {missing} configured non-active model route(s) are not currently exposed by OpenCode; run `ocg doctor` for details"
+                    );
+                }
+            }
+        }
     }
     let runner = ProcessRunner::new(selection.path.into_os_string());
     // Materialize the adapter *before* exec: if it cannot be written, the
     // generated `file://` plugin would be broken, so fail clearly instead of
     // launching an integration that cannot work. A non-coding session (for
     // example `ocg models`) skips this entirely.
-    let extra_env = if coding_session {
-        orchestration_env(effective, cwd).map_err(Failure::Gear)?
+    let extra_env = if plugin_active {
+        runtime_plugin_env(effective, cwd, level).map_err(Failure::Gear)?
     } else {
         Vec::new()
     };
     runner
-        .exec(args, cwd, &content, &extra_env)
+        .exec(args, cwd, &content, &extra_env, &proxy_env)
         .map_err(Failure::Gear)?;
     Ok(0)
+}
+
+/// Resolve the effective proxy for a command. Static system discovery is only
+/// attempted when the environment carries nothing, so non-network commands do
+/// not spawn `scutil`.
+fn resolve_proxy(disable: bool) -> ProxySelection {
+    crate::proxy::resolve(disable, &crate::proxy::SystemProxyEnv, &SystemStaticProxy)
 }
 
 /// Materialize the generated plugin and export the exact bridge environment.
@@ -693,16 +800,11 @@ fn launch(
 /// no plugin, no file and no variable reaches OpenCode. A materialization
 /// failure is returned so the launch aborts rather than injecting a `file://`
 /// URL that does not resolve.
-fn orchestration_env(
+fn runtime_plugin_env(
     effective: &config::Effective,
     cwd: &Path,
+    level: &str,
 ) -> crate::error::Result<Vec<(OsString, OsString)>> {
-    let enabled = crate::orchestration::OrchestrationConfig::from_config(&effective.data)
-        .map(|config| config.enabled)
-        .unwrap_or(false);
-    if !enabled {
-        return Ok(Vec::new());
-    }
     let path = crate::orchestration::plugin::materialize(cwd)?;
     let mut env = Vec::new();
     let exe = std::env::current_exe().map_err(|error| {
@@ -726,6 +828,20 @@ fn orchestration_env(
     env.push((
         OsString::from("OPENCODE_GEAR_PROJECT_CONFIG"),
         effective.project_path.as_os_str().to_os_string(),
+    ));
+    env.push((
+        OsString::from("OPENCODE_GEAR_ORCHESTRATION_ENABLED"),
+        OsString::from("1"),
+    ));
+    let contract = model::lead_contract(&effective.data, level)?;
+    let contract = serde_json::to_string(&contract).map_err(|error| {
+        GearError::config(format!(
+            "cannot serialize the Lead runtime contract: {error}"
+        ))
+    })?;
+    env.push((
+        OsString::from("OPENCODE_GEAR_LEAD_CONTRACT"),
+        OsString::from(contract),
     ));
     // Defense in depth: the exported path is the one just materialized.
     debug_assert!(path.is_file());
@@ -817,10 +933,16 @@ fn check_line(status: &str, label: &str, detail: &str) {
 fn doctor_command(
     effective: &config::Effective,
     project_root: &Path,
+    level: &str,
     env: &Env,
+    disable_proxy: bool,
 ) -> std::result::Result<i32, Failure> {
     let mut failures = 0usize;
     println!("OpenCode Gear doctor");
+
+    let proxy = resolve_proxy(disable_proxy);
+    print_proxy_diagnostics(&proxy);
+    let proxy_env = proxy.child_env();
 
     let platform = match Platform::current() {
         Ok(platform) => {
@@ -878,13 +1000,18 @@ fn doctor_command(
     }
 
     let errors = validate::validate(effective);
-    if errors.is_empty() {
+    let static_config_valid = errors.is_empty();
+    if static_config_valid {
         let roles = model::role_specs(&effective.data)
             .map(|roles| roles.len())
             .unwrap_or(0);
-        check_line("ok", "config/routing", &format!("valid ({roles} roles)"));
+        check_line(
+            "ok",
+            "static config/routing",
+            &format!("valid ({roles} roles)"),
+        );
     } else {
-        check_line("fail", "config/routing", &errors.join("; "));
+        check_line("fail", "static config/routing", &errors.join("; "));
         failures += 1;
     }
 
@@ -900,7 +1027,8 @@ fn doctor_command(
                 &clock,
                 &process,
             )
-            .with_explicit(env.opencode_bin.clone());
+            .with_explicit(env.opencode_bin.clone())
+            .with_proxy_env(proxy_env.clone());
             manager.resolve_for_report()
         }
         None => runtime::RuntimeReport::default(),
@@ -939,6 +1067,80 @@ fn doctor_command(
     }
     for warning in &report.warnings {
         check_line("warn", "runtime", warning);
+    }
+
+    println!("runtime models");
+    if !static_config_valid {
+        check_line(
+            "info",
+            "runtime models",
+            "skipped because static config/routing validation failed",
+        );
+    } else if let Some(program) = report.path.as_deref() {
+        let mut resolved = build::build_opencode_config(effective, level).map_err(Failure::Gear)?;
+        crate::orchestration::plugin::remove_ocg_plugin(&mut resolved);
+        let content = serde_json::to_string(&resolved).map_err(|error| {
+            Failure::Gear(GearError::config(format!(
+                "cannot serialize the OpenCode config for runtime model checks: {error}"
+            )))
+        })?;
+        match crate::preflight::probe(
+            &effective.data,
+            &process,
+            program,
+            project_root,
+            &content,
+            &proxy_env,
+        )
+        .map_err(Failure::Gear)?
+        {
+            ModelPreflight::Unavailable { reason } => check_line("warn", "runtime models", &reason),
+            ModelPreflight::Complete { checks } => {
+                for check in checks {
+                    let variant = check
+                        .requirement
+                        .variant
+                        .as_deref()
+                        .map(|variant| format!(" (variant {variant})"))
+                        .unwrap_or_default();
+                    match check.availability {
+                        Availability::Available => check_line(
+                            "ok",
+                            &check.requirement.label,
+                            &format!("{}{}", check.requirement.full_model_id, variant),
+                        ),
+                        Availability::MissingProvider => {
+                            check_line(
+                                "error",
+                                &check.requirement.label,
+                                &format!(
+                                    "{}{} — provider is not currently exposed by OpenCode; authenticate/configure the provider or adjust OCG configuration",
+                                    check.requirement.full_model_id, variant
+                                ),
+                            );
+                            failures += 1;
+                        }
+                        Availability::MissingModel => {
+                            check_line(
+                                "error",
+                                &check.requirement.label,
+                                &format!(
+                                    "{}{} — model is not currently exposed by OpenCode; authenticate/configure the provider or adjust OCG configuration",
+                                    check.requirement.full_model_id, variant
+                                ),
+                            );
+                            failures += 1;
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        check_line(
+            "info",
+            "runtime models",
+            "not checked because no usable OpenCode runtime is installed",
+        );
     }
 
     let runtime_root = Layout::new(project_root).runtime_root();
@@ -1315,18 +1517,63 @@ fn doctor_command(
 
     Ok(if failures == 0 { 0 } else { 1 })
 }
+
+fn print_proxy_diagnostics(proxy: &ProxySelection) {
+    if proxy.is_disabled() {
+        check_line(
+            "ok",
+            "proxy",
+            match proxy.source() {
+                ProxySource::CliDisabled => "disabled by CLI",
+                ProxySource::EnvDisabled => "disabled by OPENCODE_GEAR_DISABLE_PROXY",
+                _ => "disabled",
+            },
+        );
+        return;
+    }
+    check_line("ok", "proxy mode", "auto");
+    let source = match proxy.source() {
+        ProxySource::Environment => "environment",
+        ProxySource::System => "macOS system settings",
+        ProxySource::Direct => "direct (no proxy configured)",
+        ProxySource::CliDisabled | ProxySource::EnvDisabled => "disabled",
+    };
+    check_line("ok", "proxy source", source);
+    for endpoint in proxy.plan().endpoints() {
+        let label = match endpoint.scheme() {
+            ProxyScheme::Http => "HTTP proxy",
+            ProxyScheme::Https => "HTTPS proxy",
+            ProxyScheme::All => "all proxy",
+        };
+        check_line("ok", label, "configured");
+    }
+    if !proxy.plan().no_proxy().is_empty() {
+        check_line("ok", "no-proxy", "configured");
+    }
+    for warning in proxy.warnings() {
+        check_line("warn", "proxy", warning);
+    }
+}
 /// `ocg upgrade`: self-update Gear, then force-maintain the active OpenCode.
 fn upgrade_command(
     effective: &config::Effective,
     project_root: &Path,
     env: &Env,
+    disable_proxy: bool,
 ) -> std::result::Result<i32, Failure> {
     let platform = Platform::current().map_err(Failure::Gear)?;
     let clock = SystemClock;
     let process = SystemProcessHost;
-    let http = ReqwestHttp::new().map_err(Failure::Gear)?;
+    let proxy = resolve_proxy(disable_proxy);
+    for warning in proxy.warnings() {
+        eprintln!("ocg: warning: {warning}");
+    }
+    let proxy_env = proxy.child_env();
+    let http =
+        ReqwestHttp::with_policy(proxy.plan(), env.github_token.clone()).map_err(Failure::Gear)?;
     let manager = runtime_manager(project_root, effective, env, &http, &clock, &process)
-        .map_err(Failure::Gear)?;
+        .map_err(Failure::Gear)?
+        .with_proxy_env(proxy_env);
 
     let current = Version::parse(VERSION).map_err(|error| {
         Failure::Gear(GearError::config(format!(

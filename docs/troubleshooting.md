@@ -69,10 +69,39 @@ does.
 
 ## `ocg upgrade` did not change my system OpenCode
 
-For a system runtime, `ocg upgrade` runs `opencode upgrade` and never installs
-a managed copy or downgrades a newer system runtime. If `opencode upgrade`
-fails, the old compatible runtime is kept with a warning. A system runtime
-that is still incompatible falls back to a managed install.
+For a system runtime, OCG resolves the latest OpenCode release through its own
+transport and runs `opencode upgrade <that version>`. It never installs a
+managed copy and never downgrades a newer system runtime. If the lookup or the
+upgrade fails, the old compatible runtime is kept with a warning and the failed
+check is cached. A system runtime that is still incompatible falls back to a
+managed install.
+
+## A proxy is not used, or is used unexpectedly
+
+OCG resolves the proxy in this order: `--disable-proxy`, then a truthy
+`OPENCODE_GEAR_DISABLE_PROXY`, then `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` /
+`NO_PROXY` (either case), then static macOS discovery, then direct.
+
+- Use `--disable-proxy` (before or after a non-passthrough command) or
+  `OPENCODE_GEAR_DISABLE_PROXY=1` to force direct connections.
+- Only `http://` and `https://` proxy URLs are used by OCG's own client. A
+  `socks5://` value is ignored with a warning for OCG itself, but is preserved
+  verbatim for the launched OpenCode so a working SOCKS setup is not broken.
+- A PAC configuration from the system is reported but not interpreted.
+- OCG disables `reqwest`'s hidden automatic discovery; only the variables above
+  take effect. A launched OpenCode (and the `upgrade` / `models` children)
+  receives the resolved values under both the upper- and lower-case names after
+  every spelling is cleared.
+
+## GitHub API rate limit
+
+OCG's own GitHub requests are anonymous unless `GH_TOKEN` (preferred) or
+`GITHUB_TOKEN` is set. Without a token the public limit is small; a refused
+lookup reports the resource, limit, remaining and reset from the response
+headers, and a `retry-after` when GitHub sends one. A rate-limited update check
+is cached like any other failed check for `runtime.checkIntervalHours`, so a
+launch does not hammer the API. Set one of the token variables to raise the
+limit; the token is sent only to `api.github.com`.
 
 ## A pinned OpenCode version will not move
 
@@ -107,6 +136,29 @@ opencode models volcengine-coding --verbose
 
 Then update `config/models.json` (or your override). Reasoning variants are
 listed under `variants`; if a model has none, omit `variant`.
+
+`ocg doctor` separates static configuration validity from runtime availability
+and identifies a missing provider, a missing model under an available provider,
+or an unavailable probe. A coding launch blocks only when the active Lead model
+is definitely absent; it does not pretend that another model is an equivalent
+fallback.
+
+## Sticky model or reasoning state overrides the selected throttle
+
+On ordinary `ocg` / `ocg run` launches, the generated plugin enforces the
+Rust-resolved Lead agent/model/variant on mutable `chat.message` output. This is
+designed to override stale TUI and reused-session Lead state while leaving
+consumer subagent requests unchanged. Check the effective contract and runtime
+availability with:
+
+```bash
+ocg --throttle mid --dry-run
+ocg --throttle mid doctor
+```
+
+If `OPENCODE_GEAR_ORCHESTRATION=0` or
+`"orchestration": {"enabled": false}` is set, the explicit no-hook path emits
+no generated plugin, so this enforcement is intentionally unavailable.
 
 ## `volcengine-coding` rejects a model as unsupported
 

@@ -188,7 +188,10 @@ fn run_activates_orchestration_plugin_without_preparing_context() {
     let project = dir.project();
     let marker = dir.join("marker.txt");
     let script = dir.join("fake-opencode.sh");
-    let body = format!("#!/bin/sh\nprintf done > \"{}\"\n", marker.display());
+    let body = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"models\" ]; then printf '%s\\n' openai/gpt-5.6-sol openai/gpt-6-astra; exit 0; fi\nprintf done > \"{}\"\n",
+        marker.display()
+    );
     fs::write(&script, body).unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
 

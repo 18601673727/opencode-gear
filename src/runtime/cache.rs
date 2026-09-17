@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 pub struct CacheRecord {
     pub checked_at: i64,
     pub version: Option<Version>,
+    /// A safe category for a failed check; never raw transport/process text.
+    pub failure_reason: Option<String>,
 }
 
 impl CacheRecord {
@@ -33,9 +35,15 @@ impl CacheRecord {
             .get("version")
             .and_then(Value::as_str)
             .and_then(super::policy::parse_exact_version);
+        let failure_reason = value
+            .get("failure_reason")
+            .and_then(Value::as_str)
+            .filter(|reason| matches!(*reason, "rate_limited" | "failed"))
+            .map(str::to_string);
         Some(Self {
             checked_at,
             version,
+            failure_reason,
         })
     }
 
@@ -43,6 +51,7 @@ impl CacheRecord {
         json!({
             "checked_at": self.checked_at,
             "version": self.version.as_ref().map(ToString::to_string),
+            "failure_reason": self.failure_reason,
         })
     }
 
@@ -117,6 +126,7 @@ mod tests {
         let record = CacheRecord {
             checked_at: 1_000,
             version: Some(Version::new(1, 18, 31)),
+            failure_reason: None,
         };
         assert!(due(Some(&record), 1_000, 24, true));
     }
@@ -126,6 +136,7 @@ mod tests {
         let record = CacheRecord {
             checked_at: 1_000,
             version: None,
+            failure_reason: Some("failed".to_string()),
         };
         let interval = 24;
         assert!(!record.is_due(1_000 + 3_600, interval));
@@ -140,6 +151,7 @@ mod tests {
         let record = CacheRecord {
             checked_at: 42,
             version: Some(Version::new(1, 18, 31)),
+            failure_reason: None,
         };
         record.write(dir.path()).unwrap();
         assert_eq!(CacheRecord::read(dir.path()), Some(record));
@@ -158,6 +170,7 @@ mod tests {
         CacheRecord {
             checked_at: 1_000,
             version: None,
+            failure_reason: None,
         }
         .write(dir.path())
         .unwrap();

@@ -126,6 +126,7 @@ fn fresh_cache(dir: &TestDir) {
     CacheRecord {
         checked_at: 1_000,
         version: None,
+        failure_reason: None,
     }
     .write(&dir.path().join("cache"))
     .unwrap();
@@ -535,6 +536,7 @@ fn expired_cache_triggers_a_check_and_warns_on_failure() {
     CacheRecord {
         checked_at: 0,
         version: None,
+        failure_reason: None,
     }
     .write(&dir.path().join("cache"))
     .unwrap();
@@ -580,14 +582,14 @@ fn system_host(system: &Path, version: &str) -> FakeProcessHost {
 }
 
 #[test]
-fn system_due_check_upgrades_in_place() {
+fn system_due_check_upgrades_in_place_to_the_resolved_target() {
     let dir = TestDir::new();
     let system = dir.join("opencode-system");
     write_executable(&system, "#!/bin/sh\necho 1.18.20\n");
     let process =
         system_host(&system, "1.18.20").with_upgrade_success(system.clone(), Some("1.18.31"));
 
-    let http = MemoryHttp::new();
+    let http = http_with_latest("1.18.31");
     let clock = FixedClock::new(1_000);
     let selection = manager(&dir, RuntimePolicy::default(), &http, &clock, &process)
         .resolve_for_launch()
@@ -596,6 +598,11 @@ fn system_due_check_upgrades_in_place() {
     assert_eq!(selection.version, Some(Version::new(1, 18, 31)));
     assert!(!dir.join(".opencode-gear").exists());
     assert_eq!(process.upgrade_calls(), vec![system]);
+    assert_eq!(
+        process.upgrade_targets(),
+        vec![Some(Version::new(1, 18, 31))],
+        "the resolved release must be passed to `opencode upgrade`"
+    );
     assert_eq!(
         CacheRecord::read(&dir.path().join("cache"))
             .unwrap()
@@ -612,6 +619,34 @@ fn system_due_check_failure_keeps_old_and_records_a_negative_check() {
     let process =
         system_host(&system, "1.18.20").with_upgrade_failure(system.clone(), "no network");
 
+    let http = http_with_latest("1.18.31");
+    let clock = FixedClock::new(1_000);
+    let selection = manager(&dir, RuntimePolicy::default(), &http, &clock, &process)
+        .resolve_for_launch()
+        .unwrap();
+    assert_eq!(selection.source, RuntimeSource::System);
+    assert_eq!(selection.version, Some(Version::new(1, 18, 20)));
+    assert!(!selection.warnings.is_empty());
+    assert_eq!(
+        process.upgrade_targets(),
+        vec![Some(Version::new(1, 18, 31))],
+        "a resolved target must be attempted before failing"
+    );
+    assert_eq!(
+        CacheRecord::read(&dir.path().join("cache"))
+            .unwrap()
+            .version,
+        None
+    );
+}
+
+#[test]
+fn system_lookup_failure_keeps_old_and_records_a_negative_check() {
+    let dir = TestDir::new();
+    let system = dir.join("opencode-system");
+    write_executable(&system, "#!/bin/sh\necho 1.18.20\n");
+    let process = system_host(&system, "1.18.20");
+
     let http = MemoryHttp::new();
     let clock = FixedClock::new(1_000);
     let selection = manager(&dir, RuntimePolicy::default(), &http, &clock, &process)
@@ -620,6 +655,10 @@ fn system_due_check_failure_keeps_old_and_records_a_negative_check() {
     assert_eq!(selection.source, RuntimeSource::System);
     assert_eq!(selection.version, Some(Version::new(1, 18, 20)));
     assert!(!selection.warnings.is_empty());
+    assert!(
+        process.upgrade_calls().is_empty(),
+        "no target can be attempted when the lookup fails"
+    );
     assert_eq!(
         CacheRecord::read(&dir.path().join("cache"))
             .unwrap()
@@ -636,7 +675,7 @@ fn system_failed_check_is_not_retried_within_the_interval() {
     let process =
         system_host(&system, "1.18.20").with_upgrade_failure(system.clone(), "no network");
 
-    let http = MemoryHttp::new();
+    let http = http_with_latest("1.18.31");
     let clock = FixedClock::new(1_000);
     let policy = RuntimePolicy::default();
 
@@ -645,16 +684,83 @@ fn system_failed_check_is_not_retried_within_the_interval() {
         .unwrap();
     assert!(!first.warnings.is_empty());
     assert_eq!(process.upgrade_calls().len(), 1);
+    assert_eq!(
+        http.requests().len(),
+        1,
+        "the release must be resolved once for the failed upgrade"
+    );
 
     let second = manager(&dir, policy, &http, &clock, &process)
         .resolve_for_launch()
         .unwrap();
-    assert!(second.warnings.is_empty(), "negative check must be cached");
+    assert!(
+        second
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("last OpenCode update check failed")),
+        "cached failure reason must remain visible: {:?}",
+        second.warnings
+    );
     assert_eq!(
         process.upgrade_calls().len(),
         1,
         "must not upgrade again within the interval"
     );
+    assert_eq!(
+        http.requests().len(),
+        1,
+        "must not resolve again within the interval"
+    );
+}
+
+#[test]
+fn system_rate_limited_check_is_cached() {
+    let dir = TestDir::new();
+    let system = dir.join("opencode-system");
+    write_executable(&system, "#!/bin/sh\necho 1.18.20\n");
+    let process = system_host(&system, "1.18.20");
+
+    let http = MemoryHttp::new().with_status(
+        LATEST_URL,
+        403,
+        &[
+            ("x-ratelimit-limit", "60"),
+            ("x-ratelimit-remaining", "0"),
+            ("x-ratelimit-resource", "core"),
+            ("retry-after", "60"),
+        ],
+        b"{}".to_vec(),
+    );
+    let clock = FixedClock::new(1_000);
+    let policy = RuntimePolicy::default();
+
+    let first = manager(&dir, policy.clone(), &http, &clock, &process)
+        .resolve_for_launch()
+        .unwrap();
+    assert_eq!(first.source, RuntimeSource::System);
+    assert_eq!(first.version, Some(Version::new(1, 18, 20)));
+    assert!(
+        first
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("rate limit")),
+        "a rate-limited lookup must say so: {:?}",
+        first.warnings
+    );
+    assert!(process.upgrade_calls().is_empty());
+
+    let second = manager(&dir, policy, &http, &clock, &process)
+        .resolve_for_launch()
+        .unwrap();
+    assert!(
+        second
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("last OpenCode update check was rate-limited")),
+        "cached rate-limit reason must remain visible: {:?}",
+        second.warnings
+    );
+    assert_eq!(http.requests().len(), 1, "must not hammer the API");
 }
 
 #[test]
@@ -665,7 +771,7 @@ fn incompatible_system_upgrade_success_uses_the_system_runtime() {
     let process =
         system_host(&system, "1.17.0").with_upgrade_success(system.clone(), Some("1.18.31"));
 
-    let http = MemoryHttp::new();
+    let http = http_with_latest("1.18.31");
     let clock = FixedClock::new(1_000);
     let selection = manager(&dir, RuntimePolicy::default(), &http, &clock, &process)
         .resolve_for_launch()
@@ -674,6 +780,10 @@ fn incompatible_system_upgrade_success_uses_the_system_runtime() {
     assert_eq!(selection.version, Some(Version::new(1, 18, 31)));
     assert!(!dir.join(".opencode-gear").exists());
     assert_eq!(process.upgrade_calls().len(), 1);
+    assert_eq!(
+        process.upgrade_targets(),
+        vec![Some(Version::new(1, 18, 31))]
+    );
 }
 
 #[test]
@@ -733,7 +843,14 @@ fn managed_failed_check_is_not_retried_within_the_interval() {
     let second = manager(&dir, policy, &http, &clock, &process)
         .resolve_for_launch()
         .unwrap();
-    assert!(second.warnings.is_empty(), "negative check must be cached");
+    assert!(
+        second
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("last OpenCode update check failed")),
+        "the cached failure reason must stay visible without a new check: {:?}",
+        second.warnings
+    );
     assert_eq!(
         http.requests().len(),
         1,
@@ -744,7 +861,7 @@ fn managed_failed_check_is_not_retried_within_the_interval() {
 // --- forced upgrade maintains the active source ----------------------------
 
 #[test]
-fn forced_upgrade_on_a_newer_system_runtime_never_installs_managed() {
+fn forced_upgrade_on_a_newer_system_runtime_never_downgrades_or_installs_managed() {
     let dir = TestDir::new();
     let system = dir.join("opencode-system");
     write_executable(&system, "#!/bin/sh\necho 1.19.0\n");
@@ -758,11 +875,15 @@ fn forced_upgrade_on_a_newer_system_runtime_never_installs_managed() {
     assert_eq!(outcome.after.source, RuntimeSource::System);
     assert_eq!(outcome.after.version, Some(Version::new(1, 19, 0)));
     assert!(!Layout::new(dir.path()).active_path().exists());
-    assert!(
-        http.requests().is_empty(),
-        "system upgrade must not fetch releases"
+    assert_eq!(
+        http.requests(),
+        vec![LATEST_URL.to_string()],
+        "the latest release must be resolved once through OCG's transport"
     );
-    assert_eq!(process.upgrade_calls().len(), 1);
+    assert!(
+        process.upgrade_calls().is_empty(),
+        "a newer system runtime must not be downgraded"
+    );
 }
 
 #[test]

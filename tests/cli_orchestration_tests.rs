@@ -120,12 +120,49 @@ fn disabled_orchestration_emits_no_plugin() {
         .unwrap_or(false);
     assert!(
         !has_ocg,
-        "disabled orchestration must not emit a plugin: {config}"
+        "disabled orchestration must preserve the explicit no-hook path: {config}"
     );
     assert!(!project
         .join(".opencode-gear")
         .join("orchestration")
         .exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn disabled_orchestration_launch_preserves_the_no_hook_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TestDir::new();
+    let project = project(&dir);
+    let marker = dir.join("launched");
+    let script = dir.join("fake-opencode-no-hook.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.18.31; exit 0; fi\nif [ \"$1\" = \"models\" ]; then printf '%s\\n' openai/gpt-5.6-sol; exit 0; fi\nprintf launched > \"{}\"\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = base_command(&project, dir.path())
+        .env("OPENCODE_GEAR_ORCHESTRATION", "0")
+        .env("OPENCODE_GEAR_OPENCODE", &script)
+        .args(["run", "hello"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(marker.exists());
+    assert!(
+        !project.join(".opencode-gear").exists(),
+        "the explicit no-hook launch must not materialize local plugin state"
+    );
 }
 
 #[test]
@@ -203,7 +240,7 @@ fn launch_fails_clearly_when_the_plugin_cannot_be_materialized() {
     let script = dir.join("fake-opencode.sh");
     std::fs::write(
         &script,
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.18.31; exit 0; fi\necho launched\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.18.31; exit 0; fi\nif [ \"$1\" = \"models\" ]; then printf '%s\\n' openai/gpt-5.6-sol; exit 0; fi\necho launched\n",
     )
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -346,7 +383,7 @@ fn launch_propagates_explicit_config_paths_to_the_bridge_environment() {
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.18.31; exit 0; fi\nprintf '%s\\n%s\\n' \"$OPENCODE_GEAR_USER_CONFIG\" \"$OPENCODE_GEAR_PROJECT_CONFIG\" > \"{}\"\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.18.31; exit 0; fi\nif [ \"$1\" = \"models\" ]; then printf '%s\\n' openai/gpt-5.6-sol; exit 0; fi\nprintf '%s\\n%s\\n' \"$OPENCODE_GEAR_USER_CONFIG\" \"$OPENCODE_GEAR_PROJECT_CONFIG\" > \"{}\"\n",
             marker.display()
         ),
     )

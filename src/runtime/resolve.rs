@@ -10,6 +10,7 @@ use crate::error::{GearError, Result};
 use crate::http::HttpTransport;
 use crate::platform::Platform;
 use crate::process::{is_executable, ProcessHost};
+use crate::proxy::ChildProxyEnv;
 use crate::runtime::cache::{self, CacheRecord};
 use crate::runtime::install::{ensure_gitignore, install_opencode, ActiveRuntime, Layout};
 use crate::runtime::policy::{self, RuntimePolicy};
@@ -100,6 +101,9 @@ pub struct RuntimeManager<'a> {
     pub http: &'a dyn HttpTransport,
     pub clock: &'a dyn Clock,
     pub process: &'a dyn ProcessHost,
+    /// The resolved proxy policy applied to any child process this manager
+    /// starts (system `opencode upgrade`).
+    pub proxy_env: ChildProxyEnv,
 }
 
 impl<'a> RuntimeManager<'a> {
@@ -123,7 +127,14 @@ impl<'a> RuntimeManager<'a> {
             http,
             clock,
             process,
+            proxy_env: ChildProxyEnv::default(),
         }
+    }
+
+    /// Apply the resolved proxy policy to child processes.
+    pub fn with_proxy_env(mut self, proxy_env: ChildProxyEnv) -> Self {
+        self.proxy_env = proxy_env;
+        self
     }
 
     pub fn with_explicit(mut self, explicit: Option<OsString>) -> Self {
@@ -306,6 +317,7 @@ impl<'a> RuntimeManager<'a> {
 
     fn resolve_managed(&self, active: ActiveRuntime) -> Result<RuntimeSelection> {
         let mut warnings = Vec::new();
+        self.append_cached_check_warning(&mut warnings);
 
         if self.policy.allows_auto_upgrade() && self.check_due() {
             match self.check_and_upgrade(&active.version) {
@@ -314,7 +326,7 @@ impl<'a> RuntimeManager<'a> {
                 Err(error) => {
                     // Record the failure so a compatible runtime does not
                     // retry the check on every launch.
-                    self.record_check(None);
+                    self.record_failed_check(&error);
                     warnings.push(format!("could not check for an OpenCode update: {error}"));
                 }
             }
@@ -340,77 +352,89 @@ impl<'a> RuntimeManager<'a> {
     }
 
     /// Decide what to do with a system `opencode` found on `PATH`.
-    fn resolve_system(&self, system: RuntimeSelection) -> Result<RuntimeSelection> {
-        let mut warnings = system.warnings;
+    ///
+    /// OpenCode Gear resolves the latest OpenCode release through its own
+    /// transport and then asks the system runtime to move to that exact
+    /// version. A compatible runtime is always kept if the lookup or the
+    /// upgrade fails, and a failed check is cached so a launch does not hammer
+    /// the network (including when the failure is a rate limit).
+    fn resolve_system(&self, mut system: RuntimeSelection) -> Result<RuntimeSelection> {
+        let mut warnings = std::mem::take(&mut system.warnings);
+        self.append_cached_check_warning(&mut warnings);
         let compatible = is_compatible(&system.version);
+        let auto = self.policy.allows_auto_upgrade();
 
         if compatible {
-            if self.policy.allows_auto_upgrade() && self.check_due() {
-                match self.process.upgrade(&system.path) {
-                    Ok(_) => {
-                        let version = self.probe_version(&system.path);
-                        self.record_check(version.clone());
-                        if is_compatible(&version) {
-                            return Ok(RuntimeSelection {
-                                source: RuntimeSource::System,
-                                path: system.path,
-                                version,
-                                warnings,
-                            });
-                        }
-                        warnings.push(format!(
-                            "the system OpenCode at {} is still not compatible after `opencode upgrade`",
-                            system.path.display()
-                        ));
-                        return self.bootstrap(warnings);
-                    }
+            if auto && self.check_due() {
+                let release = match release::fetch_latest_release(
+                    self.http,
+                    &self.api_base,
+                    &self.opencode_repo,
+                ) {
+                    Ok(release) => release,
                     Err(error) => {
                         // Negative check: do not retry on every launch.
-                        self.record_check(None);
+                        self.record_failed_check(&error);
                         warnings.push(format!(
-                            "could not upgrade the system OpenCode at {}; continuing with {}: {error}",
-                            system.path.display(),
+                            "could not check for an OpenCode update; continuing with {}: {error}",
                             describe_version(&system.version)
                         ));
-                        return Ok(RuntimeSelection {
-                            source: RuntimeSource::System,
-                            path: system.path,
-                            version: system.version,
-                            warnings,
-                        });
+                        return Ok(keep_system(system, warnings));
                     }
+                };
+                if system
+                    .version
+                    .as_ref()
+                    .map(|current| release.version <= *current)
+                    .unwrap_or(false)
+                {
+                    self.record_check(Some(release.version));
+                    return Ok(keep_system(system, warnings));
                 }
+                return self.upgrade_compatible_system(system, &release, warnings);
             }
-            return Ok(RuntimeSelection {
-                source: RuntimeSource::System,
-                path: system.path,
-                version: system.version,
-                warnings,
-            });
+            return Ok(keep_system(system, warnings));
         }
 
         // Unusable or incompatible system runtime.
-        if self.policy.allows_auto_upgrade() {
-            match self.process.upgrade(&system.path) {
-                Ok(_) => {
-                    let version = self.probe_version(&system.path);
-                    if is_compatible(&version) {
-                        self.record_check(version.clone());
-                        return Ok(RuntimeSelection {
-                            source: RuntimeSource::System,
-                            path: system.path,
-                            version,
-                            warnings,
-                        });
+        if auto {
+            match release::fetch_latest_release(self.http, &self.api_base, &self.opencode_repo) {
+                Ok(release) => {
+                    match self.process.upgrade(
+                        &system.path,
+                        Some(&release.version),
+                        &self.proxy_env,
+                    ) {
+                        Ok(_) => {
+                            let version = self.probe_version(&system.path);
+                            if is_compatible(&version) {
+                                self.record_check(version.clone());
+                                return Ok(RuntimeSelection {
+                                    source: RuntimeSource::System,
+                                    path: system.path,
+                                    version,
+                                    warnings,
+                                });
+                            }
+                            warnings.push(format!(
+                                "the system OpenCode at {} is still not compatible after `opencode upgrade {}`",
+                                system.path.display(),
+                                release.version
+                            ));
+                        }
+                        Err(error) => {
+                            warnings.push(format!(
+                                "the system OpenCode at {} is not compatible and `opencode upgrade {}` failed: {error}",
+                                system.path.display(),
+                                release.version
+                            ));
+                        }
                     }
-                    warnings.push(format!(
-                        "the system OpenCode at {} is still not compatible after `opencode upgrade`",
-                        system.path.display()
-                    ));
+                    return self.bootstrap_release(&release, warnings);
                 }
                 Err(error) => {
                     warnings.push(format!(
-                        "the system OpenCode at {} is not compatible and `opencode upgrade` failed: {error}",
+                        "the system OpenCode at {} is not compatible and the latest release could not be resolved: {error}",
                         system.path.display()
                     ));
                 }
@@ -425,6 +449,48 @@ impl<'a> RuntimeManager<'a> {
 
         // The project-local fallback is required even when autoUpgrade is off.
         self.bootstrap(warnings)
+    }
+
+    /// Upgrade a compatible system runtime to an already resolved release.
+    fn upgrade_compatible_system(
+        &self,
+        system: RuntimeSelection,
+        release: &Release,
+        mut warnings: Vec<String>,
+    ) -> Result<RuntimeSelection> {
+        match self
+            .process
+            .upgrade(&system.path, Some(&release.version), &self.proxy_env)
+        {
+            Ok(_) => {
+                let version = self.probe_version(&system.path);
+                self.record_check(version.clone());
+                if is_compatible(&version) {
+                    return Ok(RuntimeSelection {
+                        source: RuntimeSource::System,
+                        path: system.path,
+                        version,
+                        warnings,
+                    });
+                }
+                warnings.push(format!(
+                    "the system OpenCode at {} is still not compatible after `opencode upgrade {}`",
+                    system.path.display(),
+                    release.version
+                ));
+                self.bootstrap_release(release, warnings)
+            }
+            Err(error) => {
+                // Negative check: do not retry on every launch.
+                self.record_failed_check(&error);
+                warnings.push(format!(
+                    "could not upgrade the system OpenCode at {}; continuing with {}: {error}",
+                    system.path.display(),
+                    describe_version(&system.version)
+                ));
+                Ok(keep_system(system, warnings))
+            }
+        }
     }
 
     fn system_selection(&self) -> Option<RuntimeSelection> {
@@ -466,7 +532,7 @@ impl<'a> RuntimeManager<'a> {
             .path
             .clone()
             .ok_or_else(|| GearError::config("the explicit OpenCode has no path"))?;
-        match self.process.upgrade(&path) {
+        match self.process.upgrade(&path, None, &self.proxy_env) {
             Ok(_) => {
                 let version = self.probe_version(&path);
                 Ok(RuntimeSelection {
@@ -528,7 +594,7 @@ impl<'a> RuntimeManager<'a> {
                 let usable = is_compatible(&before.version)
                     && before.path.as_deref().map(is_executable).unwrap_or(false);
                 if usable {
-                    self.record_check(None);
+                    self.record_failed_check(&error);
                     warnings.push(format!(
                         "managed OpenCode update failed; keeping {}: {error}",
                         describe_version(&before.version)
@@ -560,7 +626,54 @@ impl<'a> RuntimeManager<'a> {
             .ok_or_else(|| GearError::config("the system OpenCode has no path"))?;
         let compatible = is_compatible(&before.version);
 
-        match self.process.upgrade(&path) {
+        // Resolve the latest release once and use it as the explicit target.
+        let release = match release::fetch_latest_release(
+            self.http,
+            &self.api_base,
+            &self.opencode_repo,
+        ) {
+            Ok(release) => release,
+            Err(error) => {
+                if compatible {
+                    self.record_failed_check(&error);
+                    warnings.push(format!(
+                        "could not resolve the latest OpenCode release; keeping {}: {error}",
+                        describe_version(&before.version)
+                    ));
+                    return Ok(RuntimeSelection {
+                        source: RuntimeSource::System,
+                        path,
+                        version: before.version.clone(),
+                        warnings: Vec::new(),
+                    });
+                }
+                warnings.push(format!(
+                        "the system OpenCode at {} is not compatible and the latest release could not be resolved: {error}",
+                        path.display()
+                    ));
+                return self.bootstrap(warnings.clone());
+            }
+        };
+
+        if before
+            .version
+            .as_ref()
+            .map(|current| release.version <= *current)
+            .unwrap_or(false)
+        {
+            self.record_check(Some(release.version));
+            return Ok(RuntimeSelection {
+                source: RuntimeSource::System,
+                path,
+                version: before.version.clone(),
+                warnings: Vec::new(),
+            });
+        }
+
+        match self
+            .process
+            .upgrade(&path, Some(&release.version), &self.proxy_env)
+        {
             Ok(_) => {
                 let version = self.probe_version(&path);
                 if is_compatible(&version) {
@@ -573,15 +686,16 @@ impl<'a> RuntimeManager<'a> {
                     })
                 } else {
                     warnings.push(format!(
-                        "the system OpenCode at {} is still not compatible after `opencode upgrade`",
-                        path.display()
+                        "the system OpenCode at {} is still not compatible after `opencode upgrade {}`",
+                        path.display(),
+                        release.version
                     ));
-                    self.bootstrap(warnings.clone())
+                    self.bootstrap_release(&release, warnings.clone())
                 }
             }
             Err(error) => {
                 if compatible {
-                    self.record_check(None);
+                    self.record_failed_check(&error);
                     warnings.push(format!(
                         "system OpenCode `upgrade` failed; keeping {}: {error}",
                         describe_version(&before.version)
@@ -597,7 +711,7 @@ impl<'a> RuntimeManager<'a> {
                         "the system OpenCode at {} is not compatible and `opencode upgrade` failed: {error}",
                         path.display()
                     ));
-                    self.bootstrap(warnings.clone())
+                    self.bootstrap_release(&release, warnings.clone())
                 }
             }
         }
@@ -613,7 +727,16 @@ impl<'a> RuntimeManager<'a> {
             )?,
             None => release::fetch_latest_release(self.http, &self.api_base, &self.opencode_repo)?,
         };
-        let mut selection = self.install_release(&release, RuntimeSource::ProjectLocal)?;
+        self.bootstrap_release(&release, warnings)
+    }
+
+    /// Install an already resolved release and record the check.
+    fn bootstrap_release(
+        &self,
+        release: &Release,
+        warnings: Vec<String>,
+    ) -> Result<RuntimeSelection> {
+        let mut selection = self.install_release(release, RuntimeSource::ProjectLocal)?;
         if self.policy.version.is_none() {
             self.record_check(Some(release.version.clone()));
         }
@@ -665,8 +788,49 @@ impl<'a> RuntimeManager<'a> {
             let _ = CacheRecord {
                 checked_at: self.clock.now_unix(),
                 version,
+                failure_reason: None,
             }
             .write(dir);
+        }
+    }
+
+    fn record_failed_check(&self, error: &GearError) {
+        let message = error.to_string().to_ascii_lowercase();
+        let failure_reason = if message.contains("rate limit") || message.contains("throttled") {
+            "rate_limited"
+        } else {
+            "failed"
+        };
+        if let Some(dir) = &self.cache_dir {
+            let _ = CacheRecord {
+                checked_at: self.clock.now_unix(),
+                version: None,
+                failure_reason: Some(failure_reason.to_string()),
+            }
+            .write(dir);
+        }
+    }
+
+    fn append_cached_check_warning(&self, warnings: &mut Vec<String>) {
+        let Some(dir) = &self.cache_dir else {
+            return;
+        };
+        let Some(record) = CacheRecord::read(dir) else {
+            return;
+        };
+        if record.is_due(self.clock.now_unix(), self.policy.check_interval_hours) {
+            return;
+        }
+        match record.failure_reason.as_deref() {
+            Some("rate_limited") => warnings.push(
+                "the last OpenCode update check was rate-limited and is cached until the check interval expires"
+                    .to_string(),
+            ),
+            Some("failed") => warnings.push(
+                "the last OpenCode update check failed and is cached until the check interval expires"
+                    .to_string(),
+            ),
+            _ => {}
         }
     }
 }
@@ -680,6 +844,16 @@ fn is_compatible(version: &Option<Version>) -> bool {
         .as_ref()
         .map(|version| *version >= policy::min_opencode_version())
         .unwrap_or(false)
+}
+
+/// Keep the system runtime as selected, replacing only the warnings.
+fn keep_system(selection: RuntimeSelection, warnings: Vec<String>) -> RuntimeSelection {
+    RuntimeSelection {
+        source: RuntimeSource::System,
+        path: selection.path,
+        version: selection.version,
+        warnings,
+    }
 }
 
 fn describe_version(version: &Option<Version>) -> String {

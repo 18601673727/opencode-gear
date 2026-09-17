@@ -5,6 +5,7 @@
 //! role maps to a model key.
 
 use crate::error::{GearError, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub fn providers(data: &Value) -> Option<&Map<String, Value>> {
@@ -78,6 +79,125 @@ pub fn lead_agent_id(level: &str) -> String {
 
 pub fn consumer_agent_id(role: &str) -> String {
     format!("{}{role}", crate::defaults::CONSUMER_AGENT_PREFIX)
+}
+
+/// The exact primary Lead request contract selected by one OCG throttle.
+///
+/// This value is resolved in Rust and handed to the thin OpenCode plugin for
+/// enforcement at `chat.message`, after OpenCode has applied sticky UI/session
+/// selection but before the user message is saved or sent to a provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeadContract {
+    pub level: String,
+    pub agent: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub variant: String,
+}
+
+impl LeadContract {
+    pub fn full_model_id(&self) -> String {
+        format!("{}/{}", self.provider_id, self.model_id)
+    }
+}
+
+/// Resolve the runtime Lead contract for a throttle level.
+pub fn lead_contract(data: &Value, level: &str) -> Result<LeadContract> {
+    let spec = data
+        .get("throttle")
+        .and_then(|throttle| throttle.get("levels"))
+        .and_then(Value::as_object)
+        .and_then(|levels| levels.get(level))
+        .ok_or_else(|| GearError::config(format!("unknown throttle level: '{level}'")))?;
+    let model_key = spec
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| GearError::config(format!("throttle level '{level}' is missing 'model'")))?;
+    let entry = model_entry(data, model_key)?;
+    let provider_id = entry
+        .get("provider")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| GearError::config(format!("model '{model_key}' has no provider")))?;
+    let model_id = entry
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| GearError::config(format!("model '{model_key}' has no id")))?;
+    let variant = spec
+        .get("variant")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            GearError::config(format!(
+                "throttle level '{level}' must define a runtime variant"
+            ))
+        })?;
+    Ok(LeadContract {
+        level: level.to_string(),
+        agent: lead_agent_id(level),
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+        variant: variant.to_string(),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelRequirementKind {
+    Lead,
+    Consumer,
+}
+
+/// One provider/model that must be exposed by the active OpenCode runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRequirement {
+    pub label: String,
+    pub agent: String,
+    pub full_model_id: String,
+    pub variant: Option<String>,
+    pub kind: ModelRequirementKind,
+}
+
+/// Every configured Lead throttle and consumer role, in declaration order.
+/// Duplicate model IDs deliberately remain separate requirements because, for
+/// example, low and mid may share a model while requiring different variants.
+pub fn runtime_model_requirements(data: &Value) -> Result<Vec<ModelRequirement>> {
+    let mut requirements = Vec::new();
+    if let Some(levels) = data
+        .get("throttle")
+        .and_then(|throttle| throttle.get("levels"))
+        .and_then(Value::as_object)
+    {
+        for level in levels.keys() {
+            let contract = lead_contract(data, level)?;
+            let full_model_id = contract.full_model_id();
+            requirements.push(ModelRequirement {
+                label: contract.agent.clone(),
+                agent: contract.agent,
+                full_model_id,
+                variant: Some(contract.variant),
+                kind: ModelRequirementKind::Lead,
+            });
+        }
+    }
+    if let Some(roles) = role_specs(data) {
+        for (role, spec) in roles {
+            let key = spec.get("model").and_then(Value::as_str).ok_or_else(|| {
+                GearError::config(format!("routing role '{role}' is missing 'model'"))
+            })?;
+            requirements.push(ModelRequirement {
+                label: role.clone(),
+                agent: consumer_agent_id(role),
+                full_model_id: model_full_id(data, key)?.1,
+                variant: spec
+                    .get("variant")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                kind: ModelRequirementKind::Consumer,
+            });
+        }
+    }
+    Ok(requirements)
 }
 
 /// Resolve the active throttle level. CLI beats environment, which beats the

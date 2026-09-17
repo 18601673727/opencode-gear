@@ -9,6 +9,8 @@
 //! spawning anything.
 
 use crate::error::{GearError, Result};
+use crate::proxy::{ChildProxyEnv, StaticProxyProvider};
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -16,6 +18,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+const MAX_MODELS_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
 /// The `opencode` binary and how to run it.
 #[derive(Debug, Clone)]
@@ -37,14 +41,17 @@ impl ProcessRunner {
     /// `OPENCODE_CONFIG_CONTENT` carries the generated config;
     /// `OPENCODE_CONFIG` is removed so a stale file path cannot override it.
     /// `extra_env` carries additional variables (for example the orchestration
-    /// bridge's executable and project). On Unix this `exec`s so signals and
-    /// exit codes behave exactly like the historical shell wrapper.
+    /// bridge's executable and project); `proxy_env` is the resolved proxy
+    /// policy, which is applied last so it cannot be overridden. On Unix this
+    /// `exec`s so signals and exit codes behave exactly like the historical
+    /// shell wrapper.
     pub fn exec(
         &self,
         args: &[OsString],
         cwd: &Path,
         config_content: &str,
         extra_env: &[(OsString, OsString)],
+        proxy_env: &ChildProxyEnv,
     ) -> Result<()> {
         let mut command = Command::new(&self.program);
         command
@@ -55,6 +62,7 @@ impl ProcessRunner {
         for (key, value) in extra_env {
             command.env(key, value);
         }
+        proxy_env.apply(&mut command);
 
         #[cfg(unix)]
         {
@@ -79,6 +87,42 @@ impl ProcessRunner {
     }
 }
 
+/// Reads static macOS proxy configuration through `/usr/sbin/scutil --proxy`.
+///
+/// This is the only place the command is constructed, and it is compiled to
+/// `None` on every non-macOS platform. Tests inject
+/// [`crate::proxy::NoStaticProxy`] or a fixed provider instead.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemStaticProxy;
+
+impl StaticProxyProvider for SystemStaticProxy {
+    fn raw_scutil(&self) -> Option<String> {
+        read_scutil_proxy()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_scutil_proxy() -> Option<String> {
+    let output = Command::new("/usr/sbin/scutil")
+        .arg("--proxy")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_scutil_proxy() -> Option<String> {
+    None
+}
+
 /// Process discovery, version probing and OpenCode's own upgrade command.
 pub trait ProcessHost: Send + Sync {
     /// Resolve a bare program name against `PATH`.
@@ -87,11 +131,29 @@ pub trait ProcessHost: Send + Sync {
     /// Run `<program> --version` and return the trimmed output.
     fn version(&self, program: &Path) -> Result<String>;
 
-    /// Run OpenCode's own `<program> upgrade` and return its output.
+    /// Run `<program> models` with the exact generated configuration and
+    /// return its machine-oriented line output. This is the supported
+    /// OpenCode CLI surface used by runtime model preflight.
+    fn models(
+        &self,
+        program: &Path,
+        cwd: &Path,
+        config_content: &str,
+        proxy: &ChildProxyEnv,
+    ) -> Result<String>;
+
+    /// Run OpenCode's own `<program> upgrade [target]` and return its output.
     ///
     /// This is the only upgrade path for an existing system runtime; it must
-    /// never be replaced by a managed download.
-    fn upgrade(&self, program: &Path) -> Result<String>;
+    /// never be replaced by a managed download. `target` is the concrete
+    /// version OpenCode Gear resolved through its own transport, and `proxy`
+    /// is the resolved proxy policy for the child.
+    fn upgrade(
+        &self,
+        program: &Path,
+        target: Option<&Version>,
+        proxy: &ChildProxyEnv,
+    ) -> Result<String>;
 }
 
 /// The real host, backed by `PATH` and `std::process::Command`.
@@ -155,13 +217,83 @@ impl ProcessHost for SystemProcessHost {
         )))
     }
 
-    fn upgrade(&self, program: &Path) -> Result<String> {
-        let output = Command::new(program)
-            .arg("upgrade")
-            .output()
-            .map_err(|error| {
-                GearError::io(format!("cannot run {} upgrade", program.display()), error)
-            })?;
+    fn models(
+        &self,
+        program: &Path,
+        cwd: &Path,
+        config_content: &str,
+        proxy: &ChildProxyEnv,
+    ) -> Result<String> {
+        let mut command = Command::new(program);
+        command
+            .arg("models")
+            .current_dir(cwd)
+            .env("OPENCODE_CONFIG_CONTENT", config_content)
+            .env_remove("OPENCODE_CONFIG")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        proxy.apply(&mut command);
+        let mut child = command.spawn().map_err(|error| {
+            GearError::io(format!("cannot run {} models", program.display()), error)
+        })?;
+        let stdout_handle = child.stdout.take().map(|stdout| {
+            std::thread::spawn(move || read_drain_bounded(stdout, MAX_MODELS_OUTPUT_BYTES))
+        });
+        let stderr_handle = child.stderr.take().map(|stderr| {
+            std::thread::spawn(move || read_drain_bounded(stderr, MAX_MODELS_OUTPUT_BYTES))
+        });
+        let status = child.wait().map_err(|error| {
+            GearError::io(
+                format!("cannot wait for {} models", program.display()),
+                error,
+            )
+        })?;
+        let (stdout, stdout_truncated) = stdout_handle
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default();
+        let (_, stderr_truncated) = stderr_handle
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default();
+        if stdout_truncated || stderr_truncated {
+            return Err(GearError::config(format!(
+                "{} models exceeded the {} byte output limit",
+                program.display(),
+                MAX_MODELS_OUTPUT_BYTES
+            )));
+        }
+        if !status.success() {
+            // OpenCode/provider diagnostics can contain arbitrary third-party
+            // text. Keep this probe failure actionable without echoing it.
+            return Err(GearError::config(format!(
+                "{} models failed with {}",
+                program.display(),
+                status
+            )));
+        }
+        String::from_utf8(stdout).map_err(|_| {
+            GearError::config(format!(
+                "{} models produced non-UTF-8 output",
+                program.display()
+            ))
+        })
+    }
+
+    fn upgrade(
+        &self,
+        program: &Path,
+        target: Option<&Version>,
+        proxy: &ChildProxyEnv,
+    ) -> Result<String> {
+        let mut command = Command::new(program);
+        command.arg("upgrade");
+        if let Some(version) = target {
+            command.arg(version.to_string());
+        }
+        proxy.apply(&mut command);
+        let output = command.output().map_err(|error| {
+            GearError::io(format!("cannot run {} upgrade", program.display()), error)
+        })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -193,6 +325,14 @@ pub enum FakeUpgrade {
     Failure(String),
 }
 
+/// The outcome configured for a fake `models` call.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub enum FakeModels {
+    Success(String),
+    Failure(String),
+}
+
 /// A fake host for tests: a fixed `PATH` map, canned version strings, canned
 /// `upgrade` outcomes and call counters.
 #[doc(hidden)]
@@ -202,8 +342,11 @@ pub struct FakeProcessHost {
     versions: Arc<Mutex<HashMap<PathBuf, String>>>,
     default_version: Option<String>,
     upgrades: Arc<Mutex<HashMap<PathBuf, FakeUpgrade>>>,
+    models: Arc<Mutex<HashMap<PathBuf, FakeModels>>>,
     upgrade_calls: Arc<Mutex<Vec<PathBuf>>>,
+    upgrade_targets: Arc<Mutex<Vec<Option<Version>>>>,
     version_calls: Arc<Mutex<Vec<PathBuf>>>,
+    model_calls: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl FakeProcessHost {
@@ -248,14 +391,42 @@ impl FakeProcessHost {
         self
     }
 
+    pub fn with_models_success(self, path: impl Into<PathBuf>, output: &str) -> Self {
+        self.models
+            .lock()
+            .expect("fake models")
+            .insert(path.into(), FakeModels::Success(output.to_string()));
+        self
+    }
+
+    pub fn with_models_failure(self, path: impl Into<PathBuf>, message: &str) -> Self {
+        self.models
+            .lock()
+            .expect("fake models")
+            .insert(path.into(), FakeModels::Failure(message.to_string()));
+        self
+    }
+
     /// Paths for which `upgrade` was invoked, in order.
     pub fn upgrade_calls(&self) -> Vec<PathBuf> {
         self.upgrade_calls.lock().expect("upgrade calls").clone()
     }
 
+    /// Requested target versions for each `upgrade` call, in order.
+    pub fn upgrade_targets(&self) -> Vec<Option<Version>> {
+        self.upgrade_targets
+            .lock()
+            .expect("upgrade targets")
+            .clone()
+    }
+
     /// Paths for which `--version` was invoked, in order.
     pub fn version_calls(&self) -> Vec<PathBuf> {
         self.version_calls.lock().expect("version calls").clone()
+    }
+
+    pub fn model_calls(&self) -> Vec<PathBuf> {
+        self.model_calls.lock().expect("model calls").clone()
     }
 }
 
@@ -282,11 +453,47 @@ impl ProcessHost for FakeProcessHost {
         })
     }
 
-    fn upgrade(&self, program: &Path) -> Result<String> {
+    fn models(
+        &self,
+        program: &Path,
+        _cwd: &Path,
+        _config_content: &str,
+        _proxy: &ChildProxyEnv,
+    ) -> Result<String> {
+        self.model_calls
+            .lock()
+            .expect("model calls")
+            .push(program.to_path_buf());
+        match self
+            .models
+            .lock()
+            .expect("fake models")
+            .get(program)
+            .cloned()
+        {
+            Some(FakeModels::Success(output)) => Ok(output),
+            Some(FakeModels::Failure(message)) => Err(GearError::config(message)),
+            None => Err(GearError::config(format!(
+                "{} models is not configured in this fake",
+                program.display()
+            ))),
+        }
+    }
+
+    fn upgrade(
+        &self,
+        program: &Path,
+        target: Option<&Version>,
+        _proxy: &ChildProxyEnv,
+    ) -> Result<String> {
         self.upgrade_calls
             .lock()
             .expect("upgrade calls")
             .push(program.to_path_buf());
+        self.upgrade_targets
+            .lock()
+            .expect("upgrade targets")
+            .push(target.cloned());
         let outcome = self
             .upgrades
             .lock()
@@ -855,9 +1062,21 @@ mod tests {
             .with_default_version("1.18.20")
             .with_upgrade_success("/opt/opencode", Some("1.18.31"));
         assert_eq!(host.version(Path::new("/opt/opencode")).unwrap(), "1.18.20");
-        host.upgrade(Path::new("/opt/opencode")).unwrap();
+        host.upgrade(
+            Path::new("/opt/opencode"),
+            Some(&Version::new(1, 18, 31)),
+            &ChildProxyEnv::default(),
+        )
+        .unwrap();
         assert_eq!(host.version(Path::new("/opt/opencode")).unwrap(), "1.18.31");
         assert_eq!(host.upgrade_calls(), vec![PathBuf::from("/opt/opencode")]);
+        assert_eq!(host.upgrade_targets(), vec![Some(Version::new(1, 18, 31))]);
+    }
+
+    #[test]
+    fn system_static_proxy_is_absent_off_macos() {
+        #[cfg(not(target_os = "macos"))]
+        assert!(SystemStaticProxy.raw_scutil().is_none());
     }
 
     #[cfg(unix)]

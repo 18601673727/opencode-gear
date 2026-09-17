@@ -85,6 +85,10 @@ fn lead_tiers_map_to_the_expected_models() {
             .1,
         "openai/gpt-6-astra"
     );
+    assert_eq!(
+        effective.data["throttle"]["levels"]["high"]["variant"],
+        json!("high")
+    );
 }
 
 #[test]
