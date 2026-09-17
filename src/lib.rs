@@ -11,6 +11,7 @@ pub mod build;
 pub mod cli;
 pub mod clock;
 pub mod config;
+pub mod context;
 pub mod defaults;
 pub mod error;
 pub mod http;

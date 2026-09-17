@@ -123,6 +123,67 @@ Invariants:
 The update checks and self-update are the only network paths, and both are
 bypassed by `ocg version` and `ocg doctor`, which are strictly read-only.
 
+## Repository context
+
+The context engine is the optional, local half of the runtime layer. It answers
+"what should the agent look at?" without a model:
+
+```text
+repo map        dirs, source/test roots, languages, manifests, entrypoints,
+                migrations, git state, per-file metadata
+incremental     .opencode-gear/index/context-index.json
+symbol index    Rust / TypeScript / JavaScript / Python symbols + line ranges
+git diff        status entries (never omitted) + bounded hunks + changed symbols
+ranking         integer, transparent task/path/symbol/import/changed/test scores
+cache           .opencode-gear/cache/context/*.json, dependency-fingerprinted
+capsules        versioned serde TaskCapsule for a later session
+```
+
+Invariants worth preserving:
+
+- **Local and deterministic.** No network, no telemetry, no embeddings. Ordering
+  is explicit (path, line, kind) and ranking uses integer scores, so the same
+  tree always yields the same plan.
+- **Sensitive content never enters an artifact.** `.env`, key material,
+  `id_rsa`/`id_ed25519`, `credentials*`, `secrets*`, `auth*`, `token*` and known
+  OpenCode credential locations are classified by path and never read, sliced or
+  cached. When in doubt the engine excludes.
+- **Git is optional.** Without git, fingerprints fall back to SHA-256 of file
+  content and the diff is empty; nothing errors. With git, clean tracked files
+  use blob ids so an unchanged file is never re-read or re-parsed.
+- **Changed paths are never dropped.** The diff capture is bounded before it can
+  allocate an arbitrarily large stdout (spawn + capped read + kill), and hunk
+  bodies are separately bounded; an oversize diff adds a structural summary and
+  keeps the full path list. Deleted paths are reported as unsourced and their
+  symbols are never guessed.
+- **The file walk is capped.** `context.maxRepositoryFiles` stops the
+  deterministic walk; the repo map, index and plan are marked truncated and
+  carry a note, while git status is collected separately so changed paths stay
+  complete. A capped map is never presented as complete.
+- **Git state is part of cache identity.** The cache key covers HEAD, branch and
+  the complete sorted status entries, so a commit or status change can never
+  serve a stale plan. Fine-grained source fingerprints still invalidate only
+  entries that depend on the changed files.
+- **Cached content is re-verified, never trusted.** Before a cached plan is
+  returned, every slice is compared with the current non-sensitive source lines,
+  selected paths must still be non-sensitive, and dependency fingerprints and
+  git identity must match. A poisoned entry is discarded.
+- **Fail-soft.** A failed cache write only warns and keeps the computed plan;
+  the plan's `notes` carry the reason.
+- **Explicit production only.** An ordinary `ocg` / `ocg run` launch does not
+  prepare context, because the plan is not injected into OpenCode. Context is
+  produced by `ocg context` / `ocg context symbols` or the library API, and the
+  Lead prompt points the agent at those commands. `context.enabled: false` makes
+  `ocg context` a no-op that writes nothing.
+- **No invented OpenCode mechanism.** The plan is exposed through `ocg context`
+  and the library; it is not smuggled into the generated OpenCode config, which
+  has no generic context-blob key. Only mechanisms documented by OpenCode are
+  used.
+
+`ocg cache clean` removes the cache subtree only; `runtime/` and `index/` are
+never touched by it. Creating the index or cache adds `.opencode-gear/` to the
+project `.gitignore` once via the runtime's idempotent helper.
+
 ## Why one agent per throttle level
 
 OpenCode binds one model per agent, and the Task tool has no per-call model

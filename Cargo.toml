@@ -19,6 +19,7 @@ name = "opencode_gear"
 path = "src/lib.rs"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 semver = "1"
 directories = "6"

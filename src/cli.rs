@@ -8,6 +8,7 @@
 use crate::build;
 use crate::clock::{Clock, SystemClock};
 use crate::config;
+use crate::context::{self, ContextConfig, ContextEngine};
 use crate::defaults::{load_defaults, GearSource};
 use crate::error::GearError;
 use crate::http::{HttpTransport, NoHttp, ReqwestHttp};
@@ -15,7 +16,7 @@ use crate::json;
 use crate::model;
 use crate::observability;
 use crate::platform::Platform;
-use crate::process::{ProcessHost, ProcessRunner, SystemProcessHost};
+use crate::process::{ProcessHost, ProcessRunner, SystemGitHost, SystemProcessHost};
 use crate::report;
 use crate::runtime::policy::RuntimePolicy;
 use crate::runtime::{self, install::Layout};
@@ -109,6 +110,8 @@ pub enum Command {
     Layers,
     Build,
     Trace(Option<String>),
+    Context(Vec<OsString>),
+    Cache(Option<String>),
     Version,
     Doctor,
     Upgrade,
@@ -312,6 +315,11 @@ where
         Some("build") => Command::Build,
         Some("dry-run") => Command::Build,
         Some("trace") => Command::Trace(event),
+        Some("context") => Command::Context(rest),
+        Some("cache") => Command::Cache(
+            rest.first()
+                .map(|value| value.to_string_lossy().into_owned()),
+        ),
         Some("version") => Command::Version,
         Some("doctor") => Command::Doctor,
         Some("upgrade") => Command::Upgrade,
@@ -350,6 +358,9 @@ Commands:
   validate              validate the merged configuration
   layers                show configuration layers and trace state
   build                 print the resolved OpenCode config
+  context <task...>     build a deterministic local repository context plan
+  context symbols <q>   find indexed symbols by name (diagnostic)
+  cache clean|stats     manage the local context cache (never the runtime)
   version               report Gear, platform and the resolved OpenCode runtime
   doctor                check platform, config, runtime and cache (read-only)
   upgrade               self-update Gear, then maintain the active OpenCode
@@ -544,6 +555,8 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
             Ok(0)
         }
         Command::Doctor => doctor_command(&effective, &cwd, &env),
+        Command::Context(args) => context_command(&effective, &cwd, args, cli.pretty),
+        Command::Cache(action) => cache_command(&effective, &cwd, action.as_deref()),
         Command::Upgrade => upgrade_command(&effective, &cwd, &env),
     }
 }
@@ -944,6 +957,123 @@ fn is_writable_dir(path: &Path) -> bool {
                 _ => return false,
             },
         }
+    }
+}
+
+/// `ocg context <task...>` and `ocg context symbols <query>`.
+fn context_command(
+    effective: &config::Effective,
+    project_root: &Path,
+    args: &[OsString],
+    pretty: bool,
+) -> std::result::Result<i32, Failure> {
+    let config = ContextConfig::from_config(&effective.data).map_err(Failure::Gear)?;
+    if !config.enabled {
+        // Disabled means disabled: do not read, index or cache anything.
+        println!(
+            "context engine is disabled (context.enabled=false); no index or cache work was performed"
+        );
+        return Ok(0);
+    }
+    let git = SystemGitHost;
+    let clock = SystemClock;
+    let engine = ContextEngine::new(project_root, config, &git, &clock);
+    let words: Vec<String> = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+
+    if words.first().map(String::as_str) == Some("symbols") {
+        let query = words[1..].join(" ").trim().to_string();
+        if query.is_empty() {
+            return Err(usage_failure("context symbols needs a query"));
+        }
+        let hits = engine.search_symbols(&query, 100).map_err(Failure::Gear)?;
+        let definition = engine.definition(&query).map_err(Failure::Gear)?;
+        let payload = json!({
+            "query": query,
+            "definition": definition,
+            "symbols": hits,
+        });
+        print_config(&payload, pretty)?;
+        return Ok(0);
+    }
+
+    let task = words.join(" ").trim().to_string();
+    if task.is_empty() {
+        return Err(usage_failure(
+            "context needs a task description (for example: ocg context fix the parser)",
+        ));
+    }
+    let outcome = engine.plan(&task, None).map_err(Failure::Gear)?;
+    for warning in &outcome.warnings {
+        eprintln!("ocg: warning: {warning}");
+    }
+    if pretty {
+        let value = serde_json::to_value(&outcome.plan).map_err(|error| {
+            Failure::Gear(GearError::config(format!(
+                "cannot serialize the context plan: {error}"
+            )))
+        })?;
+        print_config(&value, true)?;
+    } else {
+        println!("{}", context::plan_text(&outcome.plan));
+    }
+    Ok(0)
+}
+
+/// `ocg cache clean|stats`. Never touches the managed runtime.
+fn cache_command(
+    effective: &config::Effective,
+    project_root: &Path,
+    action: Option<&str>,
+) -> std::result::Result<i32, Failure> {
+    let config = ContextConfig::from_config(&effective.data).map_err(Failure::Gear)?;
+    let git = SystemGitHost;
+    let clock = SystemClock;
+    let engine = ContextEngine::new(project_root, config, &git, &clock);
+    match action {
+        Some("clean") => {
+            let report = engine.cache_clean().map_err(Failure::Gear)?;
+            println!(
+                "removed {} context cache entr{} ({} bytes) from {}",
+                report.removed_entries,
+                if report.removed_entries == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                report.removed_bytes,
+                report.dir
+            );
+            Ok(0)
+        }
+        Some("stats") | None => {
+            let stats = engine.cache_stats();
+            println!("context cache: {}", stats.dir);
+            println!(
+                "  entries: {}  bytes: {}  corrupt: {}",
+                stats.entries, stats.bytes, stats.corrupt
+            );
+            match (stats.oldest, stats.newest) {
+                (Some(oldest), Some(newest)) => {
+                    println!("  oldest: {oldest}  newest: {newest}");
+                }
+                _ => println!("  oldest: -  newest: -"),
+            }
+            let index = engine.load_index();
+            match index {
+                Some(index) => println!(
+                    "index: {} indexed files, {} symbols",
+                    index.metrics.files, index.metrics.symbols
+                ),
+                None => println!("index: not built"),
+            }
+            Ok(0)
+        }
+        Some(other) => Err(usage_failure(format!(
+            "unknown cache action: {other} (try 'ocg cache stats' or 'ocg cache clean')"
+        ))),
     }
 }
 

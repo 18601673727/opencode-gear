@@ -300,6 +300,251 @@ impl ProcessHost for FakeProcessHost {
     }
 }
 
+/// A captured `git` invocation.
+///
+/// A non-zero exit status is *data*, not an error: "this is not a git
+/// repository" is a normal answer the context engine must handle gracefully.
+/// Only a failure to spawn `git` at all is an [`Err`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitOutput {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+    /// Set when stdout or stderr was capped by [`GitHost::run_bounded`].
+    pub truncated: bool,
+}
+
+/// The only place the context engine reaches Git. Keeping it here preserves the
+/// "every child process goes through one auditable module" invariant.
+pub trait GitHost: Send + Sync {
+    /// Run `git` with `args` in `cwd` and capture its output.
+    fn run(&self, args: &[&str], cwd: &Path) -> Result<GitOutput>;
+
+    /// Run `git` and capture at most `max_bytes` of stdout, killing the child if
+    /// it keeps producing output. The default implementation truncates the
+    /// result of [`GitHost::run`] on a UTF-8 boundary, which is deterministic
+    /// and sufficient for fakes; real hosts should override it.
+    fn run_bounded(&self, args: &[&str], cwd: &Path, max_bytes: usize) -> Result<GitOutput> {
+        let mut output = self.run(args, cwd)?;
+        if output.stdout.len() > max_bytes {
+            let mut end = max_bytes;
+            while end > 0 && !output.stdout.is_char_boundary(end) {
+                end -= 1;
+            }
+            output.stdout.truncate(end);
+            output.truncated = true;
+        }
+        Ok(output)
+    }
+}
+
+/// Read at most `max` bytes, stopping (and signalling truncation) as soon as
+/// the cap is reached. Used for stdout, where the caller kills the child.
+fn read_bounded<R: std::io::Read>(mut reader: R, max: usize) -> (Vec<u8>, bool) {
+    let mut out = Vec::new();
+    let mut buffer = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                let remaining = max.saturating_sub(out.len());
+                if remaining == 0 {
+                    truncated = true;
+                    break;
+                }
+                let take = read.min(remaining);
+                out.extend_from_slice(&buffer[..take]);
+                if take < read {
+                    truncated = true;
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    (out, truncated)
+}
+
+/// Drain a stream to EOF while retaining at most `max` bytes. Used for stderr,
+/// so a full pipe can never deadlock the child.
+fn read_drain_bounded<R: std::io::Read>(mut reader: R, max: usize) -> (Vec<u8>, bool) {
+    let mut out = Vec::new();
+    let mut buffer = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                let remaining = max.saturating_sub(out.len());
+                if remaining == 0 {
+                    truncated = true;
+                    continue;
+                }
+                let take = read.min(remaining);
+                out.extend_from_slice(&buffer[..take]);
+                if take < read {
+                    truncated = true;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    (out, truncated)
+}
+
+/// The real Git host, backed by `std::process::Command`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemGitHost;
+
+impl GitHost for SystemGitHost {
+    fn run(&self, args: &[&str], cwd: &Path) -> Result<GitOutput> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .map_err(|error| GearError::io("cannot run git", error))?;
+        Ok(GitOutput {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            truncated: false,
+        })
+    }
+
+    fn run_bounded(&self, args: &[&str], cwd: &Path, max_bytes: usize) -> Result<GitOutput> {
+        let mut child = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| GearError::io("cannot run git", error))?;
+
+        // Drain stderr concurrently, retaining a bounded prefix.
+        let stderr_handle = child
+            .stderr
+            .take()
+            .map(|stderr| std::thread::spawn(move || read_drain_bounded(stderr, max_bytes)));
+
+        let (stdout_bytes, stdout_truncated) = match child.stdout.take() {
+            Some(stdout) => read_bounded(stdout, max_bytes),
+            None => (Vec::new(), false),
+        };
+        // Stop a runaway producer before waiting on it.
+        if stdout_truncated {
+            let _ = child.kill();
+        }
+        let status = match child.wait() {
+            Ok(status) => status,
+            Err(error) => {
+                if let Some(handle) = stderr_handle {
+                    let _ = handle.join();
+                }
+                return Err(GearError::io("cannot wait for git", error));
+            }
+        };
+        let (stderr_bytes, stderr_truncated) = match stderr_handle {
+            Some(handle) => handle.join().unwrap_or_default(),
+            None => (Vec::new(), false),
+        };
+        Ok(GitOutput {
+            success: status.success(),
+            stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+            truncated: stdout_truncated || stderr_truncated,
+        })
+    }
+}
+
+/// One exact-argument fake git response.
+#[doc(hidden)]
+pub type FakeGitResponse = (Vec<String>, GitOutput);
+
+/// A fake Git host for tests: exact-argument responses, with a default
+/// "not a repository" answer for unmatched calls.
+#[doc(hidden)]
+#[derive(Debug, Default, Clone)]
+pub struct FakeGitHost {
+    responses: Arc<Mutex<Vec<FakeGitResponse>>>,
+    calls: Arc<Mutex<Vec<Vec<String>>>>,
+    default: Option<GitOutput>,
+}
+
+impl FakeGitHost {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register the output for an exact argument vector (ignoring `cwd`).
+    pub fn with_response(self, args: &[&str], output: GitOutput) -> Self {
+        self.responses
+            .lock()
+            .expect("fake git responses")
+            .push((args.iter().map(|arg| arg.to_string()).collect(), output));
+        self
+    }
+
+    /// Convenience: a successful response with the given stdout.
+    pub fn with_stdout(self, args: &[&str], stdout: &str) -> Self {
+        self.with_response(
+            args,
+            GitOutput {
+                success: true,
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+                truncated: false,
+            },
+        )
+    }
+
+    /// Convenience: a failed response with the given stderr.
+    pub fn with_failure(self, args: &[&str], stderr: &str) -> Self {
+        self.with_response(
+            args,
+            GitOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+                truncated: false,
+            },
+        )
+    }
+
+    /// The output returned for any unmatched call. Defaults to "not a repo".
+    pub fn with_default(mut self, output: GitOutput) -> Self {
+        self.default = Some(output);
+        self
+    }
+
+    /// Every argument vector this fake handled, in call order.
+    pub fn calls(&self) -> Vec<Vec<String>> {
+        self.calls.lock().expect("fake git calls").clone()
+    }
+}
+
+impl GitHost for FakeGitHost {
+    fn run(&self, args: &[&str], _cwd: &Path) -> Result<GitOutput> {
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        self.calls
+            .lock()
+            .expect("fake git calls")
+            .push(args.clone());
+        let responses = self.responses.lock().expect("fake git responses");
+        if let Some((_, output)) = responses.iter().find(|(expected, _)| *expected == args) {
+            return Ok(output.clone());
+        }
+        drop(responses);
+        Ok(self.default.clone().unwrap_or(GitOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "fatal: not a git repository".to_string(),
+            truncated: false,
+        }))
+    }
+}
+
 /// Whether a path points at an executable regular file.
 pub fn is_executable(path: &Path) -> bool {
     if !path.is_file() {
@@ -357,5 +602,33 @@ mod tests {
         std::fs::write(&program, "#!/bin/sh\necho 9.9.9\nexit 1\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(SystemProcessHost.version(&program).is_err());
+    }
+
+    #[test]
+    fn bounded_reads_stop_and_report_truncation() {
+        let (out, truncated) = read_bounded(std::io::Cursor::new(b"abcdef".to_vec()), 3);
+        assert_eq!(out, b"abc");
+        assert!(truncated);
+
+        let (out, truncated) = read_bounded(std::io::Cursor::new(b"ab".to_vec()), 5);
+        assert_eq!(out, b"ab");
+        assert!(!truncated);
+
+        // The drain variant keeps reading to EOF but retains only the prefix.
+        let (out, truncated) = read_drain_bounded(std::io::Cursor::new(b"abcdef".to_vec()), 3);
+        assert_eq!(out, b"abc");
+        assert!(truncated);
+
+        let (out, truncated) = read_drain_bounded(std::io::Cursor::new(b"ab".to_vec()), 5);
+        assert_eq!(out, b"ab");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn fake_git_run_bounded_truncates_deterministically() {
+        let fake = FakeGitHost::new().with_stdout(&["big"], "0123456789");
+        let output = fake.run_bounded(&["big"], Path::new("."), 4).unwrap();
+        assert_eq!(output.stdout, "0123");
+        assert!(output.truncated);
     }
 }

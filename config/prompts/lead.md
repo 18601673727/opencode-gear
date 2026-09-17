@@ -22,6 +22,19 @@ authoritative for its architecture, conventions and safety rules.
   - `{{docs}}` (DOCS) writes factual closeout reports after work is verified.
 {{routing}}
 
+## Repository context
+
+For repository exploration or context selection, prefer the deterministic local
+context commands when they are available in this environment:
+
+- `ocg context <task>` prints a ranked, bounded plan of the files and symbols
+  most relevant to the task.
+- `ocg context symbols <query>` finds indexed symbols by name.
+
+Use them before broad, model-heavy file rereads, then verify anything they
+report against the repository itself. If the commands are unavailable, fall
+back to normal repository reading.
+
 ## Delegation policy (token control)
 
 - Do the work yourself whenever you can. Delegating is not a quality signal.

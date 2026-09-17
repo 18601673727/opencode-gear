@@ -14,6 +14,7 @@ pub fn validate(effective: &Effective) -> Vec<String> {
     let mut errors = Vec::new();
 
     errors.extend(crate::runtime::policy::RuntimePolicy::validate(data));
+    errors.extend(crate::context::ContextConfig::validate(data));
 
     let empty = Map::new();
     let levels = data

@@ -77,6 +77,7 @@ fn all_json_files_parse() {
 
 #[test]
 fn no_private_project_tokens() {
+    let forward_token = concat!("forward_", "to_gpt");
     let tokens = [
         concat!("Zh", "uju"),
         concat!("Route", "Lace"),
@@ -88,11 +89,21 @@ fn no_private_project_tokens() {
         concat!("zj-", "explorer"),
         concat!("zj-", "verifier"),
         concat!("zj-", "docs"),
-        concat!("forward_", "to_gpt"),
+        forward_token,
     ];
     for path in text_files() {
         let text = fs::read_to_string(&path).unwrap_or_default();
+        // The tracked `.gitignore` must be allowed to name the mandated buffer
+        // file. Every other protected token, and every production source or
+        // doc, is still rejected.
+        let is_gitignore = path
+            .file_name()
+            .map(|name| name == ".gitignore")
+            .unwrap_or(false);
         for token in tokens {
+            if is_gitignore && token == forward_token {
+                continue;
+            }
             assert!(
                 !text.contains(token),
                 "{} contains private token {token}",

@@ -140,7 +140,16 @@ pub fn load_defaults(source: &GearSource) -> Result<Value> {
         "_prompt_defaults": prompt_defaults,
         "observability": {"enabled": false, "path": Value::Null},
         "runtime": default_runtime(),
+        "context": default_context(),
     }))
+}
+
+/// The built-in context engine policy.
+///
+/// Kept in code (like `observability` and `runtime`) so a disk gear home keeps
+/// working without a new required file. All context fields are optional.
+pub fn default_context() -> Value {
+    serde_json::to_value(crate::context::ContextConfig::default()).unwrap_or_else(|_| json!({}))
 }
 
 /// The built-in managed-runtime policy.

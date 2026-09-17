@@ -8,6 +8,9 @@
 .opencode-gear.json
 *.events.jsonl
 
+# Conversation buffer for an external assistant (never committed)
+forward_to_gpt.md
+
 # Editors / OS
 .DS_Store
 .idea/

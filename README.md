@@ -51,6 +51,7 @@ specialists that are good at their one job and cheap enough to use often.
 - [Isolation and permissions](#isolation-and-permissions)
 - [Security and secrets](#security-and-secrets)
 - [Observability (optional)](#observability-optional)
+- [Repository context (optional)](#repository-context-optional)
 - [Troubleshooting](#troubleshooting)
 - [Repository layout](#repository-layout)
 - [Tests](#tests)
@@ -547,6 +548,9 @@ throttle [level]    print, or persist, the default throttle level
 validate            validate the merged configuration
 layers              show config layers and trace state
 build               print the resolved OpenCode config
+context <task...>   deterministic local repository context plan
+context symbols <q> find indexed symbols by name (diagnostic)
+cache clean|stats   manage the local context cache (never the runtime)
 version             Gear, platform and the resolved OpenCode runtime
 doctor              read-only platform/config/runtime/cache check
 upgrade             self-update Gear, then maintain the active OpenCode
@@ -634,6 +638,57 @@ local file — never to a remote service:
 - Enable with `"observability": {"enabled": true, "path": "~/..."}`, or point
   `OPENCODE_GEAR_TRACE` at a file. Delete the file to delete the history.
 
+## Repository context (optional)
+
+`ocg` can build a deterministic, local description of a project: a repository
+map, an incremental symbol index, a bounded git diff summary and a ranked
+context plan. It is **local only** — no network, no telemetry, no embeddings
+and no paid API.
+
+```bash
+ocg context fix the failing parser        # human-readable plan
+ocg context --pretty summarise the cache   # full plan as JSON
+ocg context symbols parse                  # symbol/definition diagnostic
+ocg cache stats                           # cache + index status
+ocg cache clean                           # clear the context cache only
+```
+
+**Integration boundary.** Context is produced only when you ask for it, through
+`ocg context` or the library API. An ordinary `ocg` / `ocg run` launch does
+**not** build an index or write context state: the plan is not injected into
+OpenCode because OpenCode's public config contract has no generic "context
+blob" key, and `ocg` does not invent one. The shipped Lead prompt instead tells
+the agent to prefer the deterministic `ocg context <task>` /
+`ocg context symbols <query>` commands when it needs repository context. The
+subsystem fails soft: a failed cache write or a bounded git capture only
+produces a warning, never a lost plan.
+
+Set `"context": {"enabled": false}` to disable it entirely. Then `ocg context`
+prints an informational message, returns success, and never reads, indexes or
+caches anything.
+
+The walker is bounded: `context.maxRepositoryFiles` (default `100000`, max
+`5000000`) is a hard cap on files scanned and indexed. When it is reached, the
+repo map, index and plan are marked truncated with an honest note instead of
+claiming a complete map; git status is collected separately, so `changed_paths`
+stays complete.
+
+State layout, alongside the managed runtime:
+
+```text
+<project>/.opencode-gear/
+  runtime/opencode/...        managed OpenCode (untouched by cache clean)
+  index/context-index.json    inspectable, incrementally updated symbol index
+  cache/context/*.json        fine-grained plan cache
+```
+
+Sensitive files (`.env`, `.envrc`, key material, `id_rsa`/`id_ed25519`,
+`credentials*`, `secrets*`, `auth*`, `token*`, known OpenCode credential
+locations, ...) are never read, parsed, sliced or cached — only their path
+metadata is indexed. `ocg cache clean` removes `cache/` only, never the
+runtime or the index. Creating the index or cache adds `.opencode-gear/` to the
+project `.gitignore` once, using the same idempotent helper the runtime uses.
+
 ## Troubleshooting
 
 **`ocg: configuration is invalid`** — run `ocg validate`; the builder refuses to
@@ -700,6 +755,8 @@ opencode-gear/
   src/platform.rs        OS/arch normalization and release asset mapping
   src/clock.rs           injectable time source
   src/http.rs            blocking HTTP transport abstraction + reqwest impl
+  src/context/           deterministic local context engine (repo map, index,
+                         symbols, git diff, ranking, cache, capsules)
   src/runtime/           managed OpenCode runtime (policy, resolve, install,
                          cache, release, archive, self-update)
   install.sh             portable POSIX installer
@@ -732,6 +789,14 @@ missing-provider and missing-model behaviour, variant validation, override
 precedence, arbitrary roles, prompt appending, isolation rules, the opt-in
 trace, embedded-vs-disk parity, and repository hygiene (no private tokens, no
 credential shapes, no absolute home paths).
+
+The context suite is deterministic and offline. It covers polyglot repo maps,
+build-directory and binary/oversized exclusion, incremental index reuse and
+update, Rust/TypeScript/JavaScript/Python symbol extraction, git
+modified/added/deleted/renamed diffs (skipped when `git` is unavailable),
+bounded hunks, ranking limits and stable ordering, fine-grained cache
+invalidation, corrupt-cache recovery, capsule round-tripping and sensitive
+content exclusion.
 
 The runtime suite uses an in-memory HTTP transport, a fake process host, a
 fixed clock and temporary directories to cover platform mappings, the four

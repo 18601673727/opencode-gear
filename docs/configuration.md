@@ -35,6 +35,7 @@ An override file uses the same top-level keys as the gear's `config/` files:
 | `prompts` | `config/prompts/` | role -> path or `{"text": "..."}` |
 | `observability` | — | `{ "enabled": bool, "path": "..." }` |
 | `runtime` | — | managed OpenCode runtime policy (see below) |
+| `context` | — | local context engine policy (see below) |
 | `opencode` | — | raw OpenCode config merged into the result last |
 
 Example:
@@ -213,6 +214,62 @@ The update cache lives in the platform cache directory
 macOS). Both successful and failed checks are recorded, so a runtime that just
 failed to upgrade is not retried within the interval.
 
+## Context policy
+
+The optional local context engine is configured by the top-level `context`
+object. Every field is optional and the defaults are conservative; no user
+configuration is required.
+
+```json
+{
+  "context": {
+    "enabled": true,
+    "cache": true,
+    "maxFileBytes": 1000000,
+    "maxRepositoryFiles": 100000,
+    "maxCandidates": 200,
+    "maxFiles": 24,
+    "maxSlices": 48,
+    "maxBytes": 262144,
+    "maxDiffBytes": 131072,
+    "maxHunks": 40,
+    "maxSymbolsPerFile": 200,
+    "includeUntracked": true
+  }
+}
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Allow context production. When false, `ocg context` prints an informational message, returns success and reads, indexes or caches nothing. |
+| `cache` | `true` | Read and write `<project>/.opencode-gear/cache/`. |
+| `maxFileBytes` | `1000000` | Files larger than this are indexed by metadata only. |
+| `maxRepositoryFiles` | `100000` | Hard cap on files scanned/indexed. Beyond it the repo map, index and plan are marked truncated; git status is collected separately so changed paths stay complete. |
+| `maxCandidates` | `200` | Maximum ranked candidates in a plan. |
+| `maxFiles` | `24` | Maximum files selected into a plan. |
+| `maxSlices` | `48` | Maximum content slices in a plan. |
+| `maxBytes` | `262144` | Maximum total slice bytes. |
+| `maxDiffBytes` | `131072` | Maximum retained git diff text, and the cap on the git stdout capture. |
+| `maxHunks` | `40` | Maximum retained diff hunks; changed paths are always listed. |
+| `maxSymbolsPerFile` | `200` | Maximum extracted symbols per file. |
+| `includeUntracked` | `true` | Treat untracked files as added in the diff summary. |
+
+`maxFileBytes` must be positive and at most 64 MiB; `maxRepositoryFiles` must be
+at least 1 and at most 5,000,000; every other numeric limit must be positive.
+`ocg validate` reports violations. The engine never reads, slices or caches
+sensitive files (`.env`, `.envrc`, key material, `id_rsa`/`id_ed25519`,
+`credentials*`, `secrets*`, `auth*`, `token*`, known OpenCode credential
+locations); only their path metadata is indexed.
+
+An ordinary `ocg` / `ocg run` launch does not prepare context. Use
+`ocg context <task>` (or the library API); the shipped Lead prompt tells the
+agent to prefer those commands. Cached plans are only returned after their
+source slices, dependency fingerprints and git identity are re-verified, and a
+failed cache write leaves the computed plan intact with a warning note.
+
+Token counts in plans and capsules are always **estimates** (`bytes / 4`) and
+are labelled as such.
+
 ## Environment variables
 
 `OPENCODE_GEAR_*` is canonical; the legacy `OC_GEAR_*` names are accepted as
@@ -242,6 +299,9 @@ ocg status   [--throttle LEVEL] [--project DIR]
 ocg throttle [LEVEL] [--project DIR]
 ocg layers   [--project DIR]
 ocg trace    --event launch [--project DIR]
+ocg context  <task...> [--pretty] [--project DIR]
+ocg context  symbols <query> [--project DIR]
+ocg cache    stats|clean [--project DIR]
 ocg version  (read-only runtime report)
 ocg doctor   (read-only environment check)
 ocg upgrade  (self-update Gear, then maintain OpenCode)
