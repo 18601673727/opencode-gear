@@ -261,15 +261,14 @@ sensitive files (`.env`, `.envrc`, key material, `id_rsa`/`id_ed25519`,
 `credentials*`, `secrets*`, `auth*`, `token*`, known OpenCode credential
 locations); only their path metadata is indexed.
 
-An ordinary `ocg` / `ocg run` launch does not build the context index. Use
-`ocg context <task>` (or the library API); the shipped Lead prompt tells the
-agent to prefer those commands. When orchestration is enabled a launch does
-materialize the generated plugin and answers its bridge calls with bounded
-dynamic context (see [Orchestration policy](#orchestration-policy)); the index
-itself is still only built by `ocg context`. Cached plans are only returned
-after their source slices, dependency fingerprints and git identity are
-re-verified, and a failed cache write leaves the computed plan intact with a
-warning note.
+An ordinary `ocg` / `ocg run` launch materializes the generated plugin when
+orchestration is enabled; it does not index until a context request is handled.
+Repository context and index state may then be built or updated by explicit
+`ocg context <task>` commands, the library API, or ordinary orchestration bridge
+context requests (see [Orchestration policy](#orchestration-policy)). Cached
+plans are only returned after their source slices, dependency fingerprints and
+git identity are re-verified, and a failed cache write leaves the computed plan
+intact with a warning note.
 
 Token counts in plans and capsules are always **estimates** (`bytes / 4`) and
 are labelled as such.

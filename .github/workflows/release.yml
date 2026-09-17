@@ -109,8 +109,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: native tests for the target
-        run: cargo test --locked --release --target ${{ matrix.target }}
+      - name: native host tests
+        run: cargo test --locked
       - name: build ${{ matrix.target }}
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: smoke-run the final artifact
@@ -153,38 +153,13 @@ jobs:
           body: |
             OpenCode Gear ${{ github.ref_name }}
 
-            This release includes:
+            RC2 fixes macOS native release validation: filesystem-equivalent
+            temporary paths are now compared canonically, and native test
+            commands are aligned across Linux and macOS. It includes all OCG
+            v0.2 orchestration and token-efficiency features from RC1.
 
-            - **Rust-native OCG** — a single, self-contained Rust binary; all
-              ranking, projection, freshness, retry and telemetry policy lives
-              in Rust.
-            - **Managed OpenCode runtime** — discovery, project-local install,
-              pinned versions, cached update checks and self-update.
-            - **macOS and Linux installer** — POSIX `install.sh`, four
-              artifacts (linux x86_64/arm64, darwin x86_64/arm64) and a
-              verified SHA256SUMS.
-            - **Repository Context Engine** — deterministic repo map,
-              incremental symbol index, bounded git diff, ranking and a
-              context cache.
-            - **Task Capsules** — versioned, inspectable structured planning
-              state.
-            - **Verification and Log Distillation** — explicitly configured,
-              shell-free commands with bounded raw logs and deterministic
-              failure-focused summaries.
-            - **Local Efficiency Metrics** — `ocg stats` aggregates of byte,
-              token-provenance, index/cache and verification accounting.
-            - **Automatic activation** — an ordinary `ocg` launch generates a
-              thin OpenCode plugin adapter and exports the bridge environment;
-              `OPENCODE_GEAR_ORCHESTRATION=0` disables it entirely.
-            - **Compact role handoffs** — typed, role-masked
-              `ModelHandoffCapsule` projections bounded by absolute bytes and a
-              fraction of the rich source.
-            - **Local-only telemetry** — events are written under
-              `<project>/.opencode-gear/telemetry/`; there is no remote endpoint
-              and no prompt, source, command or log content is stored.
-
-            Installing a prerelease: the unpinned installer follows the latest
-            **stable** release by design. Pin this candidate explicitly:
+            The unpinned installer follows the latest stable release by design.
+            Pin this candidate explicitly:
 
             ```bash
             OPENCODE_GEAR_VERSION=${{ github.ref_name }} sh install.sh

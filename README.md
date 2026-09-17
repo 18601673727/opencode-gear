@@ -138,11 +138,11 @@ OPENCODE_GEAR_INSTALL_DIR="$HOME/bin" sh install.sh
 ```
 
 > **Release candidates.** The unpinned installer deliberately follows the
-> **latest stable** release. While `v0.2.0-rc.1` is a prerelease, pin it
+> **latest stable** release. While `v0.2.0-rc.2` is a prerelease, pin it
 > explicitly:
 >
 > ```bash
-> OPENCODE_GEAR_VERSION=v0.2.0-rc.1 sh install.sh
+> OPENCODE_GEAR_VERSION=v0.2.0-rc.2 sh install.sh
 > ```
 
 Supported platforms:
@@ -684,9 +684,10 @@ decision stays in the `ocg` Rust bridge (see
 [Orchestration](#orchestration-optional)). With orchestration disabled (the
 `OPENCODE_GEAR_ORCHESTRATION=0` escape hatch or `"orchestration":
 {"enabled": false}`) no plugin is emitted and launch writes no orchestration
-state. An ordinary launch never builds the context **index**: `ocg context`
-still owns that. The subsystem fails soft: a failed cache write or a bounded
-git capture only produces a warning, never a lost plan.
+state. Repository context and index state may be built or updated by explicit
+`ocg context` commands and by ordinary orchestration bridge context requests.
+The subsystem fails soft: a failed cache write or a bounded git capture only
+produces a warning, never a lost plan.
 
 Set `"context": {"enabled": false}` to disable it entirely. Then `ocg context`
 prints an informational message, returns success, and never reads, indexes or

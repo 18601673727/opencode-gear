@@ -8,6 +8,29 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
+#[cfg(unix)]
+fn assert_same_existing_directory(observed: &Path, expected: &Path) {
+    let observed_resolved = fs::canonicalize(observed).unwrap_or_else(|error| {
+        panic!(
+            "cannot resolve observed directory {}: {error}",
+            observed.display()
+        )
+    });
+    let expected_resolved = fs::canonicalize(expected).unwrap_or_else(|error| {
+        panic!(
+            "cannot resolve expected directory {}: {error}",
+            expected.display()
+        )
+    });
+    assert_eq!(
+        observed_resolved,
+        expected_resolved,
+        "child used the wrong working directory (observed {}, expected {})",
+        observed.display(),
+        expected.display()
+    );
+}
+
 fn base_command(cwd: &Path, work: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ocg"));
     command
@@ -307,13 +330,30 @@ fn run_execs_the_configured_binary_with_config_and_cwd() {
 
     let recorded = fs::read_to_string(&record).expect("record");
     let lines: Vec<&str> = recorded.lines().collect();
-    assert_eq!(lines[0], project.display().to_string());
+    assert_same_existing_directory(Path::new(lines[0]), &project);
     assert_eq!(lines[1], "run");
     assert_eq!(lines[2], "hello world");
 
     let config: Value =
         serde_json::from_str(&fs::read_to_string(&config_file).expect("config")).expect("parse");
     assert_eq!(config["default_agent"], json!("lead-low"));
+}
+
+#[cfg(unix)]
+#[test]
+fn filesystem_aliases_resolve_to_the_same_directory() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TestDir::new();
+    let project = dir.project();
+    let alias = dir.join("project-alias");
+    symlink(&project, &alias).expect("create directory alias");
+
+    assert_ne!(
+        alias, project,
+        "the fixture must use distinct lexical paths"
+    );
+    assert_same_existing_directory(&alias, &project);
 }
 
 #[cfg(unix)]

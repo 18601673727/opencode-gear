@@ -170,13 +170,13 @@ Invariants worth preserving:
   git identity must match. A poisoned entry is discarded.
 - **Fail-soft.** A failed cache write only warns and keeps the computed plan;
   the plan's `notes` carry the reason.
-- **Explicit index production, optional activation.** The context *index* is
-  produced by `ocg context` / `ocg context symbols` or the library API, never by
-  a plain launch. When orchestration is enabled, a launch does materialize the
-  generated plugin adapter (see [Orchestration](#orchestration)) and can answer
-  the adapter's bridge calls with bounded dynamic context; that is activation,
-  not index construction. `context.enabled: false` makes `ocg context` a no-op
-  and makes the orchestration dynamic context empty.
+- **On-demand index production and optional activation.** The context *index*
+  can be built or updated by `ocg context` / `ocg context symbols`, the library
+  API, or an ordinary orchestration bridge context request. A launch only
+  materializes the generated plugin adapter (see
+  [Orchestration](#orchestration)); indexing begins when a context request is
+  handled. `context.enabled: false` makes explicit context commands no-ops and
+  makes orchestration dynamic context empty.
 - **No invented OpenCode mechanism.** Activation uses the supported local JS
   plugin contract; the generated adapter is injected through the config's
   `plugin` array and calls the hidden `ocg __bridge` command. Nothing is
