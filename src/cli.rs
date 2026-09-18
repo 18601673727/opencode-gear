@@ -417,7 +417,7 @@ Commands:
   checkpoint list|show|save
                         inspect, or create, a phase checkpoint
   version               report Gear, platform and the resolved OpenCode runtime
-  doctor                check proxy, static config, runtime models and cache (read-only)
+  doctor                diagnose layering, Lead contracts, OpenCode, proxy and runtime (read-only)
   upgrade               self-update Gear, then maintain the active OpenCode
   help                  show this help
 
@@ -924,8 +924,51 @@ fn describe_runtime_version(version: Option<&Version>) -> String {
         .unwrap_or_else(|| "unknown version".to_string())
 }
 
-fn check_line(status: &str, label: &str, detail: &str) {
-    println!("  {label:<16} [{status}] {detail}");
+/// Severity-tracked doctor output.
+///
+/// Every line is one of PASS / INFO / WARN / FAIL. Only FAIL makes `ocg doctor`
+/// exit non-zero, so a warning never fails a scripted smoke. The counters are
+/// deterministic for a fixed environment, which is what the doctor tests assert.
+#[derive(Default)]
+struct Doctor {
+    passed: usize,
+    warnings: usize,
+    failures: usize,
+    infos: usize,
+}
+
+impl Doctor {
+    fn line(&mut self, status: &str, label: &str, detail: &str) {
+        let token = match status {
+            "ok" => {
+                self.passed += 1;
+                "PASS"
+            }
+            "warn" => {
+                self.warnings += 1;
+                "WARN"
+            }
+            "error" | "fail" => {
+                self.failures += 1;
+                "FAIL"
+            }
+            _ => {
+                self.infos += 1;
+                "INFO"
+            }
+        };
+        println!("  {label:<18} [{token}] {detail}");
+    }
+}
+
+/// Whether a standard proxy variable (either spelling) is set and non-empty.
+/// Only presence is ever observed; the value is never read or rendered.
+fn proxy_env_present(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os(&lower).filter(|value| !value.is_empty()))
+        .is_some()
 }
 
 /// `ocg doctor`: read-only environment and runtime checks. Never installs,
@@ -937,66 +980,125 @@ fn doctor_command(
     env: &Env,
     disable_proxy: bool,
 ) -> std::result::Result<i32, Failure> {
-    let mut failures = 0usize;
+    let mut doctor = Doctor::default();
     println!("OpenCode Gear doctor");
 
     let proxy = resolve_proxy(disable_proxy);
-    print_proxy_diagnostics(&proxy);
+    print_proxy_diagnostics(&mut doctor, &proxy);
+    print_proxy_env_diagnostics(&mut doctor, &proxy, disable_proxy);
     let proxy_env = proxy.child_env();
 
     let platform = match Platform::current() {
         Ok(platform) => {
-            check_line("ok", "platform", &platform.slug());
+            doctor.line("ok", "platform", &platform.slug());
             Some(platform)
         }
         Err(error) => {
-            check_line("fail", "platform", &error.to_string());
-            failures += 1;
+            doctor.line("fail", "platform", &error.to_string());
             None
         }
     };
 
     match std::env::current_exe() {
-        Ok(exe) => check_line("ok", "gear", &format!("{} (Gear {VERSION})", exe.display())),
+        Ok(exe) => doctor.line("ok", "gear", &format!("{} (Gear {VERSION})", exe.display())),
         Err(error) => {
-            check_line(
+            doctor.line(
                 "fail",
                 "gear",
                 &format!("cannot determine the running executable: {error}"),
             );
-            failures += 1;
         }
     }
 
     let process = SystemProcessHost;
     match process.find_in_path("ocg") {
-        Some(path) => check_line("ok", "gear on PATH", &path.display().to_string()),
-        None => check_line(
+        Some(path) => doctor.line("ok", "gear on PATH", &path.display().to_string()),
+        None => doctor.line(
             "warn",
             "gear on PATH",
             "not found; install with install.sh or add the install directory to PATH",
         ),
     }
 
+    // Config layering: which layer each override came from, and whether it was
+    // found. This is the section a user reads when "my override does nothing".
+    println!("config layering");
+    match effective.gear_home.as_ref() {
+        Some(home) => doctor.line(
+            "ok",
+            "defaults",
+            &format!("disk gear home {}", home.display()),
+        ),
+        None => doctor.line(
+            "ok",
+            "defaults",
+            "embedded in the binary (no OPENCODE_GEAR_HOME)",
+        ),
+    }
+    for (name, path) in [
+        ("user config", &effective.user_path),
+        ("project config", &effective.project_path),
+    ] {
+        if path.is_file() {
+            doctor.line("ok", name, &path.display().to_string());
+        } else {
+            doctor.line("info", name, &format!("{} (not present)", path.display()));
+        }
+    }
     if project_root.is_dir() {
-        check_line("ok", "project root", &project_root.display().to_string());
+        doctor.line("ok", "project root", &project_root.display().to_string());
     } else {
-        check_line(
+        doctor.line(
             "fail",
             "project root",
             &format!("{} is not a directory", project_root.display()),
         );
-        failures += 1;
     }
 
-    if effective.project_path.is_file() {
-        check_line(
-            "ok",
-            "project config",
-            &effective.project_path.display().to_string(),
-        );
-    } else {
-        check_line("info", "project config", "not present (optional)");
+    // The effective Lead contracts. Throttle only ever changes the Lead.
+    println!("effective Lead contracts");
+    match report::throttle_rows(effective) {
+        Ok(rows) => {
+            for (row_level, full, variant) in rows {
+                let active = if row_level == level { " (active)" } else { "" };
+                doctor.line(
+                    "ok",
+                    &format!("lead-{row_level}"),
+                    &format!("{full} variant {variant}{active}"),
+                );
+            }
+        }
+        Err(error) => doctor.line("warn", "lead contracts", &error.to_string()),
+    }
+    let default_throttle = effective
+        .data
+        .get("throttle")
+        .and_then(|throttle| throttle.get("default"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    doctor.line("info", "default throttle", default_throttle);
+    doctor.line("info", "default agent", &model::lead_agent_id(level));
+
+    // The Consumer Router, independent of the throttle. Only role names and
+    // provider/model ids are printed; no credential ever reaches this section.
+    println!("consumer router (independent of throttle)");
+    match model::routing_rows(&effective.data) {
+        Ok(rows) => {
+            for (role, agent, _provider, full) in rows {
+                doctor.line("ok", &agent, &format!("{full} ({role})"));
+            }
+        }
+        Err(error) => doctor.line("warn", "consumer router", &error.to_string()),
+    }
+    if let Some(small) = effective
+        .data
+        .get("routing")
+        .and_then(|routing| routing.get("small_model"))
+        .and_then(Value::as_str)
+    {
+        if let Ok((_, full)) = model::model_full_id(&effective.data, small) {
+            doctor.line("info", "small_model", &full);
+        }
     }
 
     let errors = validate::validate(effective);
@@ -1005,14 +1107,13 @@ fn doctor_command(
         let roles = model::role_specs(&effective.data)
             .map(|roles| roles.len())
             .unwrap_or(0);
-        check_line(
+        doctor.line(
             "ok",
             "static config/routing",
             &format!("valid ({roles} roles)"),
         );
     } else {
-        check_line("fail", "static config/routing", &errors.join("; "));
-        failures += 1;
+        doctor.line("fail", "static config/routing", &errors.join("; "));
     }
 
     let clock = SystemClock;
@@ -1035,7 +1136,7 @@ fn doctor_command(
     };
 
     if report.installed() {
-        check_line(
+        doctor.line(
             "ok",
             "runtime",
             &format!(
@@ -1053,10 +1154,9 @@ fn doctor_command(
             ),
         );
     } else if let Some(error) = &report.error {
-        check_line("fail", "runtime", error);
-        failures += 1;
+        doctor.line("fail", "runtime", error);
     } else {
-        check_line(
+        doctor.line(
             "info",
             "runtime",
             &format!(
@@ -1066,12 +1166,60 @@ fn doctor_command(
         );
     }
     for warning in &report.warnings {
-        check_line("warn", "runtime", warning);
+        doctor.line("warn", "runtime", warning);
+    }
+
+    // OpenCode installation. `report` is the runtime OCG would launch; the
+    // system PATH binary is reported separately so an obvious version split
+    // between a managed runtime and an ambient install is visible.
+    println!("OpenCode");
+    let system_binary = process.find_in_path("opencode");
+    let system_version = system_binary
+        .as_ref()
+        .and_then(|path| process.version(path).ok());
+    match (&system_binary, &system_version) {
+        (Some(path), Some(version)) => doctor.line(
+            "ok",
+            "opencode on PATH",
+            &format!("{} ({version})", path.display()),
+        ),
+        (Some(path), None) => doctor.line(
+            "warn",
+            "opencode on PATH",
+            &format!("{} exists but `--version` failed", path.display()),
+        ),
+        (None, _) => doctor.line(
+            "info",
+            "opencode on PATH",
+            "not found; OCG uses the runtime above, or bootstraps one on launch",
+        ),
+    }
+    let runtime_version = report.version.as_ref().map(ToString::to_string);
+    match (report.source, &runtime_version, &system_version) {
+        (Some(source), Some(runtime), Some(path)) if runtime != path => doctor.line(
+            "warn",
+            "opencode version",
+            &format!(
+                "runtime ({}) is {runtime} but system PATH is {path}; launches use the runtime",
+                source.label()
+            ),
+        ),
+        (Some(source), Some(runtime), _) => doctor.line(
+            "ok",
+            "opencode version",
+            &format!("runtime ({}) {runtime}", source.label()),
+        ),
+        (Some(source), None, _) => doctor.line(
+            "info",
+            "opencode version",
+            &format!("runtime ({}) version unknown", source.label()),
+        ),
+        _ => {}
     }
 
     println!("runtime models");
     if !static_config_valid {
-        check_line(
+        doctor.line(
             "info",
             "runtime models",
             "skipped because static config/routing validation failed",
@@ -1094,7 +1242,9 @@ fn doctor_command(
         )
         .map_err(Failure::Gear)?
         {
-            ModelPreflight::Unavailable { reason } => check_line("warn", "runtime models", &reason),
+            ModelPreflight::Unavailable { reason } => {
+                doctor.line("warn", "runtime models", &reason)
+            }
             ModelPreflight::Complete { checks } => {
                 for check in checks {
                     let variant = check
@@ -1104,13 +1254,13 @@ fn doctor_command(
                         .map(|variant| format!(" (variant {variant})"))
                         .unwrap_or_default();
                     match check.availability {
-                        Availability::Available => check_line(
+                        Availability::Available => doctor.line(
                             "ok",
                             &check.requirement.label,
                             &format!("{}{}", check.requirement.full_model_id, variant),
                         ),
                         Availability::MissingProvider => {
-                            check_line(
+                            doctor.line(
                                 "error",
                                 &check.requirement.label,
                                 &format!(
@@ -1118,10 +1268,9 @@ fn doctor_command(
                                     check.requirement.full_model_id, variant
                                 ),
                             );
-                            failures += 1;
                         }
                         Availability::MissingModel => {
-                            check_line(
+                            doctor.line(
                                 "error",
                                 &check.requirement.label,
                                 &format!(
@@ -1129,14 +1278,13 @@ fn doctor_command(
                                     check.requirement.full_model_id, variant
                                 ),
                             );
-                            failures += 1;
                         }
                     }
                 }
             }
         }
     } else {
-        check_line(
+        doctor.line(
             "info",
             "runtime models",
             "not checked because no usable OpenCode runtime is installed",
@@ -1145,13 +1293,13 @@ fn doctor_command(
 
     let runtime_root = Layout::new(project_root).runtime_root();
     if is_writable_dir(&runtime_root) {
-        check_line(
+        doctor.line(
             "ok",
             "runtime dir",
             &format!("{} is writable", runtime_root.display()),
         );
     } else {
-        check_line(
+        doctor.line(
             "warn",
             "runtime dir",
             &format!("{} is not writable", runtime_root.display()),
@@ -1172,7 +1320,7 @@ fn doctor_command(
                     policy.check_interval_hours,
                     false,
                 );
-                check_line(
+                doctor.line(
                     "ok",
                     "update cache",
                     &format!(
@@ -1182,13 +1330,13 @@ fn doctor_command(
                     ),
                 );
             }
-            None => check_line(
+            None => doctor.line(
                 "info",
                 "update cache",
                 &format!("{} (never checked)", dir.display()),
             ),
         },
-        None => check_line(
+        None => doctor.line(
             "warn",
             "update cache",
             "platform cache directory unavailable",
@@ -1204,7 +1352,7 @@ fn doctor_command(
             .and_then(|text| serde_json::from_str::<context::index::ContextIndex>(&text).ok())
         {
             Some(index) => {
-                check_line(
+                doctor.line(
                     "ok",
                     "repository map/index",
                     &format!(
@@ -1217,7 +1365,7 @@ fn doctor_command(
                 Some(index)
             }
             None => {
-                check_line(
+                doctor.line(
                     "warn",
                     "repository map/index",
                     &format!(
@@ -1229,7 +1377,7 @@ fn doctor_command(
             }
         }
     } else {
-        check_line(
+        doctor.line(
             "info",
             "repository map/index",
             "not built (optional; `ocg context` builds it)",
@@ -1238,7 +1386,7 @@ fn doctor_command(
     };
 
     match &index {
-        Some(index) => check_line(
+        Some(index) => doctor.line(
             "ok",
             "symbol index",
             &format!(
@@ -1246,7 +1394,7 @@ fn doctor_command(
                 index.metrics.symbols, index.metrics.files
             ),
         ),
-        None => check_line(
+        None => doctor.line(
             "info",
             "symbol index",
             "not built (optional; depends on the repository index)",
@@ -1258,9 +1406,9 @@ fn doctor_command(
     let cache_stats = cache.stats();
     let cache_exists = Path::new(&cache_stats.dir).exists();
     if !cache_exists {
-        check_line("info", "context cache", "not present (optional)");
+        doctor.line("info", "context cache", "not present (optional)");
     } else if cache_stats.corrupt > 0 {
-        check_line(
+        doctor.line(
             "warn",
             "context cache",
             &format!(
@@ -1269,7 +1417,7 @@ fn doctor_command(
             ),
         );
     } else {
-        check_line(
+        doctor.line(
             "ok",
             "context cache",
             &format!(
@@ -1282,7 +1430,7 @@ fn doctor_command(
     // Task checkpoints: corrupt files are counted, never printed.
     let (checkpoints, corrupt_checkpoints) = checkpoint::list(project_root);
     if corrupt_checkpoints > 0 {
-        check_line(
+        doctor.line(
             "warn",
             "task checkpoints",
             &format!(
@@ -1291,9 +1439,9 @@ fn doctor_command(
             ),
         );
     } else if checkpoints.is_empty() {
-        check_line("info", "task checkpoints", "none saved (optional)");
+        doctor.line("info", "task checkpoints", "none saved (optional)");
     } else {
-        check_line(
+        doctor.line(
             "ok",
             "task checkpoints",
             &format!("{} checkpoint(s)", checkpoints.len()),
@@ -1302,7 +1450,7 @@ fn doctor_command(
 
     // Verification config: parse only, never run a command.
     match VerificationConfig::from_config(&effective.data) {
-        Ok(config) => check_line(
+        Ok(config) => doctor.line(
             if config.enabled { "ok" } else { "info" },
             "verification config",
             &format!(
@@ -1320,7 +1468,7 @@ fn doctor_command(
                     .sum::<usize>()
             ),
         ),
-        Err(error) => check_line("warn", "verification config", &error.to_string()),
+        Err(error) => doctor.line("warn", "verification config", &error.to_string()),
     }
 
     // Telemetry storage: read-only, local-only, no state creation.
@@ -1348,16 +1496,16 @@ fn doctor_command(
         }
     );
     if telemetry_log.corrupt_lines > 0 || telemetry_log.unsupported_lines > 0 {
-        check_line("warn", "telemetry", &telemetry_line);
+        doctor.line("warn", "telemetry", &telemetry_line);
     } else if !telemetry_config.enabled || !store.exists() {
-        check_line("info", "telemetry", &telemetry_line);
+        doctor.line("info", "telemetry", &telemetry_line);
     } else {
-        check_line("ok", "telemetry", &telemetry_line);
+        doctor.line("ok", "telemetry", &telemetry_line);
     }
 
     // Capability planner: advisory only.
     match CapabilityConfig::from_config(&effective.data) {
-        Ok(config) => check_line(
+        Ok(config) => doctor.line(
             if config.enabled { "ok" } else { "info" },
             "tool capability planner",
             &format!(
@@ -1370,20 +1518,20 @@ fn doctor_command(
                 config.custom.len()
             ),
         ),
-        Err(error) => check_line("warn", "tool capability planner", &error.to_string()),
+        Err(error) => doctor.line("warn", "tool capability planner", &error.to_string()),
     }
 
     // Sensitive-file exclusions: summarise the current index only.
     match &index {
         Some(index) => {
             let excluded = index.files.iter().filter(|file| file.excluded).count();
-            check_line(
+            doctor.line(
                 "ok",
                 "sensitive-file exclusions",
                 &format!("{excluded} path(s) excluded from content in the current index"),
             );
         }
-        None => check_line(
+        None => doctor.line(
             "info",
             "sensitive-file exclusions",
             "applied by path during indexing; no index to summarise",
@@ -1394,7 +1542,7 @@ fn doctor_command(
     // never launches OpenCode, never runs a bridge and never mutates state.
     match crate::orchestration::OrchestrationConfig::from_config(&effective.data) {
         Ok(config) => {
-            check_line(
+            doctor.line(
                 if config.enabled { "ok" } else { "info" },
                 "orchestration",
                 &format!(
@@ -1413,7 +1561,7 @@ fn doctor_command(
             if config.enabled {
                 let plugin = crate::orchestration::plugin::plugin_path(project_root);
                 if plugin.is_file() {
-                    check_line(
+                    doctor.line(
                         "ok",
                         "orchestration plugin",
                         &format!(
@@ -1422,7 +1570,7 @@ fn doctor_command(
                         ),
                     );
                 } else {
-                    check_line(
+                    doctor.line(
                         "info",
                         "orchestration plugin",
                         "not materialized yet (written at the next `ocg` launch)",
@@ -1430,13 +1578,13 @@ fn doctor_command(
                 }
                 let loaded = crate::orchestration::state::load(project_root);
                 if !loaded.exists {
-                    check_line(
+                    doctor.line(
                         "info",
                         "orchestration state",
                         "not present (created by the bridge on first use)",
                     );
                 } else if loaded.corrupt {
-                    check_line(
+                    doctor.line(
                         "warn",
                         "orchestration state",
                         "corrupt or unsupported; the next bridge call starts from empty state",
@@ -1448,7 +1596,7 @@ fn doctor_command(
                         .values()
                         .map(|session| session.checkpoints.len())
                         .sum::<usize>();
-                    check_line(
+                    doctor.line(
                         "ok",
                         "orchestration state",
                         &format!(
@@ -1470,7 +1618,7 @@ fn doctor_command(
                     "health",
                     limits,
                 );
-                check_line(
+                doctor.line(
                     if capsule.measured_bytes() <= limits.max_bytes {
                         "ok"
                     } else {
@@ -1486,7 +1634,7 @@ fn doctor_command(
                 let context_enabled = ContextConfig::from_config(&effective.data)
                     .map(|context| context.enabled)
                     .unwrap_or(false);
-                check_line(
+                doctor.line(
                     if context_enabled { "ok" } else { "info" },
                     "context activation",
                     if context_enabled {
@@ -1501,7 +1649,7 @@ fn doctor_command(
                             && verification.command_count(&verification.default_stage) > 0
                     })
                     .unwrap_or(false);
-                check_line(
+                doctor.line(
                     if verification_ready { "ok" } else { "info" },
                     "verification integration",
                     if verification_ready {
@@ -1512,15 +1660,22 @@ fn doctor_command(
                 );
             }
         }
-        Err(error) => check_line("warn", "orchestration", &error.to_string()),
+        Err(error) => doctor.line("warn", "orchestration", &error.to_string()),
     }
 
-    Ok(if failures == 0 { 0 } else { 1 })
+    println!("doctor summary");
+    println!(
+        "  {} passed, {} warnings, {} failures ({} informational)",
+        doctor.passed, doctor.warnings, doctor.failures, doctor.infos
+    );
+    Ok(if doctor.failures == 0 { 0 } else { 1 })
 }
 
-fn print_proxy_diagnostics(proxy: &ProxySelection) {
+/// Proxy mode, endpoints and non-SOCKS notes. Values are always rendered
+/// through [`crate::proxy::SecretUrl`]; only names and schemes are ever shown.
+fn print_proxy_diagnostics(doctor: &mut Doctor, proxy: &ProxySelection) {
     if proxy.is_disabled() {
-        check_line(
+        doctor.line(
             "ok",
             "proxy",
             match proxy.source() {
@@ -1531,27 +1686,65 @@ fn print_proxy_diagnostics(proxy: &ProxySelection) {
         );
         return;
     }
-    check_line("ok", "proxy mode", "auto");
+    doctor.line("ok", "proxy mode", "auto");
     let source = match proxy.source() {
         ProxySource::Environment => "environment",
         ProxySource::System => "macOS system settings",
         ProxySource::Direct => "direct (no proxy configured)",
         ProxySource::CliDisabled | ProxySource::EnvDisabled => "disabled",
     };
-    check_line("ok", "proxy source", source);
+    doctor.line("ok", "proxy source", source);
     for endpoint in proxy.plan().endpoints() {
         let label = match endpoint.scheme() {
             ProxyScheme::Http => "HTTP proxy",
             ProxyScheme::Https => "HTTPS proxy",
             ProxyScheme::All => "all proxy",
         };
-        check_line("ok", label, "configured");
+        doctor.line("ok", label, "configured");
     }
     if !proxy.plan().no_proxy().is_empty() {
-        check_line("ok", "no-proxy", "configured");
+        doctor.line("ok", "no-proxy", "configured");
     }
     for warning in proxy.warnings() {
-        check_line("warn", "proxy", warning);
+        // SOCKS pass-through is rendered structurally, with its full meaning,
+        // by `print_proxy_env_diagnostics`.
+        if warning.contains("SOCKS scheme that OCG does not interpret") {
+            continue;
+        }
+        doctor.line("warn", "proxy", warning);
+    }
+}
+
+/// The standard proxy variables and the SOCKS pass-through contract.
+///
+/// Only presence is reported for the variables; values (which may embed a
+/// credential) are never read here. A SOCKS `ALL_PROXY` is a WARN, not a FAIL:
+/// OCG's own HTTP client does not interpret SOCKS, but the value is preserved
+/// verbatim for the child OpenCode process, and no OCG network operation
+/// depends on it.
+fn print_proxy_env_diagnostics(doctor: &mut Doctor, proxy: &ProxySelection, disable_proxy: bool) {
+    println!("environment / proxy");
+    for name in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"] {
+        if proxy_env_present(name) {
+            doctor.line("info", name, "present (value never shown)");
+        } else {
+            doctor.line("info", name, "not set");
+        }
+    }
+    if disable_proxy {
+        doctor.line(
+            "info",
+            "proxy policy",
+            "disabled for this invocation; the child OpenCode process inherits no proxy variable",
+        );
+        return;
+    }
+    for (name, _url) in proxy.plan().passthrough() {
+        doctor.line(
+            "warn",
+            name,
+            "uses a SOCKS scheme OCG does not interpret; OCG's own network calls ignore it, but the value is preserved verbatim for the child OpenCode process",
+        );
     }
 }
 /// `ocg upgrade`: self-update Gear, then force-maintain the active OpenCode.

@@ -23,7 +23,17 @@ fn base_command(cwd: &Path, work: &Path) -> Command {
         .env_remove("OC_GEAR_OPENCODE_BIN")
         .env_remove("OPENCODE_GEAR_TELEMETRY")
         .env_remove("OPENCODE_GEAR_ORCHESTRATION")
-        .env_remove("OC_GEAR_ORCHESTRATION");
+        .env_remove("OC_GEAR_ORCHESTRATION")
+        .env_remove("HTTP_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("all_proxy")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN");
     command
 }
 
@@ -186,11 +196,12 @@ fn doctor_reports_static_config_separately_from_available_runtime_models() {
     let text = stdout(&output);
     assert!(text.contains("static config"), "{text}");
     assert!(text.contains("runtime models"), "{text}");
+    assert!(text.contains("openai/gpt-5.6-sol (variant low)"), "{text}");
     assert!(
         text.contains("openai/gpt-5.6-sol (variant medium)"),
         "{text}"
     );
-    assert!(text.contains("openai/gpt-6-astra (variant high)"), "{text}");
+    assert!(text.contains("openai/gpt-6-astra (variant low)"), "{text}");
     assert!(text.contains("disabled by CLI"), "{text}");
 }
 
@@ -213,4 +224,207 @@ fn doctor_distinguishes_missing_provider_and_missing_model() {
     let text = stdout(&output);
     assert!(text.contains("provider is not currently exposed"), "{text}");
     assert!(text.contains("model is not currently exposed"), "{text}");
+    // A FAIL must be visible in the summary, not only in the failing line.
+    assert!(text.contains("failures"), "{text}");
+    assert!(!text.contains("0 failures"), "{text}");
+}
+
+/// The layering section, the effective Lead contracts, the consumer router and
+/// the summary are all present for a plain project with no overrides.
+#[test]
+fn doctor_reports_layering_contracts_and_summary() {
+    let dir = TestDir::new();
+    let project = dir.project();
+    let project_arg = project.to_string_lossy().into_owned();
+    let output = run(
+        dir.path(),
+        dir.path(),
+        &["--project", &project_arg, "doctor"],
+    );
+    assert!(output.status.success(), "{}", stdout(&output));
+    let text = stdout(&output);
+    for label in [
+        "config layering",
+        "defaults",
+        "user config",
+        "project config",
+        "project root",
+        "effective Lead contracts",
+        "default throttle",
+        "default agent",
+        "consumer router (independent of throttle)",
+        "doctor summary",
+    ] {
+        assert!(text.contains(label), "missing '{label}' in\n{text}");
+    }
+    // The effective contracts must be the shipped profile, not a stale value.
+    assert!(text.contains("openai/gpt-5.6-sol variant low"), "{text}");
+    assert!(text.contains("openai/gpt-5.6-sol variant medium"), "{text}");
+    assert!(text.contains("openai/gpt-6-astra variant low"), "{text}");
+    // The Consumer Router is reported alongside, and is not the Lead.
+    assert!(text.contains("volcengine-coding/kimi-k2.7-code"), "{text}");
+    assert!(text.contains("opencode-go/deepseek-v4.1-flash"), "{text}");
+    // A clean environment has no FAIL.
+    assert!(text.contains("0 failures"), "{text}");
+}
+
+#[test]
+fn doctor_reports_missing_project_config_as_info() {
+    let dir = TestDir::new();
+    let project = dir.project();
+    let project_arg = project.to_string_lossy().into_owned();
+    let output = run(
+        dir.path(),
+        dir.path(),
+        &["--project", &project_arg, "doctor"],
+    );
+    assert!(output.status.success(), "{}", stdout(&output));
+    let text = stdout(&output);
+    assert!(text.contains("project config"), "{text}");
+    assert!(text.contains("not present"), "{text}");
+}
+
+#[test]
+fn doctor_marks_user_and_project_layers_as_found() {
+    let dir = TestDir::new();
+    let project = dir.project();
+    let user = dir.join("user-config.json");
+    let project_config = project.join("project-config.json");
+    fs::write(&user, "{\"throttle\":{\"default\":\"mid\"}}\n").unwrap();
+    fs::write(&project_config, "{\"throttle\":{\"default\":\"high\"}}\n").unwrap();
+    let output = base_command(dir.path(), dir.path())
+        .args([
+            "--user-config",
+            user.to_str().unwrap(),
+            "--project-config",
+            project_config.to_str().unwrap(),
+            "doctor",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stdout(&output));
+    let text = stdout(&output);
+    assert!(text.contains(user.to_str().unwrap()), "{text}");
+    assert!(text.contains(project_config.to_str().unwrap()), "{text}");
+    // Both layers are applied, so the project default (high) wins.
+    assert!(
+        text.lines()
+            .any(|line| line.contains("default agent") && line.contains("lead-high")),
+        "{text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_warns_about_a_socks_proxy_without_leaking_its_value() {
+    let dir = TestDir::new();
+    let project = dir.project();
+    let output = base_command(dir.path(), dir.path())
+        .env(
+            "ALL_PROXY",
+            "socks5h://alice:wonderland@proxy-internal:1080",
+        )
+        .args(["--project", project.to_str().unwrap(), "doctor"])
+        .output()
+        .unwrap();
+    // SOCKS is a warning, never a failure: the child keeps the value.
+    assert!(output.status.success(), "{}", stdout(&output));
+    let text = stdout(&output);
+    assert!(text.contains("ALL_PROXY"), "{text}");
+    assert!(text.contains("SOCKS"), "{text}");
+    assert!(text.contains("preserved"), "{text}");
+    assert!(text.contains("ignore it"), "{text}");
+    for secret in ["wonderland", "alice", "proxy-internal", "1080"] {
+        assert!(!text.contains(secret), "leaked '{secret}' in\n{text}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_reports_a_normal_http_proxy_without_its_value() {
+    let dir = TestDir::new();
+    let project = dir.project();
+    let output = base_command(dir.path(), dir.path())
+        .env("HTTP_PROXY", "http://proxy-internal:3128")
+        .env("HTTPS_PROXY", "http://proxy-internal:3129")
+        .env("NO_PROXY", "localhost,.internal")
+        .args(["--project", project.to_str().unwrap(), "doctor"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stdout(&output));
+    let text = stdout(&output);
+    assert!(text.contains("HTTP_PROXY"), "{text}");
+    assert!(text.contains("HTTPS_PROXY"), "{text}");
+    assert!(text.contains("NO_PROXY"), "{text}");
+    assert!(text.contains("present"), "{text}");
+    assert!(!text.contains("proxy-internal"), "leaked value in\n{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_never_prints_proxy_or_provider_credentials() {
+    let dir = TestDir::new();
+    let project = dir.project();
+    // Build the token shape at runtime so this test source does not itself look
+    // like a committed credential to the repository hygiene scan.
+    let fake_pat = format!("ghp_{}", "0123456789abcdefghijklmnopqrstuvwxyz");
+    let output = base_command(dir.path(), dir.path())
+        .env("HTTPS_PROXY", "http://alice:wonderland@proxy-internal:3128")
+        .env("ALL_PROXY", "socks5://bob:builder@proxy-internal:1080")
+        .env("GH_TOKEN", &fake_pat)
+        .env("GITHUB_TOKEN", "github_pat_value_that_must_not_render")
+        .args(["--project", project.to_str().unwrap(), "doctor"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "warnings must not fail doctor: {}",
+        stdout(&output)
+    );
+    let text = stdout(&output);
+    assert!(!text.contains(&fake_pat), "leaked GH_TOKEN in\n{text}");
+    for secret in [
+        "wonderland",
+        "alice",
+        "bob",
+        "builder",
+        "proxy-internal",
+        "github_pat_value_that_must_not_render",
+    ] {
+        assert!(!text.contains(secret), "leaked '{secret}' in\n{text}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_warns_when_the_system_and_runtime_versions_differ() {
+    let dir = TestDir::new();
+    let project = dir.project();
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    write_executable(
+        &bin.join("opencode"),
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 9.9.9; exit 0; fi\nexit 2\n",
+    );
+    let runtime = dir.join("fake-runtime.sh");
+    write_executable(
+        &runtime,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.18.31; exit 0; fi\nif [ \"$1\" = \"models\" ]; then printf '%s\\n' openai/gpt-5.6-sol openai/gpt-6-astra volcengine-coding/kimi-k2.7-code volcengine-coding/kimi-k3 opencode-go/deepseek-v4.1-flash opencode-go/glm-5.3-flash opencode-go/glm-5.3; exit 0; fi\nexit 2\n",
+    );
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = base_command(dir.path(), dir.path())
+        .env("PATH", path)
+        .env("OPENCODE_GEAR_OPENCODE", &runtime)
+        .args(["--project", project.to_str().unwrap(), "doctor"])
+        .output()
+        .unwrap();
+    let text = stdout(&output);
+    assert!(text.contains("opencode on PATH"), "{text}");
+    assert!(text.contains("9.9.9"), "{text}");
+    assert!(text.contains("system PATH is 9.9.9"), "{text}");
+    assert!(text.contains("runtime (explicit) is 1.18.31"), "{text}");
 }

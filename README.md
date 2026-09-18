@@ -117,9 +117,9 @@ The shipped Lead request contracts are exact:
 
 | Throttle | Agent | Provider/model | Variant |
 | --- | --- | --- | --- |
-| low | `lead-low` | `openai/gpt-5.6-sol` | `medium` |
-| mid | `lead-mid` | `openai/gpt-5.6-sol` | `high` |
-| high | `lead-high` | `openai/gpt-6-astra` | `high` |
+| low | `lead-low` | `openai/gpt-5.6-sol` | `low` |
+| mid | `lead-mid` | `openai/gpt-5.6-sol` | `medium` |
+| high | `lead-high` | `openai/gpt-6-astra` | `low` |
 
 Before a coding launch, OCG asks the selected OpenCode runtime for its model
 catalogue. A definitely missing active Lead model blocks the launch instead of
@@ -345,12 +345,71 @@ replaced by the system runtime, and is preserved by `ocg upgrade`.
 
 ```bash
 ocg version   # Gear, platform, resolved OpenCode version/source/path (read-only)
-ocg doctor    # static config, runtime models, proxy, runtime and cache (read-only)
+ocg doctor    # layered config, Lead contracts, OpenCode, proxy, provider and runtime (read-only)
 ocg upgrade   # self-update Gear, then force-maintain the active OpenCode
 ```
 
 `ocg version` and `ocg doctor` never install, upgrade or bootstrap anything.
 `ocg doctor` explains what a bootstrap would do when no runtime is present.
+
+### `ocg doctor`
+
+One command to answer "why is my configuration not taking effect?". It is
+read-only and deterministic, and it never prints a credential.
+
+```bash
+ocg doctor
+```
+
+```text
+OpenCode Gear doctor
+  platform               [PASS] linux-x86_64
+  gear                   [PASS] /usr/local/bin/ocg (Gear 0.2.0)
+  ...
+config layering
+  defaults               [PASS] embedded in the binary (no OPENCODE_GEAR_HOME)
+  user config            [INFO] ~/.config/opencode-gear/config.json (not present)
+  project config         [PASS] /work/app/.opencode-gear.json
+  project root           [PASS] /work/app
+effective Lead contracts
+  lead-low               [PASS] openai/gpt-5.6-sol variant low (active)
+  lead-mid               [PASS] openai/gpt-5.6-sol variant medium
+  lead-high              [PASS] openai/gpt-6-astra variant low
+  default throttle       [INFO] low
+  default agent          [INFO] lead-low
+consumer router (independent of throttle)
+  ocg-explore            [PASS] volcengine-coding/kimi-k2.7-code (explore)
+  ...
+environment / proxy
+  HTTP_PROXY             [INFO] not set
+  ALL_PROXY              [WARN] uses a SOCKS scheme OCG does not interpret; OCG's own
+                                network calls ignore it, but the value is preserved
+                                verbatim for the child OpenCode process
+...
+doctor summary
+  23 passed, 1 warnings, 0 failures (9 informational)
+```
+
+It reports:
+
+- **config layering** — embedded/disk defaults, user config, project config and
+  the project root, each found or missing;
+- **effective Lead contracts** — the model and variant behind each of `low` /
+  `mid` / `high`, the default throttle and the default agent;
+- **consumer router** — the role → provider/model summary, which is independent
+  of the throttle and never prints a secret;
+- **OpenCode** — the runtime OCG would launch (managed / project-local / system
+  / explicit), its version, the `opencode` on `PATH`, and a WARN when they
+  differ;
+- **environment / proxy** — presence of `HTTP_PROXY` / `HTTPS_PROXY` /
+  `ALL_PROXY` / `NO_PROXY` (values are never shown) and the exact SOCKS
+  pass-through contract;
+- **provider / auth readiness** — whether each configured model is currently
+  exposed by the resolved OpenCode runtime, via its own model catalogue. OCG
+  never reads or prints provider credentials.
+
+Each line is **PASS / INFO / WARN / FAIL**. Only a FAIL makes `ocg doctor` exit
+non-zero, so a warning (for example a SOCKS proxy) is safe in a scripted smoke.
 
 ### Runtime layout and cleanup
 
@@ -376,14 +435,17 @@ Throttle selects the OpenAI Lead tier only.
 
 | Level | Lead | Reasoning | Intent |
 | --- | --- | --- | --- |
-| `low` | `openai/gpt-5.6-sol` | `medium` | Default. Economical Lead. |
-| `mid` | `openai/gpt-5.6-sol` | `high` | Stronger reasoning on the same model. |
-| `high` | `openai/gpt-6-astra` | `high` | Premium Lead, larger context. |
+| `low` | `openai/gpt-5.6-sol` | `low` | Default. Economical Lead. |
+| `mid` | `openai/gpt-5.6-sol` | `medium` | Balanced: stronger reasoning on the same model. |
+| `high` | `openai/gpt-6-astra` | `low` | Premium Lead: larger, stronger model at its lowest variant. |
 
 Notes:
 
 - The model ids and reasoning variants are centralised in `config/models.json`
   and `config/throttle.json`. Swap a model there and nothing else changes.
+- **Throttle only changes the Lead contract.** It never rebuilds, copies or
+  follows the Consumer Router, so EXPLORE / BUILD / VERIFY / DEBUG stay bound to
+  the same models at every level.
 - If a provider does not expose a reasoning variant, omit `variant` and the
   provider default is used.
 - **Throttle never decides which consumer handles EXPLORE / BUILD / VERIFY.**
@@ -587,7 +649,7 @@ tools <task...>     capability plan / Tool Context Firewall view (advisory)
 checkpoint list|show|save
                     inspect or record a versioned phase checkpoint
 version             Gear, platform and the resolved OpenCode runtime
-doctor              read-only platform/config/runtime/state check
+doctor              read-only layering/config/OpenCode/proxy/runtime diagnosis
 upgrade             self-update Gear, then maintain the active OpenCode
 help                print usage
 ```
