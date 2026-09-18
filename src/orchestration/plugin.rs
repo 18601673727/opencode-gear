@@ -431,9 +431,9 @@ mod tests {
 const hooks = await server({});
 // The exact contracts OpenCode Gear exports for each throttle level.
 const CONTRACTS = {
-  low: {agent: "lead-low", provider_id: "openai", model_id: "gpt-5.6-sol", variant: "medium"},
-  mid: {agent: "lead-mid", provider_id: "openai", model_id: "gpt-5.6-sol", variant: "high"},
-  high: {agent: "lead-high", provider_id: "openai", model_id: "gpt-6-astra", variant: "high"},
+  low: {agent: "lead-low", provider_id: "openai", model_id: "gpt-5.6-sol", variant: "low"},
+  mid: {agent: "lead-mid", provider_id: "openai", model_id: "gpt-5.6-sol", variant: "medium"},
+  high: {agent: "lead-high", provider_id: "openai", model_id: "gpt-6-astra", variant: "low"},
 };
 // Mirrors upstream createUserMessage: an explicitly selected input variant wins
 // over the agent variant, and a reused session keeps its sticky agent/model.
@@ -447,9 +447,9 @@ async function check(level, inputAgent, outputAgent, providerID, modelID, varian
 const lead = {
   // Previous mid use left lead-mid sticky; low must still win.
   low: await check("low", "lead-mid", "lead-mid", "openai", "gpt-5.6-sol", "high"),
-  // Sticky Sol medium must not satisfy mid, which needs Sol high.
-  mid: await check("mid", "lead-low", "lead-low", "openai", "gpt-5.6-sol", "medium"),
-  // A stale UI variant selection must not satisfy high, which needs Astra high.
+  // A session stuck on the old Sol/medium variant must not satisfy mid.
+  mid: await check("mid", "lead-low", "lead-low", "openai", "gpt-5.6-sol", "low"),
+  // A stale UI variant selection must not satisfy high, which needs Astra low.
   high: await check("high", "lead-low", "lead-low", "openai", "gpt-5.6-sol", "high"),
 };
 // A reused session whose sticky state is a different Lead tier must be corrected.
@@ -467,31 +467,31 @@ console.log(JSON.stringify({lead, reused, consumer, unknown}));
 "#,
         );
         let value = run_plugin_script(&dir);
-        // `ocg low` -> lead-low / Sol / medium, even with sticky mid state.
+        // `ocg low` -> lead-low / Sol / low, even with sticky mid state.
         assert_eq!(value["lead"]["low"]["agent"], json!("lead-low"));
         assert_eq!(
             value["lead"]["low"]["model"]["modelID"],
             json!("gpt-5.6-sol")
         );
-        assert_eq!(value["lead"]["low"]["model"]["variant"], json!("medium"));
-        // `ocg mid` -> lead-mid / Sol / high, even with sticky Sol medium.
+        assert_eq!(value["lead"]["low"]["model"]["variant"], json!("low"));
+        // `ocg mid` -> lead-mid / Sol / medium, even with a sticky Sol low.
         assert_eq!(value["lead"]["mid"]["agent"], json!("lead-mid"));
         assert_eq!(
             value["lead"]["mid"]["model"]["modelID"],
             json!("gpt-5.6-sol")
         );
-        assert_eq!(value["lead"]["mid"]["model"]["variant"], json!("high"));
-        // `ocg high` -> lead-high / Astra / high, never a Sol fallback.
+        assert_eq!(value["lead"]["mid"]["model"]["variant"], json!("medium"));
+        // `ocg high` -> lead-high / Astra / low, never a Sol fallback.
         assert_eq!(value["lead"]["high"]["agent"], json!("lead-high"));
         assert_eq!(
             value["lead"]["high"]["model"]["modelID"],
             json!("gpt-6-astra")
         );
-        assert_eq!(value["lead"]["high"]["model"]["variant"], json!("high"));
+        assert_eq!(value["lead"]["high"]["model"]["variant"], json!("low"));
         // A reused session cannot silently override the explicit throttle.
         assert_eq!(value["reused"]["agent"], json!("lead-high"));
         assert_eq!(value["reused"]["model"]["modelID"], json!("gpt-6-astra"));
-        assert_eq!(value["reused"]["model"]["variant"], json!("high"));
+        assert_eq!(value["reused"]["model"]["variant"], json!("low"));
         // Consumer routing is unchanged for every throttle level.
         for (level, agent, model) in [
             ("low", "ocg-build", "deepseek-v4.1-flash"),
@@ -529,14 +529,16 @@ console.log(JSON.stringify({lead, reused, consumer, unknown}));
             r#"import { server } from "./plugin.mjs";
 const hooks = await server({});
 const CONTRACTS = {
-  low: {agent: "lead-low", provider_id: "openai", model_id: "gpt-5.6-sol", variant: "medium"},
-  mid: {agent: "lead-mid", provider_id: "openai", model_id: "gpt-5.6-sol", variant: "high"},
-  high: {agent: "lead-high", provider_id: "openai", model_id: "gpt-6-astra", variant: "high"},
+  low: {agent: "lead-low", provider_id: "openai", model_id: "gpt-5.6-sol", variant: "low"},
+  mid: {agent: "lead-mid", provider_id: "openai", model_id: "gpt-5.6-sol", variant: "medium"},
+  high: {agent: "lead-high", provider_id: "openai", model_id: "gpt-6-astra", variant: "low"},
 };
-// OpenCode resolves an explicit/selected variant ahead of the agent variant.
+// OpenCode resolves an explicit/selected/sticky variant ahead of the agent
+// variant. The historical "stuck on medium" symptom is a session carrying a
+// previous level's variant; every case below must still land on the contract.
 function createUserMessage(level, selectedVariant) {
   const contract = CONTRACTS[level];
-  const agentVariant = level === "low" ? "medium" : "high";
+  const agentVariant = contract.variant;
   const variant = selectedVariant ?? agentVariant;
   return {agent: contract.agent, model: {providerID: "openai", modelID: contract.model_id, variant}};
 }
@@ -550,8 +552,8 @@ async function request(level, selectedVariant) {
   return {agent: saved.agent, model: saved.model.modelID, variant: saved.model.variant};
 }
 const requests = {
-  low_sticky_high: await request("low", "high"),
-  mid_sticky_medium: await request("mid", "medium"),
+  low_sticky_medium: await request("low", "medium"),
+  mid_sticky_high: await request("mid", "high"),
   high_sticky_medium: await request("high", "medium"),
   low_no_selection: await request("low", null),
   mid_no_selection: await request("mid", null),
@@ -562,12 +564,12 @@ console.log(JSON.stringify(requests));
         );
         let value = run_plugin_script(&dir);
         for (name, agent, model, variant) in [
-            ("low_sticky_high", "lead-low", "gpt-5.6-sol", "medium"),
-            ("mid_sticky_medium", "lead-mid", "gpt-5.6-sol", "high"),
-            ("high_sticky_medium", "lead-high", "gpt-6-astra", "high"),
-            ("low_no_selection", "lead-low", "gpt-5.6-sol", "medium"),
-            ("mid_no_selection", "lead-mid", "gpt-5.6-sol", "high"),
-            ("high_no_selection", "lead-high", "gpt-6-astra", "high"),
+            ("low_sticky_medium", "lead-low", "gpt-5.6-sol", "low"),
+            ("mid_sticky_high", "lead-mid", "gpt-5.6-sol", "medium"),
+            ("high_sticky_medium", "lead-high", "gpt-6-astra", "low"),
+            ("low_no_selection", "lead-low", "gpt-5.6-sol", "low"),
+            ("mid_no_selection", "lead-mid", "gpt-5.6-sol", "medium"),
+            ("high_no_selection", "lead-high", "gpt-6-astra", "low"),
         ] {
             assert_eq!(value[name]["agent"], json!(agent), "{name}");
             assert_eq!(value[name]["model"], json!(model), "{name}");

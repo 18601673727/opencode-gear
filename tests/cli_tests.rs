@@ -383,9 +383,9 @@ fn launch_exports_the_exact_lead_contract_for_each_throttle() {
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
 
     for (level, agent, model, variant) in [
-        ("low", "lead-low", "gpt-5.6-sol", "medium"),
-        ("mid", "lead-mid", "gpt-5.6-sol", "high"),
-        ("high", "lead-high", "gpt-6-astra", "high"),
+        ("low", "lead-low", "gpt-5.6-sol", "low"),
+        ("mid", "lead-mid", "gpt-5.6-sol", "medium"),
+        ("high", "lead-high", "gpt-6-astra", "low"),
     ] {
         let output = base_command(dir.path(), dir.path())
             .env("OPENCODE_GEAR_OPENCODE_BIN", &script)
@@ -404,6 +404,118 @@ fn launch_exports_the_exact_lead_contract_for_each_throttle() {
         assert_eq!(contract["model_id"], json!(model));
         assert_eq!(contract["variant"], json!(variant));
     }
+}
+
+/// The `--dry-run` config and the config/contract the bridge actually receives
+/// must agree for every throttle level. This is the contract test that closes
+/// the "config changes but the runtime does not" gap.
+#[cfg(unix)]
+#[test]
+fn dry_run_effective_config_matches_the_runtime_bridge_contract() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TestDir::new();
+    let project = dir.project();
+    let project_arg = project.to_string_lossy().into_owned();
+
+    for (level, _agent, _model, _variant) in [
+        ("low", "lead-low", "gpt-5.6-sol", "low"),
+        ("mid", "lead-mid", "gpt-5.6-sol", "medium"),
+        ("high", "lead-high", "gpt-6-astra", "low"),
+    ] {
+        let record = dir.join(&format!("runtime-{level}"));
+        let config_file = record.join("config.json");
+        let contract_file = record.join("contract.json");
+        fs::create_dir_all(&record).unwrap();
+        let script = dir.join(&format!("fake-opencode-{level}.sh"));
+        let body = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.18.31; exit 0; fi\nif [ \"$1\" = \"models\" ]; then printf '%s\\n' openai/gpt-5.6-sol openai/gpt-6-astra; exit 0; fi\nprintf '%s' \"$OPENCODE_CONFIG_CONTENT\" > \"{}\"\nprintf '%s' \"$OPENCODE_GEAR_LEAD_CONTRACT\" > \"{}\"\n",
+            config_file.display(),
+            contract_file.display()
+        );
+        fs::write(&script, body).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let launch = base_command(dir.path(), dir.path())
+            .env("OPENCODE_GEAR_OPENCODE_BIN", &script)
+            .args([
+                "--project",
+                &project_arg,
+                "--throttle",
+                level,
+                "run",
+                "hello",
+            ])
+            .output()
+            .expect("run");
+        assert!(
+            launch.status.success(),
+            "{level}: {}",
+            String::from_utf8_lossy(&launch.stderr)
+        );
+
+        let dry = base_command(dir.path(), dir.path())
+            .args(["--project", &project_arg, "--throttle", level, "--dry-run"])
+            .output()
+            .expect("dry-run");
+        assert!(dry.status.success(), "{level}: dry-run failed");
+        let dry_config = stdout_json(&dry);
+
+        let runtime_config: Value =
+            serde_json::from_str(&fs::read_to_string(&config_file).expect("runtime config"))
+                .expect("runtime config json");
+        let contract: Value =
+            serde_json::from_str(&fs::read_to_string(&contract_file).expect("contract"))
+                .expect("contract json");
+
+        // Top-level selection and the per-level Lead agent must agree.
+        assert_eq!(runtime_config["default_agent"], dry_config["default_agent"]);
+        assert_eq!(runtime_config["model"], dry_config["model"]);
+        let agent = contract["agent"].as_str().expect("contract agent");
+        assert_eq!(dry_config["default_agent"], json!(agent));
+        assert_eq!(
+            dry_config["agent"][agent], runtime_config["agent"][agent],
+            "{level}: dry-run and runtime lead agent differ"
+        );
+        let full = format!(
+            "{}/{}",
+            contract["provider_id"].as_str().unwrap(),
+            contract["model_id"].as_str().unwrap()
+        );
+        assert_eq!(dry_config["agent"][agent]["model"], json!(full));
+        assert_eq!(dry_config["agent"][agent]["variant"], contract["variant"]);
+    }
+}
+
+/// A profile is resolved from scratch on every invocation. `build` must not
+/// persist a level, so `ocg high` after `ocg low` cannot leave a sticky
+/// profile behind for a new session.
+#[test]
+fn building_a_profile_leaves_no_session_state() {
+    let dir = TestDir::new();
+    let project = dir.project();
+    let project_arg = project.to_string_lossy().into_owned();
+
+    let low = run(
+        dir.path(),
+        dir.path(),
+        &["--project", &project_arg, "--throttle", "low", "build"],
+    );
+    let high = run(
+        dir.path(),
+        dir.path(),
+        &["--project", &project_arg, "--throttle", "high", "build"],
+    );
+    assert_ne!(
+        stdout_json(&low)["default_agent"],
+        stdout_json(&high)["default_agent"]
+    );
+    assert_eq!(stdout_json(&low)["default_agent"], json!("lead-low"));
+    assert_eq!(stdout_json(&high)["default_agent"], json!("lead-high"));
+    assert!(
+        !project.join(".opencode-gear").exists(),
+        "resolving a profile must not create session/profile state"
+    );
 }
 
 #[cfg(unix)]

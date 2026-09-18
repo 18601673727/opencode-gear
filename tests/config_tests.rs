@@ -67,7 +67,7 @@ fn lead_tiers_map_to_the_expected_models() {
     );
     assert_eq!(
         effective.data["throttle"]["levels"]["low"]["variant"],
-        json!("medium")
+        json!("low")
     );
     assert_eq!(
         model::model_full_id(&effective.data, level("mid").as_str().unwrap())
@@ -77,7 +77,7 @@ fn lead_tiers_map_to_the_expected_models() {
     );
     assert_eq!(
         effective.data["throttle"]["levels"]["mid"]["variant"],
-        json!("high")
+        json!("medium")
     );
     assert_eq!(
         model::model_full_id(&effective.data, level("high").as_str().unwrap())
@@ -87,7 +87,7 @@ fn lead_tiers_map_to_the_expected_models() {
     );
     assert_eq!(
         effective.data["throttle"]["levels"]["high"]["variant"],
-        json!("high")
+        json!("low")
     );
 }
 

@@ -4,18 +4,18 @@
   "levels": {
     "low": {
       "model": "sol",
-      "variant": "medium",
-      "description": "Economical Lead. Best default when cost matters."
+      "variant": "low",
+      "description": "Economical Lead. Sol at its lowest reasoning variant; best default when cost matters."
     },
     "mid": {
       "model": "sol",
-      "variant": "high",
-      "description": "Stronger Lead reasoning on the same Sol model."
+      "variant": "medium",
+      "description": "Balanced Lead. The same Sol model at medium reasoning."
     },
     "high": {
       "model": "astra",
-      "variant": "high",
-      "description": "Premium Lead. Larger context and the stronger reasoning tier."
+      "variant": "low",
+      "description": "Premium Lead. The larger Astra model at its lowest variant for a bigger context and stronger model."
     }
   }
 }

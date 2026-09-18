@@ -76,9 +76,9 @@ is not in the list, which stops invented reasoning levels from sneaking in.
 {
   "default": "low",
   "levels": {
-    "low":  { "model": "<model key>", "variant": "medium" },
-    "mid":  { "model": "<model key>", "variant": "high" },
-    "high": { "model": "<model key>", "variant": "high" }
+    "low":  { "model": "<model key>", "variant": "low" },
+    "mid":  { "model": "<model key>", "variant": "medium" },
+    "high": { "model": "<model key>", "variant": "low" }
   }
 }
 ```
