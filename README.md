@@ -154,14 +154,6 @@ OPENCODE_GEAR_VERSION=v0.2.0 sh install.sh
 OPENCODE_GEAR_INSTALL_DIR="$HOME/bin" sh install.sh
 ```
 
-> **Release candidates.** The unpinned installer deliberately follows the
-> **latest stable** release. While `v0.2.0-rc.3` is a prerelease, pin it
-> explicitly:
->
-> ```bash
-> OPENCODE_GEAR_VERSION=v0.2.0-rc.3 sh install.sh
-> ```
-
 Supported platforms:
 
 | OS | Architecture | Artifact |

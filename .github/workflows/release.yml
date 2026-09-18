@@ -153,61 +153,80 @@ jobs:
           body: |
             OpenCode Gear ${{ github.ref_name }}
 
-            RC3 hardens runtime networking and makes the Lead throttle a
-            runtime invariant. It keeps all v0.2 orchestration, context,
-            verification and token-efficiency features.
+            OpenCode Gear (`ocg`) is a project-agnostic configuration layer for
+            OpenCode: a self-contained Rust runtime and CLI that resolves a
+            layered configuration and launches OpenCode with the merged result.
 
-            Networking and updates
+            Core
 
-            - Coherent proxy policy: one resolved proxy per command, with
-              precedence `--disable-proxy` > `OPENCODE_GEAR_DISABLE_PROXY` >
-              standard `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`
-              (upper- or lower-case) > macOS system proxy > direct.
-            - macOS static System Configuration proxy discovery through
-              `/usr/sbin/scutil --proxy` (static HTTP/HTTPS plus a safe
-              exception list).
-            - `--disable-proxy` and `OPENCODE_GEAR_DISABLE_PROXY=1` force direct
-              connections and strip every proxy variable from child processes.
-            - GitHub API rate-limit diagnostics: a refused request reports the
-              rate-limit resource, limit, remaining and reset instead of a bare
-              HTTP status.
-            - `GH_TOKEN` (preferred) then `GITHUB_TOKEN` are used for OCG's own
-              GitHub API requests, and are attached only to `api.github.com`.
-            - The system OpenCode upgrade runs
-              `opencode upgrade <resolved-version>`, so upstream does not need a
-              second latest-release lookup; a compatible system runtime is kept
-              when the lookup or the upgrade fails.
+            - Self-contained Rust `ocg` runtime and CLI.
+            - Layered configuration: embedded defaults -> user config ->
+              project config -> CLI / environment.
+            - Managed and system OpenCode runtime handling, including a
+              compatible-runtime fallback and `opencode upgrade` delegation.
+            - Lead throttle enforcement: the selected agent, model and reasoning
+              variant are enforced on the actual Lead request.
+            - Consumer Router independence: EXPLORE / BUILD / VERIFY / DEBUG
+              routing never follows the throttle.
 
-            Runtime contracts
+            Default Lead contracts
 
-            - Runtime provider/model preflight: a coding launch verifies that
-              the selected OpenCode runtime exposes every configured model, and
-              a missing active Lead model blocks the launch instead of silently
+            ```
+            low   lead-low   openai/gpt-5.6-sol   low
+            mid   lead-mid   openai/gpt-5.6-sol   medium
+            high  lead-high  openai/gpt-6-astra   low
+            ```
+
+            Diagnostics
+
+            `ocg doctor` reports:
+            - config layering (embedded / user / project);
+            - the effective Lead contracts for every throttle level;
+            - Consumer Router visibility, independent of the throttle;
+            - the OpenCode path and runtime OCG would launch, with a WARN when
+              they differ;
+            - provider and model readiness against the resolved OpenCode
+              runtime catalogue;
+            - proxy diagnostics; and
+            - a PASS / INFO / WARN / FAIL summary (only FAIL exits non-zero).
+
+            Reliability
+
+            - Regression coverage for the "stuck on medium" failure mode.
+            - Runtime contract enforcement: sticky agent/model/variant state or
+              a reused session cannot change the selected Lead contract.
+            - A missing active Lead model blocks the launch instead of silently
               falling back to another model.
-            - Runtime Lead throttle enforcement: the selected agent, model and
-              reasoning variant are enforced on the actual Lead request, so
-              sticky model/variant state or a reused session cannot change it.
-              Consumer routing is unaffected.
+            - Consumer routing is unaffected by throttle switching.
 
-            Lead contracts
+            Token efficiency and orchestration
 
-            ```
-            low   lead-low   openai/gpt-5.6-sol   medium
-            mid   lead-mid   openai/gpt-5.6-sol   high
-            high  lead-high  openai/gpt-6-astra   high
-            ```
+            - A local repository context engine (repo map, symbol index, git
+              diff summary, ranked file selection) producing a structured
+              context capsule.
+            - Log distillation that reduces noisy build/test output to the
+              failing signal.
+            - Optional Explore -> Build -> Verify (-> Debug) orchestration with
+              typed, role-specific hand-offs and versioned checkpoints.
+            - Local, offline efficiency telemetry (`ocg stats`) with a
+              privacy-preserving schema; no network reporting.
 
             Known limitations
 
-            - PAC configuration is detected and reported, but not evaluated.
+            - PAC configuration is detected but not evaluated.
             - OCG's own HTTP client does not consume SOCKS proxy URLs; a SOCKS
-              environment value is preserved for child OpenCode processes.
+              environment value is preserved verbatim for child OpenCode
+              processes.
 
-            The unpinned installer follows the latest stable release by design.
-            Pin this candidate explicitly:
+            Install
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/18601673727/opencode-gear/main/install.sh | sh
+            ```
+
+            The unpinned installer follows the latest stable release. To pin
+            this release explicitly:
 
             ```bash
             OPENCODE_GEAR_VERSION=${{ github.ref_name }} sh install.sh
             ```
-
-            This is a release candidate intended for real-world testing.
