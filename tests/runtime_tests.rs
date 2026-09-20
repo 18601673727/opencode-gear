@@ -8,10 +8,15 @@ mod common;
 
 use common::TestDir;
 use opencode_gear::clock::FixedClock;
+use opencode_gear::error::GearError;
 use opencode_gear::http::MemoryHttp;
 use opencode_gear::platform::Platform;
 use opencode_gear::process::{is_executable, FakeProcessHost};
 use opencode_gear::runtime::cache::CacheRecord;
+use opencode_gear::runtime::compat::{
+    self, adapter_for, classify, detect, detect_from_host, EffectiveLead, LeadSelection,
+    MemorySessionClient, Observation,
+};
 use opencode_gear::runtime::hash::sha256_hex;
 use opencode_gear::runtime::install::{install_opencode, ActiveRuntime, Layout};
 use opencode_gear::runtime::policy::RuntimePolicy;
@@ -1018,4 +1023,131 @@ fn install_repairs_a_non_executable_partial_binary() {
     install_opencode(dir.path(), platform(), &version, &release, &http, &clock).unwrap();
     assert!(is_executable(&binary));
     assert_eq!(fs::read(&binary).unwrap(), b"#!/bin/sh\necho 1.18.31\n");
+}
+
+// --- runtime compatibility boundary (V1 vs V2) ------------------------------
+
+#[test]
+fn v1_adapter_preserves_the_supported_118_contract() {
+    let detected = detect("1.18.31").unwrap();
+    let adapter = adapter_for(&detected);
+    assert_eq!(adapter.major(), compat::Major::V1);
+    assert_eq!(adapter.plugin_key(), "plugin");
+    assert_eq!(adapter.task_key(), "task");
+    assert_eq!(adapter.launch_mode(), compat::LaunchMode::Exec);
+    assert_eq!(
+        adapter.lead_selection(),
+        compat::LeadSelectionMode::RequestMessage
+    );
+    // The v1 generated adapter still enforces the exact Lead request contract.
+    assert!(adapter
+        .plugin_source()
+        .contains("output.message.agent = contract.agent"));
+    assert!(adapter.is_task_tool("task"));
+}
+
+#[test]
+fn a_2_0_x_runtime_selects_the_v2_adapter() {
+    for raw in ["2.0.0", "2.0.10", "2.1.2", "opencode v2.0.10"] {
+        let detected = detect(raw).unwrap();
+        assert_eq!(detected.major(), compat::Major::V2, "{raw}");
+        let adapter = adapter_for(&detected);
+        assert_eq!(adapter.plugin_key(), "plugins", "{raw}");
+        assert_eq!(adapter.task_key(), "subagent", "{raw}");
+        assert_eq!(adapter.launch_mode(), compat::LaunchMode::Daemon, "{raw}");
+        assert_eq!(
+            adapter.lead_selection(),
+            compat::LeadSelectionMode::Session,
+            "{raw}"
+        );
+        assert!(adapter.is_task_tool("subagent"), "{raw}");
+    }
+    assert_eq!(
+        classify(Version::new(2, 0, 10)).unwrap().major(),
+        compat::Major::V2
+    );
+    assert_eq!(compat::v2_verified_baseline(), Version::new(2, 0, 10));
+}
+
+#[test]
+fn an_unsupported_or_incompatible_major_fails_clearly() {
+    for raw in ["3.0.0", "0.1.0", "1.17.0", "garbage"] {
+        let error = detect(raw).unwrap_err();
+        assert!(!error.to_string().is_empty(), "{raw}");
+    }
+}
+
+#[test]
+fn the_runtime_major_is_detected_through_the_process_host() {
+    let dir = TestDir::new();
+    let binary = dir.join("opencode-v2");
+    write_executable(&binary, "#!/bin/sh\necho 2.0.10\n");
+    let process = FakeProcessHost::new().with_default_version("2.0.10");
+    let detected = detect_from_host(&process, &binary).unwrap();
+    assert_eq!(detected.major(), compat::Major::V2);
+    assert_eq!(detected.version(), &Version::new(2, 0, 10));
+}
+
+fn compat_lead() -> LeadSelection {
+    LeadSelection {
+        level: "high".to_string(),
+        agent: "lead-high".to_string(),
+        provider_id: "openai".to_string(),
+        model_id: "gpt-6-astra".to_string(),
+        variant: Some("low".to_string()),
+    }
+}
+
+#[test]
+fn v2_session_level_lead_selection_is_deterministic() {
+    let lead = compat_lead();
+    let run = || {
+        let mut client = MemorySessionClient::new().with_session_id("session-7");
+        compat::select_session_lead(&mut client, &lead).unwrap()
+    };
+    let first = run();
+    let second = run();
+    assert_eq!(first, second, "session selection must be deterministic");
+    assert_eq!(first.session_id, "session-7");
+    assert_eq!(first.lead, lead);
+}
+
+#[test]
+fn a_contradictory_active_lead_fails_selection() {
+    let lead = compat_lead();
+    let effective = EffectiveLead {
+        agent: Some("lead-low".to_string()),
+        provider_id: Some("openai".to_string()),
+        model_id: Some("gpt-5.6-sol".to_string()),
+        variant: Some("low".to_string()),
+    };
+    let mut client = MemorySessionClient::new().with_effective(effective);
+    let error = compat::select_session_lead(&mut client, &lead).unwrap_err();
+    assert!(error.to_string().contains("contradictory"), "{error}");
+
+    // An unavailable effective Lead is equally a failure.
+    let mut unavailable = MemorySessionClient::new().failing_effective("daemon offline");
+    let error = compat::select_session_lead(&mut unavailable, &lead).unwrap_err();
+    assert!(error.to_string().contains("daemon offline"), "{error}");
+}
+
+#[test]
+fn optional_observations_warn_and_continue() {
+    let mut warnings = Vec::new();
+    let observation: Observation<u32> = compat::observe_optional(
+        Err(GearError::config("catalogue offline")),
+        "catalogue",
+        &mut warnings,
+    );
+    assert_eq!(observation.unavailable_reason(), Some("catalogue offline"));
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].contains("optional catalogue"),
+        "{}",
+        warnings[0]
+    );
+
+    let observed: Observation<u32> = compat::observe_optional(Ok(3), "catalogue", &mut warnings);
+    assert_eq!(observed.observed(), Some(3));
+    assert_eq!(warnings.len(), 1, "a successful probe adds no warning");
 }

@@ -56,19 +56,10 @@ pub fn validate(effective: &Effective) -> Vec<String> {
                 "throttle level '{level}' references unknown model '{model_key}'"
             ));
         }
-        // The Lead request contract is enforced at runtime with an explicit
-        // variant, so static validation must require it too. Otherwise a config
-        // could pass `validate`/`doctor` and still fail every coding launch.
-        if spec
-            .get("variant")
-            .and_then(Value::as_str)
-            .map(str::is_empty)
-            .unwrap_or(true)
-        {
-            errors.push(format!(
-                "throttle level '{level}' must define a runtime 'variant' (the Lead request contract is enforced with an explicit variant)"
-            ));
-        }
+        // A reasoning variant is optional and provider-specific. When the
+        // throttle declares none, the Lead runs at the provider default; it is
+        // never fabricated. A declared variant must still be one the model
+        // actually exposes (checked by `validate_variant`).
         validate_variant(
             data,
             spec,
@@ -213,10 +204,18 @@ fn validate_variant(data: &Value, spec: &Value, location: &str, errors: &mut Vec
     let Some(variant) = spec.get("variant") else {
         return;
     };
+    // `null` and the empty string both mean "provider default": the variant is
+    // absent, not invalid.
+    if variant.is_null() {
+        return;
+    }
     let Some(variant) = variant.as_str() else {
         errors.push(format!("{location}: variant must be a string"));
         return;
     };
+    if variant.is_empty() {
+        return;
+    }
     let model_key = spec.get("model").and_then(Value::as_str).unwrap_or("");
     let Some(entry) = model::model_registry(data)
         .and_then(|registry| registry.get(model_key))

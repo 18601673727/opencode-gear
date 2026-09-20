@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{write_json, TestDir};
+use common::{write_json, write_yaml, TestDir};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
@@ -35,7 +35,7 @@ fn base_command(cwd: &Path, work: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ocg"));
     command
         .current_dir(cwd)
-        .env("OPENCODE_GEAR_USER_CONFIG", work.join("no-user.json"))
+        .env("OPENCODE_GEAR_USER_CONFIG", work.join("no-user.yaml"))
         .env_remove("OPENCODE_GEAR_PROJECT_CONFIG")
         .env_remove("OPENCODE_GEAR_THROTTLE")
         .env_remove("OPENCODE_GEAR_HOME")
@@ -177,7 +177,7 @@ fn report_subcommands() {
     let dir = TestDir::new();
     let status = run(dir.path(), dir.path(), &["status"]);
     assert!(status.status.success());
-    assert!(stdout_text(&status).contains("Throttle (OpenAI Lead tier)"));
+    assert!(stdout_text(&status).contains("Throttle (Lead tier)"));
 
     let routing = run(dir.path(), dir.path(), &["routing"]);
     assert!(routing.status.success());
@@ -192,12 +192,56 @@ fn report_subcommands() {
     assert!(stdout_text(&layers).contains("gear home"));
 }
 
+/// When a Lead model declares no reasoning variant, status and doctor must say
+/// `provider-default` rather than inventing a value.
+#[test]
+fn status_and_doctor_report_provider_default_when_no_variant_is_configured() {
+    let dir = TestDir::new();
+    let project = dir.project();
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
+        &json!({"throttle": {"levels": {"high": {"model": "kimi-k3", "variant": null}}}}),
+    );
+    let project_arg = project.to_string_lossy().into_owned();
+
+    let status = run(
+        dir.path(),
+        dir.path(),
+        &["--project", &project_arg, "--throttle", "high", "status"],
+    );
+    assert!(status.status.success(), "{}", stdout_text(&status));
+    let text = stdout_text(&status);
+    assert!(text.contains("provider-default"), "{text}");
+    assert!(text.contains("volcengine-coding/kimi-k3"), "{text}");
+    assert!(
+        !text.contains("kimi-k3 variant"),
+        "status must not fabricate a variant: {text}"
+    );
+
+    let doctor = run(
+        dir.path(),
+        dir.path(),
+        &[
+            "--project",
+            &project_arg,
+            "--disable-proxy",
+            "--throttle",
+            "high",
+            "doctor",
+        ],
+    );
+    assert!(doctor.status.success(), "{}", stdout_text(&doctor));
+    let text = stdout_text(&doctor);
+    assert!(text.contains("provider-default"), "{text}");
+    assert!(text.contains("volcengine-coding/kimi-k3"), "{text}");
+}
+
 #[test]
 fn project_override_changes_routing_without_leaking() {
     let dir = TestDir::new();
     let project = dir.project();
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({
             "throttle": {"default": "mid"},
             "routing": {"roles": {"build": {"model": "glm-5.3", "variant": "high"}}}
@@ -224,8 +268,8 @@ fn project_override_changes_routing_without_leaking() {
 fn invalid_override_fails() {
     let dir = TestDir::new();
     let project = dir.project();
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"routing": {"roles": {"build": {"model": "does-not-exist"}}}}),
     );
     let project_arg = project.to_string_lossy().into_owned();
@@ -270,7 +314,7 @@ fn conflicting_positional_and_flag_throttle_fails() {
 #[test]
 fn throttle_persistence_round_trips() {
     let dir = TestDir::new();
-    let user = dir.join("user-config.json");
+    let user = dir.join("user-config.yaml");
     let user_arg = user.to_string_lossy().into_owned();
     let output = base_command(dir.path(), dir.path())
         .args(["--user-config", &user_arg, "throttle", "high"])
@@ -809,4 +853,218 @@ fn disable_proxy_environment_strips_every_proxy_variable_for_the_launch() {
         &["run", "hello"],
     );
     assert_eq!(env_value(&lines, "HTTPS_PROXY"), None);
+}
+
+#[test]
+fn init_creates_a_valid_noop_project_config() {
+    let dir = TestDir::new();
+    let project = dir.project();
+    let project_arg = project.to_string_lossy().into_owned();
+
+    let output = run(dir.path(), dir.path(), &["--project", &project_arg, "init"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout_text(&output).contains("created"));
+
+    let path = project.join(".opencode-gear.yaml");
+    assert!(path.is_file(), "init must create the project YAML");
+    let text = fs::read_to_string(&path).expect("read init file");
+    assert!(text.contains("OpenCode Gear project configuration"));
+    // No credentials or local state are ever written.
+    let lower = text.to_lowercase();
+    for token in ["token", "password", "secret", "api_key", "authorization"] {
+        assert!(!lower.contains(token), "init leaked '{token}'");
+    }
+
+    // The generated file passes `validate` and is a semantic no-op.
+    let validate = run(
+        dir.path(),
+        dir.path(),
+        &["--project", &project_arg, "validate"],
+    );
+    assert!(
+        validate.status.success(),
+        "{}",
+        String::from_utf8_lossy(&validate.stderr)
+    );
+    let dry_run = run(
+        dir.path(),
+        dir.path(),
+        &["--project", &project_arg, "--dry-run"],
+    );
+    assert_eq!(stdout_json(&dry_run)["default_agent"], json!("lead-low"));
+}
+
+#[test]
+fn init_is_safe_to_repeat_and_does_not_overwrite() {
+    let dir = TestDir::new();
+    let project = dir.project();
+    let project_arg = project.to_string_lossy().into_owned();
+
+    assert!(
+        run(dir.path(), dir.path(), &["--project", &project_arg, "init"])
+            .status
+            .success()
+    );
+    let path = project.join(".opencode-gear.yaml");
+    let original = fs::read_to_string(&path).expect("read init file");
+    let edited = format!("{original}# keep my edit\n");
+    fs::write(&path, &edited).expect("edit");
+
+    let again = run(dir.path(), dir.path(), &["--project", &project_arg, "init"]);
+    assert!(again.status.success());
+    assert!(stdout_text(&again).contains("already exists"));
+    assert_eq!(fs::read_to_string(&path).expect("reread"), edited);
+}
+
+#[test]
+fn init_refuses_on_stale_project_json() {
+    let dir = TestDir::new();
+    let project = dir.project();
+    write_json(&project.join(".opencode-gear.json"), &json!({}));
+    let project_arg = project.to_string_lossy().into_owned();
+
+    let output = run(dir.path(), dir.path(), &["--project", &project_arg, "init"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(".opencode-gear.json"), "{stderr}");
+    assert!(stderr.contains(".opencode-gear.yaml"), "{stderr}");
+    assert!(!project.join(".opencode-gear.yaml").exists());
+}
+
+#[test]
+fn stale_project_json_is_rejected_by_the_binary() {
+    let dir = TestDir::new();
+    let project = dir.project();
+    write_json(
+        &project.join(".opencode-gear.json"),
+        &json!({"throttle": {"default": "high"}}),
+    );
+    let project_arg = project.to_string_lossy().into_owned();
+
+    let output = run(
+        dir.path(),
+        dir.path(),
+        &["--project", &project_arg, "--dry-run"],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(".opencode-gear.json"), "{stderr}");
+    assert!(stderr.contains(".opencode-gear.yaml"), "{stderr}");
+}
+
+#[test]
+fn stale_user_json_is_rejected_by_the_binary() {
+    let dir = TestDir::new();
+    let user_yaml = dir.join("user-config.yaml");
+    write_json(
+        &dir.join("user-config.json"),
+        &json!({"throttle": {"default": "high"}}),
+    );
+
+    let output = base_command(dir.path(), dir.path())
+        .args(["--user-config", user_yaml.to_str().unwrap(), "--dry-run"])
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("user-config.json"), "{stderr}");
+    assert!(stderr.contains("user-config.yaml"), "{stderr}");
+}
+
+#[test]
+fn layers_command_reports_yaml_paths() {
+    let dir = TestDir::new();
+    let project = dir.project();
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
+        &json!({"throttle": {"default": "mid"}}),
+    );
+    let project_arg = project.to_string_lossy().into_owned();
+    let output = run(
+        dir.path(),
+        dir.path(),
+        &["--project", &project_arg, "layers"],
+    );
+    assert!(output.status.success());
+    let text = stdout_text(&output);
+    assert!(text.contains(".opencode-gear.yaml"), "{text}");
+}
+
+#[test]
+fn throttle_refuses_to_persist_to_a_json_path() {
+    let dir = TestDir::new();
+    let user = dir.join("user-config.json");
+    let output = base_command(dir.path(), dir.path())
+        .args(["--user-config", user.to_str().unwrap(), "throttle", "high"])
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!user.exists(), "no JSON config may be written");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("YAML only"), "{stderr}");
+}
+
+#[test]
+fn ocg_owned_args_are_consumed_and_the_rest_is_forwarded_faithfully() {
+    use opencode_gear::cli::{parse, Command};
+
+    let argv = |args: &[&str]| {
+        args.iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>()
+    };
+
+    // OCG-owned flags before the command are consumed; everything after `run`
+    // is forwarded verbatim, even when it looks OCG-owned.
+    let cli = parse(argv(&[
+        "--throttle",
+        "high",
+        "run",
+        "--throttle",
+        "x",
+        "hello",
+    ]))
+    .unwrap();
+    assert_eq!(cli.throttle.as_deref(), Some("high"));
+    match cli.command {
+        Command::Run(args) => {
+            let forwarded: Vec<String> = args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(forwarded, ["--throttle", "x", "hello"]);
+        }
+        other => panic!("expected run, got {other:?}"),
+    }
+
+    // A `run` subcommand with no OCG flags forwards every argument untouched.
+    let cli = parse(argv(&["run", "--model", "z", "--project", "/tmp/x"])).unwrap();
+    assert!(cli.throttle.is_none());
+    match cli.command {
+        Command::Run(args) => {
+            let forwarded: Vec<String> = args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(forwarded, ["--model", "z", "--project", "/tmp/x"]);
+        }
+        other => panic!("expected run, got {other:?}"),
+    }
+
+    // `--` terminates OCG parsing and forwards the remainder.
+    let cli = parse(argv(&["--", "run", "a", "b"])).unwrap();
+    match cli.command {
+        Command::Run(args) => {
+            let forwarded: Vec<String> = args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(forwarded, ["a", "b"]);
+        }
+        other => panic!("expected run, got {other:?}"),
+    }
 }

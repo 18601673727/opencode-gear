@@ -77,10 +77,10 @@ pub fn load_disk_effective(
     let defaults = load_defaults(&GearSource::Dir(home.to_path_buf())).expect("defaults");
     let user_path = user
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| project.join("no-user.json"));
+        .unwrap_or_else(|| project.join("no-user.yaml"));
     let project_path = project_config
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| project.join(".opencode-gear.json"));
+        .unwrap_or_else(|| project.join(".opencode-gear.yaml"));
     build_effective(
         defaults,
         Some(home.to_path_buf()),
@@ -94,9 +94,28 @@ pub fn load_disk_effective(
 
 pub fn load_embedded_effective(project: &Path) -> Effective {
     let defaults = load_defaults(&GearSource::Embedded).expect("defaults");
-    let user_path = project.join("no-user.json");
-    let project_path = project.join(".opencode-gear.json");
+    let user_path = project.join("no-user.yaml");
+    let project_path = project.join(".opencode-gear.yaml");
     build_effective(defaults, None, project, &user_path, &project_path, None).expect("effective")
+}
+
+pub fn write_yaml(path: &Path, value: &Value) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create parent");
+    }
+    let text = opencode_gear::yaml::to_yaml_string(value).expect("serialize yaml");
+    fs::write(path, text).expect("write yaml");
+}
+
+pub fn read_yaml(path: &Path) -> Value {
+    let text = fs::read_to_string(path).expect("read yaml");
+    opencode_gear::yaml::parse_yaml_object(&path.display().to_string(), &text).expect("parse yaml")
+}
+
+pub fn patch_yaml<F: FnOnce(&mut Value)>(path: &Path, mutate: F) {
+    let mut value = read_yaml(path);
+    mutate(&mut value);
+    write_yaml(path, &value);
 }
 
 pub fn write_json(path: &Path, value: &Value) {

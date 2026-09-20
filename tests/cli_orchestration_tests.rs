@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{write_json, TestDir};
+use common::{write_yaml, TestDir};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::Path;
@@ -13,7 +13,7 @@ fn base_command(cwd: &Path, work: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ocg"));
     command
         .current_dir(cwd)
-        .env("OPENCODE_GEAR_USER_CONFIG", work.join("no-user.json"))
+        .env("OPENCODE_GEAR_USER_CONFIG", work.join("no-user.yaml"))
         .env_remove("OPENCODE_GEAR_PROJECT_CONFIG")
         .env_remove("OPENCODE_GEAR_THROTTLE")
         .env_remove("OPENCODE_GEAR_HOME")
@@ -73,8 +73,8 @@ fn project(dir: &TestDir) -> std::path::PathBuf {
 fn enabled_build_injects_plugin_and_preserves_user_plugins() {
     let dir = TestDir::new();
     let project = project(&dir);
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"opencode": {"plugin": ["my-user-plugin"]}}),
     );
     let output = run(&project, dir.path(), &["build", "--pretty"]);
@@ -371,10 +371,10 @@ fn launch_propagates_explicit_config_paths_to_the_bridge_environment() {
 
     let dir = TestDir::new();
     let project = project(&dir);
-    let user_config = dir.join("explicit-user.json");
-    let project_config = dir.join("explicit-project.json");
-    write_json(&user_config, &json!({}));
-    write_json(
+    let user_config = dir.join("explicit-user.yaml");
+    let project_config = dir.join("explicit-project.yaml");
+    write_yaml(&user_config, &json!({}));
+    write_yaml(
         &project_config,
         &json!({"verification": {"stages": {"normal": {"commands": ["cargo check --locked"]}}}}),
     );

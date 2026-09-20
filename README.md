@@ -8,7 +8,7 @@ agent setups accidentally fuse together:
 
 ```text
 THROTTLE
-    how strong (and how expensive) the OpenAI Lead is
+    how strong (and how expensive) the Lead is
         low  /  mid  /  high
 
 CONSUMER ROUTER
@@ -66,7 +66,7 @@ specialists that are good at their one job and cheap enough to use often.
 User
  │
  ▼
-OpenAI Lead                      ← throttle picks the tier
+Lead                             ← throttle picks the tier
  │
  ├── understand
  ├── reason
@@ -75,7 +75,7 @@ OpenAI Lead                      ← throttle picks the tier
  ├── delegate ────────────────┐
  └── accept / reject results  │
                               ▼
-                     Consumer Router        ← config/routing.json
+                     Consumer Router        ← config/routing.yaml
                               │
       ┌───────────────┬───────┴────────┬────────────────┐
       ▼               ▼                ▼                ▼
@@ -91,9 +91,9 @@ launches `opencode` with the merged result through `OPENCODE_CONFIG_CONTENT`:
 ```text
 OpenCode Gear embedded defaults  (compiled into ocg)
         ↓
-user config                      (~/.config/opencode-gear/config.json)
+user config                      (~/.config/opencode-gear/config.yaml)
         ↓
-project config                   (<project>/.opencode-gear.json)
+project config                   (<project>/.opencode-gear.yaml)
         ↓
 CLI / environment                (ocg high, --throttle, OPENCODE_GEAR_THROTTLE)
 ```
@@ -150,7 +150,7 @@ export PATH="$HOME/.local/bin:$PATH"
 To pin a release, or to choose another directory:
 
 ```bash
-OPENCODE_GEAR_VERSION=v0.2.0 sh install.sh
+OPENCODE_GEAR_VERSION=v0.3.0 sh install.sh
 OPENCODE_GEAR_INSTALL_DIR="$HOME/bin" sh install.sh
 ```
 
@@ -176,9 +176,9 @@ directory.
 | Requirement | Notes |
 | --- | --- |
 | Rust 1.88+ | Build-time only; the released `ocg` binary is self-contained. |
-| OpenCode | **1.18.0 or newer.** `ocg` uses `OPENCODE_CONFIG_CONTENT`. |
+| OpenCode | **1.18.x or 2.x.** Version-specific behaviour lives behind one compatibility boundary (v1/v2 adapters); `ocg` always uses `OPENCODE_CONFIG_CONTENT`. |
 | OpenAI plan/credentials | For the Lead (`openai` provider). |
-| Volcano Coding Plan Pro | For the EXPLORE models (Kimi). Declared in `config/base.json`. |
+| Volcano Coding Plan Pro | For the EXPLORE models (Kimi). Declared in `config/base.yaml`. |
 | OpenCode Go | For BUILD / VERIFY / DEBUG (DeepSeek and GLM). |
 
 `ocg` can install and manage OpenCode itself (see
@@ -230,7 +230,7 @@ ocg --dry-run               # print the merged OpenCode config, launch nothing
 ```
 
 Run these from any project directory. OpenCode starts in the current working
-directory, and project-local overrides are read from `.opencode-gear.json`
+directory, and project-local overrides are read from `.opencode-gear.yaml`
 there.
 
 ## Managed runtime
@@ -246,9 +246,14 @@ For every launch the executable is resolved in this exact order:
 ```text
 1. explicit executable   OPENCODE_GEAR_OPENCODE (or compat aliases)
 2. managed project       <project>/.opencode-gear/runtime/opencode/...
-3. system PATH           an `opencode` on PATH, if >= 1.18.0
+3. system PATH           an `opencode` on PATH, if 1.18.x or 2.x
 4. project-local bootstrap   install a managed runtime for this project
 ```
+
+The resolved runtime's `--version` is classified explicitly. A `1.18.x`
+runtime uses the v1 adapter (`plugin`, `task`, request-scoped Lead); a `2.x`
+runtime uses the v2 adapter (`plugins`, `subagent`, session-scoped Lead). An
+unsupported major fails clearly instead of guessing.
 
 Rules that fall out of this:
 
@@ -281,16 +286,13 @@ remain valid compatibility aliases; the canonical name wins.
 Policy lives in a small top-level `runtime` object (never in the raw
 `opencode` config key):
 
-```jsonc
-{
-  "runtime": {
-    "channel": "latest",          // only supported channel
-    "autoUpgrade": true,          // upgrade managed runtimes when due
-    "checkIntervalHours": 24,     // update-check cache interval
-    "fallback": "project-local",  // bootstrap target
-    "version": "1.18.31"          // optional exact semver pin
-  }
-}
+```yaml
+runtime:
+  channel: latest          # only supported channel
+  autoUpgrade: true        # upgrade managed runtimes when due
+  checkIntervalHours: 24   # update-check cache interval
+  fallback: project-local  # bootstrap target
+  version: 1.18.31         # optional exact semver pin
 ```
 
 All fields are optional; the defaults above are used when the object is
@@ -356,12 +358,12 @@ ocg doctor
 ```text
 OpenCode Gear doctor
   platform               [PASS] linux-x86_64
-  gear                   [PASS] /usr/local/bin/ocg (Gear 0.2.0)
+  gear                   [PASS] /usr/local/bin/ocg (Gear 0.3.0)
   ...
 config layering
   defaults               [PASS] embedded in the binary (no OPENCODE_GEAR_HOME)
-  user config            [INFO] ~/.config/opencode-gear/config.json (not present)
-  project config         [PASS] /work/app/.opencode-gear.json
+  user config            [INFO] ~/.config/opencode-gear/config.yaml (not present)
+  project config         [PASS] /work/app/.opencode-gear.yaml
   project root           [PASS] /work/app
 effective Lead contracts
   lead-low               [PASS] openai/gpt-5.6-sol variant low (active)
@@ -423,7 +425,9 @@ bootstrap.
 
 ## Throttle semantics
 
-Throttle selects the OpenAI Lead tier only.
+Throttle selects the Lead tier only. The Lead is provider-agnostic: the shipped
+defaults use OpenAI, but any configured provider/model works, and a Lead model
+may omit a reasoning variant to run at the provider default.
 
 | Level | Lead | Reasoning | Intent |
 | --- | --- | --- | --- |
@@ -433,8 +437,8 @@ Throttle selects the OpenAI Lead tier only.
 
 Notes:
 
-- The model ids and reasoning variants are centralised in `config/models.json`
-  and `config/throttle.json`. Swap a model there and nothing else changes.
+- The model ids and reasoning variants are centralised in `config/models.yaml`
+  and `config/throttle.yaml`. Swap a model there and nothing else changes.
 - **Throttle only changes the Lead contract.** It never rebuilds, copies or
   follows the Consumer Router, so EXPLORE / BUILD / VERIFY / DEBUG stay bound to
   the same models at every level.
@@ -443,9 +447,9 @@ Notes:
 - **Throttle never decides which consumer handles EXPLORE / BUILD / VERIFY.**
 - Precedence: positional `ocg high` / `--throttle` > `OPENCODE_GEAR_THROTTLE`
   (legacy `OC_GEAR_THROTTLE`) > project config > user config >
-  `config/throttle.json` default.
+  `config/throttle.yaml` default.
 
-Persist a default (writes `~/.config/opencode-gear/config.json`):
+Persist a default (writes `~/.config/opencode-gear/config.yaml`):
 
 ```bash
 ocg throttle mid
@@ -466,8 +470,9 @@ ocg throttle          # print the resolved default
 Roles are arbitrary: you can add a new role with its own model and prompt in an
 override. The shipped six roles are the baseline, not a hard limit.
 
-OpenAI is **not** part of the normal consumer pool. The Lead is the only
-OpenAI agent.
+The Lead model is **not** part of the normal consumer pool: it is never a
+consumer target. In the shipped routing, no OpenAI model appears in the
+Consumer Router.
 
 ### Escalation rules
 
@@ -508,8 +513,8 @@ because another provider also offers it:
 | GPT-5.6 Sol | OpenAI | Lead (low / mid) |
 | GPT-6 Astra | OpenAI | Lead (high) |
 
-Model ids live in `config/models.json`; role assignments live in
-`config/routing.json`; throttle levels live in `config/throttle.json`.
+Model ids live in `config/models.yaml`; role assignments live in
+`config/routing.yaml`; throttle levels live in `config/throttle.yaml`.
 
 ## Configuration and overrides
 
@@ -518,48 +523,63 @@ deep-merged, so you only write the keys you want to change. The top-level keys
 mirror the files in `config/`: `throttle`, `models`, `routing`, `permissions`,
 plus the gear-only extras `prompts`, `observability`, `runtime` and `opencode`.
 
-```jsonc
-{
-  // pick a different default Lead tier
-  "throttle": { "default": "mid" },
+```yaml
+# pick a different default Lead tier
+throttle:
+  default: mid
 
-  // re-point one role
-  "routing": { "roles": { "build": { "model": "glm-5.3", "variant": "max" } } },
+# re-point one role
+routing:
+  roles:
+    build:
+      model: glm-5.3
+      variant: max
 
-  // add or re-point a model (same shape as config/models.json)
-  "models": {
-    "models": {
-      "sol": { "provider": "openai", "id": "gpt-5.6-sol", "label": "GPT-5.6 Sol",
-               "variants": ["none", "low", "medium", "high", "xhigh", "max"] }
-    }
-  },
+# add or re-point a model (same shape as config/models.yaml)
+models:
+  models:
+    sol:
+      provider: openai
+      id: gpt-5.6-sol
+      label: GPT-5.6 Sol
+      variants: [none, low, medium, high, xhigh, max]
 
-  // extend a prompt instead of replacing it (recommended for project policy)
-  "prompts": { "lead": { "append": [".opencode/lead-policy.md"] } },
+# extend a prompt instead of replacing it (recommended for project policy)
+prompts:
+  lead:
+    append:
+      - .opencode/lead-policy.md
 
-  // or replace a prompt entirely (path, or {"text": "..."})
-  // "prompts": { "lead": "~/prompts/my-lead.md" },
+# or replace a prompt entirely (path, or text)
+# prompts:
+#   lead: ~/prompts/my-lead.md
 
-  // optional local routing trace
-  "observability": { "enabled": true, "path": "~/state/opencode-gear/events.jsonl" },
+# optional local routing trace
+observability:
+  enabled: true
+  path: ~/state/opencode-gear/events.jsonl
 
-  // raw OpenCode config merged into the result last
-  "opencode": { "username": "you" }
-}
+# raw OpenCode config merged into the result last
+opencode:
+  username: you
 ```
 
 To redefine a throttle level, override the `throttle` registry itself:
 
-```json
-{ "throttle": { "levels": { "high": { "model": "astra", "variant": "xhigh" } } } }
+```yaml
+throttle:
+  levels:
+    high:
+      model: astra
+      variant: xhigh
 ```
 
 Locations:
 
 | Layer | Default path | Override with |
 | --- | --- | --- |
-| User | `~/.config/opencode-gear/config.json` | `OPENCODE_GEAR_USER_CONFIG` (legacy `OC_GEAR_USER_CONFIG`) or `--user-config` |
-| Project | `<project>/.opencode-gear.json` | `OPENCODE_GEAR_PROJECT_CONFIG` (legacy `OC_GEAR_PROJECT_CONFIG`) or `--project-config` |
+| User | `~/.config/opencode-gear/config.yaml` | `OPENCODE_GEAR_USER_CONFIG` (legacy `OC_GEAR_USER_CONFIG`) or `--user-config` |
+| Project | `<project>/.opencode-gear.yaml` | `OPENCODE_GEAR_PROJECT_CONFIG` (legacy `OC_GEAR_PROJECT_CONFIG`) or `--project-config` |
 
 `ocg --project DIR` resolves the project layer against `DIR` and launches
 OpenCode there. Precedence is project over user over defaults. Validate at any
@@ -587,8 +607,11 @@ The recommended shape is an **append**, not a replacement, so the gear prompt
 keeps improving while project policy stays independent:
 
 ```text
-<project>/.opencode-gear.json      # project override
-{ "prompts": { "lead": { "append": [".opencode/lead-policy.md"] } } }
+<project>/.opencode-gear.yaml      # project override
+prompts:
+  lead:
+    append:
+      - .opencode/lead-policy.md
 
 <project>/.opencode/lead-policy.md # the project's own rules
 ```
@@ -630,6 +653,7 @@ routing             consumer role -> model table
 throttle [level]    print, or persist, the default throttle level
 validate            validate the merged configuration
 layers              show config layers and trace state
+init                create a minimal project .opencode-gear.yaml
 build               print the resolved OpenCode config
 context <task...>   deterministic local repository context plan
 context symbols <q> find indexed symbols by name (diagnostic)
@@ -649,7 +673,7 @@ help                print usage
 Inside the TUI, `Tab` / `Shift+Tab` cycle the three Lead agents. The cycle
 order depends on the active `default_agent`; the default configuration starts
 at `lead-low`. If you do not want the keybind, remove `keybinds` from
-`config/base.json` or override it in your project config.
+`config/base.yaml` or override it in your project config.
 
 ## Environment variables
 
@@ -712,7 +736,7 @@ public rate limit (and its reset) is reported in the error message.
 
 ## Isolation and permissions
 
-Enforced through OpenCode agent permissions (`config/permissions.json`), not
+Enforced through OpenCode agent permissions (`config/permissions.yaml`), not
 just prompt convention:
 
 - **No recursive delegation.** Every consumer has `task: deny`; only a Lead
@@ -730,7 +754,7 @@ just prompt convention:
   `git push*` explicitly denied.
 - **BUILD and DOCS** keep normal edit/test ability; only `task` is denied.
 
-All of this is data in `config/permissions.json`; profiles can be edited or
+All of this is data in `config/permissions.yaml`; profiles can be edited or
 replaced per project.
 
 ## Security and secrets
@@ -751,7 +775,7 @@ replaced per project.
   `Debug`/`Display` redacts them).
 - Proxy URLs and embedded credentials are likewise never rendered in
   `Debug`, errors or diagnostics.
-- Override files (`.opencode-gear.json`, `~/.config/opencode-gear/config.json`)
+- Override files (`.opencode-gear.yaml`, `~/.config/opencode-gear/config.yaml`)
   are for routing and prompts only. Keep project privacy rules in your
   project's own agent instructions.
 - Local telemetry is local-only and never records prompts, source code, command
@@ -969,16 +993,13 @@ Policy, honestly bounded:
 
 Configuration:
 
-```json
-{
-  "orchestration": {
-    "enabled": true,
-    "maxBuildRetries": 2,
-    "maxDebugRetries": 1,
-    "maxHandoffBytes": 16384,
-    "maxHandoffRatioPercent": 60
-  }
-}
+```yaml
+orchestration:
+  enabled: true
+  maxBuildRetries: 2
+  maxDebugRetries: 1
+  maxHandoffBytes: 16384
+  maxHandoffRatioPercent: 60
 ```
 
 There is no learned router and no automatic model switching. `ocg doctor`
@@ -1091,11 +1112,11 @@ ocg models                       # everything OpenCode can see with this config
 opencode models openai --verbose
 ```
 
-Then update `config/models.json` (or your user override).
+Then update `config/models.yaml` (or your user override).
 
 **`volcengine-coding` model rejected as unsupported** — the Volcano Coding
 Plan endpoint accepts coding-plan aliases, which may differ from the raw Ark
-catalogue. `config/base.json` declares `glm-5.3`, `glm-5.3-flash`,
+catalogue. `config/base.yaml` declares `glm-5.3`, `glm-5.3-flash`,
 `kimi-k2.7-code` and `kimi-k3`; add a model to that provider block if you need
 another alias.
 
@@ -1112,6 +1133,12 @@ agents and on `keybinds`. Inspect the generated `keybinds` with
 Check `OPENCODE_GEAR_USER_CONFIG` / `OPENCODE_GEAR_PROJECT_CONFIG` (or their
 legacy names) are not pointing somewhere unexpected.
 
+**`unsupported JSON ... file`** — OpenCode Gear 0.3 reads YAML only. The error
+names the stale `.json` file and its YAML target. Convert it to `config.yaml` /
+`.opencode-gear.yaml` and delete the JSON file; existing JSON is never migrated
+or merged. `ocg init` refuses to create a project YAML while
+`.opencode-gear.json` exists.
+
 ## Repository layout
 
 ```text
@@ -1121,6 +1148,7 @@ opencode-gear/
   src/lib.rs             library root
   src/cli.rs             argument parsing, environment, dispatch
   src/config.rs          layered configuration and paths
+  src/yaml.rs            YAML parsing/serialization for layered config
   src/defaults.rs        embedded defaults + optional on-disk gear home
   src/model.rs           model registry and role resolution
   src/prompt.rs          frontmatter, append and Lead rendering
@@ -1143,11 +1171,11 @@ opencode-gear/
   install.sh             portable POSIX installer
   scripts/package-release.sh  local artifact + SHA256SUMS packaging
   .github/workflows/     release build for the four supported targets
-  config/base.json        shared OpenCode config (providers, disabled built-ins)
-  config/models.json      model/provider registry
-  config/throttle.json    throttle level -> Lead model + reasoning variant
-  config/routing.json     role -> model + reasoning variant
-  config/permissions.json agent isolation profiles
+  config/base.yaml        shared OpenCode config (providers, disabled built-ins)
+  config/models.yaml      model/provider registry
+  config/throttle.yaml    throttle level -> Lead model + reasoning variant
+  config/routing.yaml     role -> model + reasoning variant
+  config/permissions.yaml agent isolation profiles
   config/prompts/*.md     one prompt per role
   examples/               override file examples
   tests/                  Rust unit and integration tests + installer shell tests
@@ -1214,7 +1242,7 @@ answer independently.
 The new model is:
 
 ```text
-Throttle        = OpenAI Lead tier only        (low / mid / high)
+Throttle        = Lead tier only               (low / mid / high)
 Consumer Router = delegated execution routing  (EXPLORE / BUILD / VERIFY / DEBUG)
 ```
 
@@ -1225,7 +1253,7 @@ Practical mapping:
 | "Gear" as the Lead tier | Throttle (`low` / `mid` / `high`) |
 | "Gear" as the full model bundle | removed; consumer roles are fixed and independent |
 | Old per-gear duplicate consumer agents | one consumer agent per role, shared by all Leads |
-| Per-gear explorer/builder/verifier model swaps | `config/routing.json` |
+| Per-gear explorer/builder/verifier model swaps | `config/routing.yaml` |
 | "Mode" / provider-scope presets | project or user override files |
 | `oc use <mode>` interactive switching | `ocg <level>` / `ocg --throttle <level>` / Tab in the TUI |
 

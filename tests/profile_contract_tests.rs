@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::{load_embedded_effective, write_json, TestDir};
+use common::{load_embedded_effective, write_yaml, TestDir};
 use opencode_gear::{build, model};
 use serde_json::{json, Value};
 
@@ -42,7 +42,7 @@ fn embedded_defaults_define_the_documented_profile() {
         assert_eq!(contract.level, level);
         assert_eq!(contract.agent, model::lead_agent_id(level));
         assert_eq!(contract.full_model_id(), full, "{level}");
-        assert_eq!(contract.variant, variant, "{level}");
+        assert_eq!(contract.variant.as_deref(), Some(variant), "{level}");
     }
 }
 
@@ -116,20 +116,21 @@ fn consumer_agents_do_not_follow_the_throttle() {
 fn project_override_changes_only_the_overridden_field() {
     let dir = TestDir::new();
     let project = dir.project();
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"throttle": {"levels": {"high": {"variant": "xhigh"}}}}),
     );
     let effective = load_embedded_effective(&project);
     let high = model::lead_contract(&effective.data, "high").unwrap();
     assert_eq!(high.full_model_id(), "openai/gpt-6-astra");
-    assert_eq!(high.variant, "xhigh");
+    assert_eq!(high.variant.as_deref(), Some("xhigh"));
     // The un-overridden levels keep the shipped contract.
     assert_eq!(
         model::lead_contract(&effective.data, "low")
             .unwrap()
-            .variant,
-        "low"
+            .variant
+            .as_deref(),
+        Some("low")
     );
 
     // Absence of the override falls back to the shipped contract.
@@ -137,7 +138,70 @@ fn project_override_changes_only_the_overridden_field() {
     std::fs::create_dir_all(&plain_project).unwrap();
     let plain = load_embedded_effective(&plain_project);
     assert_eq!(
-        model::lead_contract(&plain.data, "high").unwrap().variant,
-        "low"
+        model::lead_contract(&plain.data, "high")
+            .unwrap()
+            .variant
+            .as_deref(),
+        Some("low")
+    );
+}
+
+/// A Lead on a custom provider that exposes no reasoning variants must resolve
+/// to `None`, and the generated OpenCode config must omit `variant` entirely.
+#[test]
+fn custom_provider_without_a_variant_is_provider_default() {
+    let dir = TestDir::new();
+    let project = dir.project();
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
+        &json!({"throttle": {"levels": {"high": {"model": "kimi-k3", "variant": null}}}}),
+    );
+    let effective = load_embedded_effective(&project);
+    assert_eq!(
+        opencode_gear::validate::validate(&effective),
+        Vec::<String>::new()
+    );
+
+    let high = model::lead_contract(&effective.data, "high").unwrap();
+    assert_eq!(high.full_model_id(), "volcengine-coding/kimi-k3");
+    assert_eq!(high.variant, None);
+
+    let config = build::build_opencode_config(&effective, "high").unwrap();
+    let agent = lead_agent(&config, "high");
+    assert_eq!(agent["model"], json!("volcengine-coding/kimi-k3"));
+    assert!(
+        agent.get("variant").is_none(),
+        "provider-default must not fabricate a variant: {agent}"
+    );
+}
+
+/// V1 (generated OpenCode config) and V2 (exported runtime contract) must both
+/// omit an absent variant rather than writing null, empty or a fake value.
+#[test]
+fn absent_variant_is_omitted_from_config_and_contract() {
+    let dir = TestDir::new();
+    let project = dir.project();
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
+        &json!({"throttle": {"levels": {"high": {"model": "kimi-k3", "variant": null}}}}),
+    );
+    let effective = load_embedded_effective(&project);
+
+    // V1: the generated config has no `variant` key at all.
+    let config = build::build_opencode_config(&effective, "high").unwrap();
+    assert!(config["agent"]["lead-high"].get("variant").is_none());
+    assert_eq!(
+        config["agent"]["lead-high"]["model"],
+        json!("volcengine-coding/kimi-k3")
+    );
+
+    // V2: the exported contract serializes without a `variant` key.
+    let contract = model::lead_contract(&effective.data, "high").unwrap();
+    let serialized = serde_json::to_value(&contract).unwrap();
+    assert_eq!(serialized["provider_id"], json!("volcengine-coding"));
+    assert_eq!(serialized["model_id"], json!("kimi-k3"));
+    assert!(
+        serialized.get("variant").is_none(),
+        "exported contract must not fabricate a variant: {serialized}"
     );
 }

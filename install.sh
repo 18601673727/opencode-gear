@@ -10,7 +10,7 @@
 # or shell startup files are touched.
 #
 # Environment:
-#   OPENCODE_GEAR_VERSION      pin an exact release tag (for example v0.2.0)
+#   OPENCODE_GEAR_VERSION      pin an exact release tag (for example v0.3.0)
 #   OPENCODE_GEAR_INSTALL_DIR  install directory (default ~/.local/bin)
 #   OPENCODE_GEAR_REPO         owner/name to download from
 #   OPENCODE_GEAR_BASE_URL     override the GitHub base URL (tests, mirrors)

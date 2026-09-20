@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{write_json, TestDir};
+use common::{write_yaml, TestDir};
 use serde_json::json;
 use std::fs;
 use std::path::Path;
@@ -15,7 +15,7 @@ fn base_command(cwd: &Path, work: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ocg"));
     command
         .current_dir(cwd)
-        .env("OPENCODE_GEAR_USER_CONFIG", work.join("no-user.json"))
+        .env("OPENCODE_GEAR_USER_CONFIG", work.join("no-user.yaml"))
         .env_remove("OPENCODE_GEAR_PROJECT_CONFIG")
         .env_remove("OPENCODE_GEAR_THROTTLE")
         .env_remove("OPENCODE_GEAR_HOME")
@@ -143,8 +143,8 @@ fn doctor_explains_bootstrap_when_no_runtime_is_present() {
 fn doctor_reports_config_routing_failure() {
     let dir = TestDir::new();
     let project = dir.project();
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"routing": {"roles": {"build": {"model": "does-not-exist"}}}}),
     );
     let project_arg = project.to_string_lossy().into_owned();

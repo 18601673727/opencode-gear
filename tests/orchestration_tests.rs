@@ -467,6 +467,24 @@ fn disabled_orchestration_emits_no_plugin_and_no_state() {
 }
 
 #[test]
+fn v2_plugin_contract_uses_the_plural_key_and_subagent_tool() {
+    use opencode_gear::orchestration::plugin;
+
+    let mut config = json!({"plugins": ["user-plugin"]});
+    plugin::inject_plugin_for(&mut config, "plugins", "file:///tmp/ocg-orchestration.js");
+    assert!(config.get("plugin").is_none(), "v2 must not emit `plugin`");
+    assert!(plugin::has_ocg_plugin_for(&config, "plugins"));
+    assert_eq!(config["plugins"].as_array().unwrap().len(), 2);
+
+    // The v2 adapter is thin: no request-message Lead rewrite, and the
+    // delegation hooks target the renamed `subagent` tool.
+    let source = plugin::v2_plugin_source();
+    assert!(source.contains("input.tool !== \"subagent\""));
+    assert!(!source.contains("output.message.agent"));
+    assert!(!source.contains("enforceLeadContract"));
+}
+
+#[test]
 fn secret_shaped_task_never_enters_handoff_or_telemetry() {
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path());

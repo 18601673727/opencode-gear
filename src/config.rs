@@ -1,7 +1,8 @@
 //! Layered configuration: defaults -> user -> project -> CLI/environment.
 
-use crate::error::Result;
-use crate::json::{deep_merge, read_json_object};
+use crate::error::{GearError, Result};
+use crate::json::deep_merge;
+use crate::yaml::read_yaml_object;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -65,11 +66,11 @@ pub fn user_config_path(
     }
     xdg_config_home(home_dir, xdg)
         .join("opencode-gear")
-        .join("config.json")
+        .join("config.yaml")
 }
 
 /// Resolve the project override path. An explicit flag beats the environment,
-/// which beats `<cwd>/.opencode-gear.json`.
+/// which beats `<cwd>/.opencode-gear.yaml`.
 pub fn project_config_path(
     cwd: &Path,
     explicit: Option<&Path>,
@@ -79,7 +80,44 @@ pub fn project_config_path(
     if let Some(raw) = explicit.or(env_path) {
         return expand_tilde(&raw.to_string_lossy(), home_dir);
     }
-    cwd.join(".opencode-gear.json")
+    cwd.join(".opencode-gear.yaml")
+}
+
+/// Reject a legacy JSON override instead of silently ignoring or migrating it.
+///
+/// `path` is the resolved layer path. Two shapes are rejected:
+///
+/// * the resolved path itself is an existing `.json` file, and
+/// * an existing JSON sibling next to the YAML path (for example
+///   `~/.config/opencode-gear/config.json` next to `config.yaml`).
+///
+/// A non-existent explicit `.json` path is left alone so previous "missing
+/// override" behavior is preserved.
+pub fn reject_stale_json(path: &Path, label: &str) -> Result<()> {
+    let is_json = path
+        .extension()
+        .map(|extension| extension.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    if is_json {
+        if path.is_file() {
+            let target = path.with_extension("yaml");
+            return Err(GearError::config(format!(
+                "unsupported JSON {label} file: {}\nOpenCode Gear reads YAML only; rename it to {} and convert its contents.",
+                path.display(),
+                target.display()
+            )));
+        }
+        return Ok(());
+    }
+    let legacy = path.with_extension("json");
+    if legacy != path && legacy.is_file() {
+        return Err(GearError::config(format!(
+            "unsupported JSON {label} file: {}\nOpenCode Gear reads YAML only; remove it or convert it to {}. Existing JSON is never migrated or merged.",
+            legacy.display(),
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Deep-merge the user and project overrides onto the defaults.
@@ -95,8 +133,9 @@ pub fn build_effective(
     let mut applied = Vec::new();
     let layers: [(&'static str, &Path); 2] = [("user", user_path), ("project", project_path)];
     for (name, path) in layers {
+        reject_stale_json(path, name)?;
         if path.is_file() {
-            let overlay = read_json_object(path)?;
+            let overlay = read_yaml_object(path)?;
             data = deep_merge(&data, &overlay);
             applied.push((name, path.to_path_buf()));
         }

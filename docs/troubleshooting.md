@@ -11,7 +11,7 @@ ocg validate
 The errors name the offending key, for example:
 
 - `routing role 'build' references unknown model 'gpt-x'` — the model key is
-  not in `config/models.json`.
+  not in `config/models.yaml`.
 - `model 'mystery' uses provider 'nope', which is not declared in
   models.providers`.
 - `routing role 'build': variant 'impossible' is not exposed by model
@@ -134,7 +134,7 @@ opencode models openai --verbose
 opencode models volcengine-coding --verbose
 ```
 
-Then update `config/models.json` (or your override). Reasoning variants are
+Then update `config/models.yaml` (or your override). Reasoning variants are
 listed under `variants`; if a model has none, omit `variant`.
 
 `ocg doctor` separates static configuration validity from runtime availability
@@ -163,20 +163,23 @@ no generated plugin, so this enforcement is intentionally unavailable.
 ## `volcengine-coding` rejects a model as unsupported
 
 The Volcano Coding Plan endpoint accepts coding-plan aliases, which are not
-always the same as the raw public catalogue. `config/base.json` declares the
+always the same as the raw public catalogue. `config/base.yaml` declares the
 models this project expects for that provider:
 
-```json
-"models": {
-  "glm-5.3": { "name": "GLM-5.3" },
-  "glm-5.3-flash": { "name": "GLM-5.3-Flash" },
-  "kimi-k2.7-code": { "name": "Kimi K2.7" },
-  "kimi-k3": { "name": "Kimi K3" }
-}
+```yaml
+models:
+  glm-5.3:
+    name: GLM-5.3
+  glm-5.3-flash:
+    name: GLM-5.3-Flash
+  kimi-k2.7-code:
+    name: Kimi K2.7
+  kimi-k3:
+    name: Kimi K3
 ```
 
 If your plan exposes a different alias, add it to that block and to
-`config/models.json`.
+`config/models.yaml`.
 
 ## A consumer ignores its read-only permission
 
@@ -192,7 +195,7 @@ override `permissions` or `opencode.agent`.
 ## Tab does not cycle the Lead
 
 The cycle depends on the three `lead-*` agents and on `keybinds` (shipped in
-`config/base.json`). Two things to know:
+`config/base.yaml`). Two things to know:
 
 - The order depends on `default_agent`, because OpenCode starts the cycle from
   the default agent. With the default `lead-low` startup, `Tab` runs
@@ -231,7 +234,7 @@ ocg layers                      # is the project layer [found]?
 ocg build --pretty | less       # inspect agent.lead-low.prompt
 ```
 
-`ocg` reads `<cwd>/.opencode-gear.json`; run it from the project root, or point
+`ocg` reads `<cwd>/.opencode-gear.yaml`; run it from the project root, or point
 `OPENCODE_GEAR_PROJECT_CONFIG` at the file. If the override sets
 `prompts.lead.path`, it **replaces** the gear prompt, so append instead:
 
@@ -256,17 +259,17 @@ message.
 
 ## I want to pin the whole project to different models
 
-Create `<project>/.opencode-gear.json`:
+Create `<project>/.opencode-gear.yaml`:
 
-```json
-{
-  "routing": {
-    "roles": {
-      "build": { "model": "glm-5.3", "variant": "max" },
-      "verify": { "model": "glm-5.3", "variant": "high" }
-    }
-  }
-}
+```yaml
+routing:
+  roles:
+    build:
+      model: glm-5.3
+      variant: max
+    verify:
+      model: glm-5.3
+      variant: high
 ```
 
 Project configuration is not committed anywhere by the gear; whether you commit
@@ -277,12 +280,11 @@ it is your project's decision.
 Expected by default: all stages start empty and no command is discovered from a
 manifest. Configure the commands you trust, for example:
 
-```json
-{
-  "verification": {
-    "stages": { "normal": { "commands": ["cargo check", "cargo test"] } }
-  }
-}
+```yaml
+verification:
+  stages:
+    normal:
+      commands: [cargo check, cargo test]
 ```
 
 `ocg verify` reports `not_run` with an explanatory note when no command is

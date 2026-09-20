@@ -33,12 +33,12 @@ Everything else in the repository exists to keep that true.
 ## Resolution pipeline
 
 ```text
-embedded defaults       config/*.json + config/prompts/*.md (compiled in)
-config/base.json        shared OpenCode config (providers, disabled built-ins)
-config/models.json      model key -> provider + real model id (+ variants)
-config/throttle.json    level -> Lead model key + reasoning variant
-config/routing.json     role  -> model key + reasoning variant
-config/permissions.json isolation profiles and role -> profile mapping
+embedded defaults       config/*.yaml + config/prompts/*.md (compiled in)
+config/base.yaml        shared OpenCode config (providers, disabled built-ins)
+config/models.yaml      model key -> provider + real model id (+ variants)
+config/throttle.yaml    level -> Lead model key + reasoning variant
+config/routing.yaml     role  -> model key + reasoning variant
+config/permissions.yaml isolation profiles and role -> profile mapping
 config/prompts/*.md     one prompt per role
         │
         ▼
@@ -132,6 +132,44 @@ Invariants:
 
 The update checks and self-update are the only network paths, and both are
 bypassed by `ocg version` and `ocg doctor`, which are strictly read-only.
+
+## OpenCode runtime compatibility
+
+Gear supports two structurally different OpenCode major families. Every
+version-specific decision is isolated behind one narrow boundary:
+
+```text
+runtime/common contract
+├── v1 adapter   OpenCode 1.18.x
+└── v2 adapter   OpenCode 2.x (verified against 2.0.10)
+```
+
+- **Detection is explicit.** A launch classifies the resolved runtime's
+  `--version` into a major before it generates config. A parseable but
+  unsupported major (for example `3.x`, or a `1.x` below `1.18.0`) is a launch
+  failure. A runtime whose version genuinely cannot be probed keeps the
+  historical v1 contract, so the supported 1.18.x path is never regressed.
+- **One boundary, no scattered conditionals.** Unrelated modules never branch
+  on the major version. They ask the adapter for the plugin array key
+  (`plugin` vs `plugins`), the delegation tool/permission key (`task` vs
+  `subagent`), the canonical local `file://` plugin URI, the Lead-selection
+  mode and the launch mode.
+- **V1 stays request-scoped.** The Rust-resolved Lead contract is enforced on
+  the mutable `chat.message` request, and the runtime catalogue probe proves
+  the active Lead model exists before launch.
+- **V2 is session-scoped.** OpenCode 2 runs a daemon reached over HTTP/SSE and
+  keeps `OPENCODE_CONFIG_CONTENT`. Gear never enumerates the whole catalogue on
+  every launch: it resolves the Lead in Rust, exports the contract via
+  environment, and emits a deterministic session-selection plan. In 0.3.0 the
+  actual daemon session client that would apply/verify the Lead is not yet
+  wired into the production launch path (covered by offline mocks and unit
+  tests). Optional catalogue/debug probes warn and continue when unavailable.
+- **The plugin adapter stays thin.** The generated adapter only transports
+  bytes to and from `ocg __bridge`; it performs no ranking, projection or
+  policy, and every bridge failure is swallowed so a broken bridge cannot
+  destroy a session. A missing `tool.execute.after` delivery is ignored.
+- **No credentials are read.** Gear never reads or writes OpenCode credential
+  files or `auth.json`.
 
 ## Repository context
 
@@ -363,9 +401,9 @@ OpenAI    Volcano   Go      Go      Go     Go      <- replaceable providers
 Sol/Astra  K2.7/K3  DS4.1   GLMfl   GLM5.3 DS4.1   <- replaceable models
 ```
 
-- Roles are the abstraction. They appear in `config/routing.json` and in
-  `config/permissions.json`.
-- Model ids appear only in `config/models.json`.
+- Roles are the abstraction. They appear in `config/routing.yaml` and in
+  `config/permissions.yaml`.
+- Model ids appear only in `config/models.yaml`.
 - Reasoning variants are validated against the `variants` list a model
   declares, so a future `Kimi K4` or `DeepSeek V5` is a config edit, not a
   rewrite.
@@ -416,19 +454,19 @@ gear therefore encodes the rules in the Lead prompt:
 
 This is honest about what can and cannot be enforced mechanically. If a future
 OpenCode release exposes a routing hook, the rules are already written down in
-one place (`config/prompts/lead.md`) and `config/routing.json`.
+one place (`config/prompts/lead.md`) and `config/routing.yaml`.
 
 ## Extension points
 
 | You want to | Edit |
 | --- | --- |
-| Use a newer model | `config/models.json` + `config/routing.json` (or an override) |
-| Change Lead tiers | `config/throttle.json` |
+| Use a newer model | `config/models.yaml` + `config/routing.yaml` (or an override) |
+| Change Lead tiers | `config/throttle.yaml` |
 | Add a specialist role | add a prompt, a routing role, a permission profile binding |
-| Pin a project to different models | `<project>/.opencode-gear.json` |
-| Add repository-specific Lead policy | `prompts.lead.append` in `<project>/.opencode-gear.json` |
+| Pin a project to different models | `<project>/.opencode-gear.yaml` |
+| Add repository-specific Lead policy | `prompts.lead.append` in `<project>/.opencode-gear.yaml` |
 | Replace a prompt for one project | `prompts` override pointing at a file |
-| Add raw OpenCode settings | `opencode` key in an override, or `config/base.json` |
+| Add raw OpenCode settings | `opencode` key in an override, or `config/base.yaml` |
 
 ## Project policy stays out of the core
 
@@ -438,7 +476,7 @@ layered on **per project**, never written into the core:
 ```text
 gear default prompt  (config/prompts/lead.md, project-agnostic)
         +
-project override     (<project>/.opencode-gear.json -> prompts.lead.append)
+project override     (<project>/.opencode-gear.yaml -> prompts.lead.append)
         =
 rendered Lead prompt
 ```

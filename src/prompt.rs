@@ -195,7 +195,11 @@ pub fn routing_block(effective: &Effective) -> Result<String> {
         })?;
         let (provider, _) = model::model_full_id(data, key)?;
         let mut rendered = model::model_label(data, key);
-        if let Some(variant) = spec.get("variant").and_then(Value::as_str) {
+        if let Some(variant) = spec
+            .get("variant")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
             rendered = format!("{rendered} ({variant})");
         }
         lines.push(format!(
@@ -231,8 +235,9 @@ pub fn routing_block(effective: &Effective) -> Result<String> {
     }
 
     lines.push(String::new());
-    lines.push("OpenAI is the Lead only. Never route EXPLORE / BUILD / VERIFY / DEBUG".to_string());
-    lines.push("to an OpenAI model unless the user explicitly configures it.".to_string());
+    lines.push("Consumer roles run only on the models listed above. The Lead is".to_string());
+    lines.push("provider-agnostic; never substitute the Lead model or any other".to_string());
+    lines.push("provider/model unless the user explicitly configures it.".to_string());
     Ok(lines.join("\n"))
 }
 

@@ -9,11 +9,26 @@ use crate::prompt;
 use crate::validate;
 use serde_json::{json, Map, Value};
 
-/// Build the OpenCode config for one throttle level.
+/// Build the OpenCode config for one throttle level using the v1 contract.
 ///
 /// The result is validated, deterministic and independent of the current
-/// environment: the same inputs always produce the same JSON.
+/// environment: the same inputs always produce the same JSON. Callers that
+/// already detected the runtime use [`build_opencode_config_for`] so the
+/// generated plugin array, local plugin URI and delegation permission key match
+/// the runtime family.
 pub fn build_opencode_config(effective: &Effective, level: &str) -> Result<Value> {
+    build_opencode_config_for(effective, level, crate::runtime::compat::v1_adapter())
+}
+
+/// Build the OpenCode config for one throttle level against a runtime adapter.
+///
+/// No version conditional lives here: the adapter supplies the plugin key, the
+/// delegation permission key and the canonical local plugin URI.
+pub fn build_opencode_config_for(
+    effective: &Effective,
+    level: &str,
+    adapter: &dyn crate::runtime::compat::RuntimeAdapter,
+) -> Result<Value> {
     validate::require_valid(effective)?;
     let data = &effective.data;
 
@@ -93,16 +108,20 @@ pub fn build_opencode_config(effective: &Effective, level: &str) -> Result<Value
             task.insert(agent.clone(), json!("allow"));
         }
 
+        let mut lead_permissions = Map::new();
+        lead_permissions.insert(adapter.task_key().to_string(), Value::Object(task));
+
         let mut lead_spec = Map::new();
         lead_spec.insert("mode".to_string(), json!("primary"));
         lead_spec.insert("model".to_string(), json!(full));
         lead_spec.insert("temperature".to_string(), temperature);
         lead_spec.insert("prompt".to_string(), json!(rendered));
-        lead_spec.insert(
-            "permission".to_string(),
-            json!({"task": Value::Object(task)}),
-        );
-        if let Some(variant) = spec.get("variant").and_then(Value::as_str) {
+        lead_spec.insert("permission".to_string(), Value::Object(lead_permissions));
+        if let Some(variant) = spec
+            .get("variant")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
             lead_spec.insert("variant".to_string(), json!(variant));
         }
         agent_config.insert(model::lead_agent_id(lead_level), Value::Object(lead_spec));
@@ -122,7 +141,10 @@ pub fn build_opencode_config(effective: &Effective, level: &str) -> Result<Value
             .and_then(|name| profiles.get(name))
             .cloned()
             .unwrap_or_else(|| json!({}));
-        let permission = deep_merge(&subagent_permission, &profile);
+        let permission = with_task_key(
+            deep_merge(&subagent_permission, &profile),
+            adapter.task_key(),
+        );
 
         let description = spec
             .get("description")
@@ -146,7 +168,11 @@ pub fn build_opencode_config(effective: &Effective, level: &str) -> Result<Value
             })?;
             consumer_spec.insert("temperature".to_string(), json!(parsed));
         }
-        if let Some(variant) = spec.get("variant").and_then(Value::as_str) {
+        if let Some(variant) = spec
+            .get("variant")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
             consumer_spec.insert("variant".to_string(), json!(variant));
         }
         agent_config.insert(model::consumer_agent_id(role), Value::Object(consumer_spec));
@@ -193,9 +219,30 @@ pub fn build_opencode_config(effective: &Effective, level: &str) -> Result<Value
     // addition to optional dynamic orchestration. Preserve the explicit
     // no-hook escape hatch: disabled orchestration emits no OCG plugin.
     if crate::orchestration::OrchestrationConfig::from_config(data)?.enabled {
-        if let Some(uri) = crate::orchestration::plugin::plugin_uri(&effective.cwd) {
-            crate::orchestration::plugin::inject_plugin(&mut merged, &uri);
+        if let Ok(uri) = adapter.local_plugin_uri(&effective.cwd) {
+            crate::orchestration::plugin::inject_plugin_for(
+                &mut merged,
+                adapter.plugin_key(),
+                &uri,
+            );
         }
     }
     Ok(merged)
+}
+
+/// Rename the top-level `task` permission key to the runtime's delegation key.
+///
+/// OpenCode 1 uses `task`; OpenCode 2 renamed the tool to `subagent`. The
+/// profiles and defaults stay written once, in the project-agnostic v1 shape.
+fn with_task_key(permission: Value, task_key: &str) -> Value {
+    if task_key == "task" {
+        return permission;
+    }
+    let Value::Object(mut map) = permission else {
+        return permission;
+    };
+    if let Some(task) = map.remove("task") {
+        map.insert(task_key.to_string(), task);
+    }
+    Value::Object(map)
 }

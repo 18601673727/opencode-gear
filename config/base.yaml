@@ -1,0 +1,31 @@
+---
+"$schema": https://opencode.ai/config.json
+agent:
+  build:
+    disable: true
+  plan:
+    disable: true
+  general:
+    disable: true
+  explore:
+    disable: true
+  scout:
+    disable: true
+keybinds:
+  agent_cycle: shift+tab
+  agent_cycle_reverse: tab
+provider:
+  volcengine-coding:
+    npm: "@ai-sdk/openai-compatible"
+    name: Volcano Coding Plan Pro
+    options:
+      baseURL: https://ark.cn-beijing.volces.com/api/coding/v3
+    models:
+      glm-5.3:
+        name: GLM-5.3
+      glm-5.3-flash:
+        name: GLM-5.3-Flash
+      kimi-k2.7-code:
+        name: Kimi K2.7
+      kimi-k3:
+        name: Kimi K3

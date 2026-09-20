@@ -14,7 +14,7 @@ fn base_command(cwd: &Path, work: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ocg"));
     command
         .current_dir(cwd)
-        .env("OPENCODE_GEAR_USER_CONFIG", work.join("no-user.json"))
+        .env("OPENCODE_GEAR_USER_CONFIG", work.join("no-user.yaml"))
         .env_remove("OPENCODE_GEAR_PROJECT_CONFIG")
         .env_remove("OPENCODE_GEAR_THROTTLE")
         .env_remove("OPENCODE_GEAR_HOME")
@@ -158,7 +158,7 @@ fn disabled_context_reports_no_work_and_writes_nothing() {
     write_project_file(&project, "src/lib.rs", "pub fn a() {}\n");
     write_project_file(
         &project,
-        ".opencode-gear.json",
+        ".opencode-gear.yaml",
         "{\"context\": {\"enabled\": false}}\n",
     );
     let project_arg = project.to_string_lossy().into_owned();

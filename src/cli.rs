@@ -13,7 +13,6 @@ use crate::context::{self, ContextConfig, ContextEngine};
 use crate::defaults::{load_defaults, GearSource};
 use crate::error::GearError;
 use crate::http::{GithubToken, HttpTransport, NoHttp, ProcessHttpEnv, ReqwestHttp};
-use crate::json;
 use crate::model;
 use crate::observability;
 use crate::orchestration::checkpoint::{self, Phase};
@@ -23,14 +22,17 @@ use crate::process::{
     ProcessHost, ProcessRunner, SystemCaptureRunner, SystemGitHost, SystemProcessHost,
     SystemStaticProxy,
 };
+use crate::project;
 use crate::proxy::{ProxyScheme, ProxySelection, ProxySource};
 use crate::report;
+use crate::runtime::compat::{self, LeadSelection, RuntimeAdapter};
 use crate::runtime::policy::RuntimePolicy;
 use crate::runtime::{self, install::Layout};
 use crate::telemetry::{self, TelemetryConfig};
 use crate::validate;
 use crate::verification::runner::{execute, VerifyRequest};
 use crate::verification::Config as VerificationConfig;
+use crate::yaml;
 use semver::Version;
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -127,6 +129,7 @@ pub enum Command {
     Throttle(Option<String>),
     Validate,
     Layers,
+    Init,
     Build,
     Trace(Option<String>),
     Context(Vec<OsString>),
@@ -355,6 +358,7 @@ where
         ),
         Some("validate") => Command::Validate,
         Some("layers") => Command::Layers,
+        Some("init") => Command::Init,
         Some("build") => Command::Build,
         Some("dry-run") => Command::Build,
         Some("trace") => Command::Trace(event),
@@ -406,6 +410,7 @@ Commands:
   throttle [level]      print, or persist, the default throttle level
   validate              validate the merged configuration
   layers                show configuration layers and trace state
+  init                  create a minimal project .opencode-gear.yaml
   build                 print the resolved OpenCode config
   context <task...>     build a deterministic local repository context plan
   context symbols <q>   find indexed symbols by name (diagnostic)
@@ -423,7 +428,7 @@ Commands:
 
 Options:
   low|mid|high          positional throttle level (same as --throttle)
-  --throttle LEVEL      low | mid | high   (OpenAI Lead tier, this launch only)
+  --throttle LEVEL      low | mid | high   (Lead tier, this launch only)
   --project DIR         project directory used for project-local overrides
   --dry-run             print the merged OpenCode config instead of launching
   --disable-proxy       never use a proxy (overrides env and system discovery)
@@ -435,8 +440,8 @@ Options:
 Environment:
   OPENCODE_GEAR_HOME           config directory loaded instead of the embedded defaults
   OPENCODE_GEAR_THROTTLE       default throttle level (overridden by --throttle)
-  OPENCODE_GEAR_USER_CONFIG    user override file (default ~/.config/opencode-gear/config.json)
-  OPENCODE_GEAR_PROJECT_CONFIG project override file (default <project>/.opencode-gear.json)
+  OPENCODE_GEAR_USER_CONFIG    user override file (default ~/.config/opencode-gear/config.yaml)
+  OPENCODE_GEAR_PROJECT_CONFIG project override file (default <project>/.opencode-gear.yaml)
   OPENCODE_GEAR_OPENCODE       explicit opencode binary (wins over everything)
   OPENCODE_GEAR_OPENCODE_BIN   compatibility alias for the same explicit binary
   OPENCODE_GEAR_TRACE          trace file; only read when observability is enabled
@@ -512,17 +517,33 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
         }
     }
 
-    let (gear_source, gear_home) = match env.home.clone() {
-        Some(home) => (GearSource::Dir(home.clone()), Some(home)),
-        None => (GearSource::Embedded, None),
-    };
-    let defaults = load_defaults(&gear_source).map_err(Failure::Gear)?;
-    let cwd = match &cli.project {
+    let invocation_dir = match &cli.project {
         Some(project) => project.clone(),
         None => std::env::current_dir()
             .map_err(|error| GearError::io("cannot determine the current directory", error))
             .map_err(Failure::Gear)?,
     };
+    // `init` writes a project file and must not depend on the existing config
+    // being loadable; it refuses on a stale JSON project file itself. It always
+    // targets the directory the user asked to initialize, never a resolved
+    // ancestor, so a new project can be created inside another one.
+    if let Command::Init = cli.command {
+        return init_command(&invocation_dir);
+    }
+    // The project boundary owns every piece of project-scoped state. An
+    // explicit `--project` names it; otherwise the nearest ancestor carrying
+    // `.opencode-gear.yaml` wins. Both paths are canonicalized before use so a
+    // symlinked spelling cannot create a second boundary.
+    let boundary = match &cli.project {
+        Some(root) => project::explicit(root),
+        None => project::resolve(&invocation_dir),
+    };
+    let project_root = boundary.root().to_path_buf();
+    let (gear_source, gear_home) = match env.home.clone() {
+        Some(home) => (GearSource::Dir(home.clone()), Some(home)),
+        None => (GearSource::Embedded, None),
+    };
+    let defaults = load_defaults(&gear_source).map_err(Failure::Gear)?;
     let user_path = config::user_config_path(
         cli.user_config.as_deref(),
         env.user_config.as_deref(),
@@ -530,7 +551,7 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
         env.home_dir.as_deref(),
     );
     let project_path = config::project_config_path(
-        &cwd,
+        &project_root,
         cli.project_config.as_deref(),
         env.project_config.as_deref(),
         env.home_dir.as_deref(),
@@ -538,7 +559,7 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
     let effective = config::build_effective(
         defaults,
         gear_home,
-        &cwd,
+        &project_root,
         &user_path,
         &project_path,
         env.home_dir.clone(),
@@ -567,7 +588,8 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
         Command::Help | Command::Version => Ok(0),
         Command::Launch => launch(
             &effective,
-            &cwd,
+            &invocation_dir,
+            &project_root,
             &level,
             &[],
             true,
@@ -579,7 +601,8 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
             let forwarded = prepend_subcommand("run", args);
             launch(
                 &effective,
-                &cwd,
+                &invocation_dir,
+                &project_root,
                 &level,
                 &forwarded,
                 true,
@@ -592,7 +615,8 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
             let forwarded = prepend_subcommand("models", args);
             launch(
                 &effective,
-                &cwd,
+                &invocation_dir,
+                &project_root,
                 &level,
                 &forwarded,
                 false,
@@ -630,6 +654,7 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
             println!("{}", report::layers_text(&effective, env.trace.as_deref()));
             Ok(0)
         }
+        Command::Init => init_command(&invocation_dir),
         Command::Build => {
             let resolved =
                 build::build_opencode_config(&effective, &level).map_err(Failure::Gear)?;
@@ -652,16 +677,90 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
             }
             Ok(0)
         }
-        Command::Doctor => doctor_command(&effective, &cwd, &level, &env, cli.disable_proxy),
-        Command::Context(args) => context_command(&effective, &cwd, args, &env, cli.pretty),
-        Command::Cache(action) => cache_command(&effective, &cwd, action.as_deref()),
-        Command::Stats(args) => stats_command(&effective, &cwd, args, &env, cli.pretty),
-        Command::Verify(args) => verify_command(&effective, &cwd, args, &env, cli.pretty),
+        Command::Doctor => {
+            doctor_command(&effective, &project_root, &level, &env, cli.disable_proxy)
+        }
+        Command::Context(args) => {
+            boundary.require(&invocation_dir).map_err(Failure::Gear)?;
+            context_command(&effective, &project_root, args, &env, cli.pretty)
+        }
+        Command::Cache(action) => {
+            boundary.require(&invocation_dir).map_err(Failure::Gear)?;
+            cache_command(&effective, &project_root, action.as_deref())
+        }
+        Command::Stats(args) => {
+            // `stats` is read-only: it may run outside an initialized project
+            // and simply report that no local telemetry exists.
+            stats_command(&effective, &project_root, args, &env, cli.pretty)
+        }
+        Command::Verify(args) => {
+            boundary.require(&invocation_dir).map_err(Failure::Gear)?;
+            verify_command(&effective, &project_root, args, &env, cli.pretty)
+        }
         Command::Tools(args) => tools_command(&effective, args, cli.pretty),
-        Command::Checkpoint(args) => checkpoint_command(&effective, &cwd, args, cli.pretty),
-        Command::Bridge(args) => bridge_command(&effective, &cwd, args, &env),
-        Command::Upgrade => upgrade_command(&effective, &cwd, &env, cli.disable_proxy),
+        Command::Checkpoint(args) => {
+            boundary.require(&invocation_dir).map_err(Failure::Gear)?;
+            checkpoint_command(&effective, &project_root, args, cli.pretty)
+        }
+        Command::Bridge(args) => {
+            boundary.require(&invocation_dir).map_err(Failure::Gear)?;
+            bridge_command(&effective, &project_root, args, &env)
+        }
+        Command::Upgrade => upgrade_command(&effective, &project_root, &env, cli.disable_proxy),
     }
+}
+
+/// The project template written by `ocg init`.
+///
+/// It is deliberately a semantic no-op: the active document is an empty
+/// mapping, so merging it changes nothing. The commented examples are for the
+/// human reader only. No credentials, tokens or local state are written.
+const INIT_TEMPLATE: &str = "\
+# OpenCode Gear project configuration (YAML).
+#
+# This file is deep-merged over the OCG defaults and your user config
+# (~/.config/opencode-gear/config.yaml). CLI flags and environment variables
+# win last. Every key is optional, so the empty mapping below is a no-op.
+#
+# Examples (uncomment and edit what you need):
+#
+#   throttle:
+#     default: mid
+#
+#   routing:
+#     roles:
+#       build:
+#         model: glm-5.3
+#         variant: high
+#
+#   observability:
+#     enabled: true
+{}
+";
+
+/// `ocg init`: create a minimal project `.opencode-gear.yaml`.
+///
+/// Refuses when a stale `.opencode-gear.json` exists in the project root, is
+/// safe to run repeatedly, and never writes credentials or local state.
+fn init_command(cwd: &Path) -> std::result::Result<i32, Failure> {
+    let target = cwd.join(".opencode-gear.yaml");
+    let legacy = cwd.join(".opencode-gear.json");
+    if legacy.is_file() {
+        return Err(Failure::Gear(GearError::config(format!(
+            "refusing to initialize: unsupported JSON project config exists at {}\nOpenCode Gear reads YAML only; convert it to {} (no migration is performed).",
+            legacy.display(),
+            target.display()
+        ))));
+    }
+    if target.exists() {
+        println!("project config already exists: {}", target.display());
+        return Ok(0);
+    }
+    std::fs::write(&target, INIT_TEMPLATE)
+        .map_err(|error| GearError::write(&target, error))
+        .map_err(Failure::Gear)?;
+    println!("created {}", target.display());
+    Ok(0)
 }
 
 fn print_config(config: &Value, pretty: bool) -> std::result::Result<(), Failure> {
@@ -690,7 +789,11 @@ fn prepend_subcommand(subcommand: &str, args: &[OsString]) -> Vec<OsString> {
 #[allow(clippy::too_many_arguments)]
 fn launch(
     effective: &config::Effective,
-    cwd: &Path,
+    // Directory the child OpenCode process starts in and relative arguments
+    // resolve against. This is the invocation directory, not the project root.
+    invocation_dir: &Path,
+    // The resolved project boundary that owns local state and the plugin.
+    project_root: &Path,
     level: &str,
     args: &[OsString],
     trace: bool,
@@ -698,19 +801,52 @@ fn launch(
     env: &Env,
     disable_proxy: bool,
 ) -> std::result::Result<i32, Failure> {
-    let mut resolved = build::build_opencode_config(effective, level).map_err(Failure::Gear)?;
+    // Validate before any runtime resolution so an invalid configuration fails
+    // fast and can never trigger an install or upgrade.
+    validate::require_valid(effective).map_err(Failure::Gear)?;
+    if trace {
+        observability::record_event(effective, "launch", level, env.trace.as_deref());
+    }
+    let proxy = resolve_proxy(disable_proxy);
+    for warning in proxy.warnings() {
+        eprintln!("ocg: warning: {warning}");
+    }
+    let proxy_env = proxy.child_env();
+    let http =
+        ReqwestHttp::with_policy(proxy.plan(), env.github_token.clone()).map_err(Failure::Gear)?;
+    let clock = SystemClock;
+    let process = SystemProcessHost;
+    let manager = runtime_manager(project_root, effective, env, &http, &clock, &process)
+        .map_err(Failure::Gear)?
+        .with_proxy_env(proxy_env.clone());
+    let selection = manager.resolve_for_launch().map_err(Failure::Gear)?;
+    for warning in &selection.warnings {
+        eprintln!("ocg: warning: {warning}");
+    }
+
+    // Establish the runtime family before generating config. A parseable but
+    // unsupported major fails here; an unclassifiable version keeps the
+    // historical v1 launch path.
+    let adapter = resolve_adapter(selection.version.as_ref()).map_err(Failure::Gear)?;
+
+    let mut resolved =
+        build::build_opencode_config_for(effective, level, adapter).map_err(Failure::Gear)?;
     // `ocg models` is not a coding session: it must not require the
     // orchestration plugin to exist or the project directory to be writable.
     if !coding_session {
-        crate::orchestration::plugin::remove_ocg_plugin(&mut resolved);
+        crate::orchestration::plugin::remove_ocg_plugin_for(&mut resolved, adapter.plugin_key());
     }
-    let plugin_active = coding_session && crate::orchestration::plugin::has_ocg_plugin(&resolved);
+    let plugin_active = coding_session
+        && crate::orchestration::plugin::has_ocg_plugin_for(&resolved, adapter.plugin_key());
+    // The catalogue probe runs before local plugin materialization. Keep every
+    // user plugin/config entry, but do not ask OpenCode to load OCG's generated
+    // file before that file exists.
     let preflight_content = if coding_session {
         let mut probe_config = resolved.clone();
-        // The model catalogue probe runs before local plugin materialization.
-        // Keep every user plugin/config entry, but do not ask OpenCode to load
-        // OCG's generated file before that file exists.
-        crate::orchestration::plugin::remove_ocg_plugin(&mut probe_config);
+        crate::orchestration::plugin::remove_ocg_plugin_for(
+            &mut probe_config,
+            adapter.plugin_key(),
+        );
         Some(serde_json::to_string(&probe_config).map_err(|error| {
             Failure::Gear(GearError::config(format!(
                 "cannot serialize the OpenCode config for runtime model checks: {error}"
@@ -724,49 +860,54 @@ fn launch(
             "cannot serialize the OpenCode config: {error}"
         )))
     })?;
-    if trace {
-        observability::record_event(effective, "launch", level, env.trace.as_deref());
-    }
-    let proxy = resolve_proxy(disable_proxy);
-    for warning in proxy.warnings() {
-        eprintln!("ocg: warning: {warning}");
-    }
-    let proxy_env = proxy.child_env();
-    let http =
-        ReqwestHttp::with_policy(proxy.plan(), env.github_token.clone()).map_err(Failure::Gear)?;
-    let clock = SystemClock;
-    let process = SystemProcessHost;
-    let manager = runtime_manager(cwd, effective, env, &http, &clock, &process)
-        .map_err(Failure::Gear)?
-        .with_proxy_env(proxy_env.clone());
-    let selection = manager.resolve_for_launch().map_err(Failure::Gear)?;
-    for warning in &selection.warnings {
-        eprintln!("ocg: warning: {warning}");
-    }
+
     if coding_session {
-        let preflight = crate::preflight::probe(
-            &effective.data,
-            &process,
-            &selection.path,
-            cwd,
-            preflight_content.as_deref().unwrap_or(&content),
-            &proxy_env,
-        )
-        .map_err(Failure::Gear)?;
-        if let Some(error) = preflight.active_lead_failure(level) {
-            return Err(Failure::Gear(GearError::config(error)));
-        }
-        match &preflight {
-            ModelPreflight::Unavailable { reason } => {
-                eprintln!("ocg: warning: {reason}; continuing because the probe is unavailable")
-            }
-            ModelPreflight::Complete { .. } => {
-                let missing = preflight.missing_non_active_count(level);
-                if missing > 0 {
-                    eprintln!(
-                        "ocg: warning: {missing} configured non-active model route(s) are not currently exposed by OpenCode; run `ocg doctor` for details"
-                    );
+        match adapter.lead_selection() {
+            // v1 enforces the Lead on the mutable request message; the runtime
+            // catalogue probe proves the active Lead model exists first.
+            compat::LeadSelectionMode::RequestMessage => {
+                let preflight = crate::preflight::probe(
+                    &effective.data,
+                    &process,
+                    &selection.path,
+                    invocation_dir,
+                    preflight_content.as_deref().unwrap_or(&content),
+                    &proxy_env,
+                )
+                .map_err(Failure::Gear)?;
+                if let Some(error) = preflight.active_lead_failure(level) {
+                    return Err(Failure::Gear(GearError::config(error)));
                 }
+                match &preflight {
+                    ModelPreflight::Unavailable { reason } => {
+                        eprintln!(
+                            "ocg: warning: {reason}; continuing because the probe is unavailable"
+                        )
+                    }
+                    ModelPreflight::Complete { .. } => {
+                        let missing = preflight.missing_non_active_count(level);
+                        if missing > 0 {
+                            eprintln!(
+                                "ocg: warning: {missing} configured non-active model route(s) are not currently exposed by OpenCode; run `ocg doctor` for details"
+                            );
+                        }
+                    }
+                }
+            }
+            // v2 selects the Lead on the session. Gear does not enumerate the
+            // whole catalogue on every launch; the Rust-resolved contract is
+            // exported for the session client, which verifies the effective
+            // Lead before Gear relies on it.
+            compat::LeadSelectionMode::Session => {
+                let contract =
+                    model::lead_contract(&effective.data, level).map_err(Failure::Gear)?;
+                let lead = LeadSelection::from_contract(&contract);
+                eprintln!(
+                    "ocg: session-level Lead: {} on {} (variant {})",
+                    lead.agent,
+                    lead.full_model_id(),
+                    lead.variant.as_deref().unwrap_or("provider-default")
+                );
             }
         }
     }
@@ -776,14 +917,34 @@ fn launch(
     // launching an integration that cannot work. A non-coding session (for
     // example `ocg models`) skips this entirely.
     let extra_env = if plugin_active {
-        runtime_plugin_env(effective, cwd, level).map_err(Failure::Gear)?
+        runtime_plugin_env(effective, project_root, level, adapter).map_err(Failure::Gear)?
     } else {
         Vec::new()
     };
     runner
-        .exec(args, cwd, &content, &extra_env, &proxy_env)
+        .exec(args, invocation_dir, &content, &extra_env, &proxy_env)
         .map_err(Failure::Gear)?;
     Ok(0)
+}
+
+/// Resolve the compatibility adapter for a runtime selection.
+///
+/// A detected version is classified explicitly and an unsupported major is a
+/// hard failure: Gear never guesses how to talk to an unknown runtime. A
+/// runtime whose version genuinely cannot be probed keeps the historical v1
+/// contract so the supported 1.18.x path is not regressed.
+fn resolve_adapter(version: Option<&Version>) -> crate::error::Result<&'static dyn RuntimeAdapter> {
+    match version {
+        Some(version) => {
+            compat::classify(version.clone()).map(|detected| compat::adapter_for(&detected))
+        }
+        None => {
+            eprintln!(
+                "ocg: warning: could not determine the OpenCode version; assuming the v1 (1.18.x) contract"
+            );
+            Ok(compat::v1_adapter())
+        }
+    }
 }
 
 /// Resolve the effective proxy for a command. Static system discovery is only
@@ -804,8 +965,9 @@ fn runtime_plugin_env(
     effective: &config::Effective,
     cwd: &Path,
     level: &str,
+    adapter: &dyn RuntimeAdapter,
 ) -> crate::error::Result<Vec<(OsString, OsString)>> {
-    let path = crate::orchestration::plugin::materialize(cwd)?;
+    let path = crate::orchestration::plugin::materialize_with(cwd, adapter.plugin_source())?;
     let mut env = Vec::new();
     let exe = std::env::current_exe().map_err(|error| {
         GearError::io(
@@ -910,6 +1072,16 @@ fn version_command(cli: &Cli, env: &Env) -> std::result::Result<i32, Failure> {
             println!(
                 "runtime:         none; the next launch will bootstrap a project-local runtime"
             );
+        }
+    }
+    if let Some(version) = report.version.as_ref() {
+        match compat::classify(version.clone()) {
+            Ok(detected) => println!(
+                "opencode family: {} ({})",
+                detected.major().as_str(),
+                detected.version()
+            ),
+            Err(error) => println!("opencode family: unsupported ({error})"),
         }
     }
     for warning in &report.warnings {
@@ -1061,10 +1233,17 @@ fn doctor_command(
         Ok(rows) => {
             for (row_level, full, variant) in rows {
                 let active = if row_level == level { " (active)" } else { "" };
+                // An absent variant is the provider default, not a fabricated
+                // value; say so explicitly.
+                let variant = if variant == "provider-default" {
+                    variant
+                } else {
+                    format!("variant {variant}")
+                };
                 doctor.line(
                     "ok",
                     &format!("lead-{row_level}"),
-                    &format!("{full} variant {variant}{active}"),
+                    &format!("{full} {variant}{active}"),
                 );
             }
         }
@@ -1217,6 +1396,29 @@ fn doctor_command(
         _ => {}
     }
 
+    // The runtime family selects the compatibility adapter for the optional
+    // catalogue probe. An unsupported major is a doctor FAIL, never a panic.
+    let adapter = match report.version.as_ref() {
+        Some(version) => match compat::classify(version.clone()) {
+            Ok(detected) => {
+                doctor.line(
+                    "ok",
+                    "runtime family",
+                    &format!("{} ({})", detected.major().as_str(), detected.version()),
+                );
+                Some(compat::adapter_for(&detected))
+            }
+            Err(error) => {
+                doctor.line("fail", "runtime family", &error.to_string());
+                None
+            }
+        },
+        None => {
+            doctor.line("info", "runtime family", "unknown; assuming v1 (1.18.x)");
+            Some(compat::v1_adapter())
+        }
+    };
+
     println!("runtime models");
     if !static_config_valid {
         doctor.line(
@@ -1224,9 +1426,10 @@ fn doctor_command(
             "runtime models",
             "skipped because static config/routing validation failed",
         );
-    } else if let Some(program) = report.path.as_deref() {
-        let mut resolved = build::build_opencode_config(effective, level).map_err(Failure::Gear)?;
-        crate::orchestration::plugin::remove_ocg_plugin(&mut resolved);
+    } else if let (Some(program), Some(adapter)) = (report.path.as_deref(), adapter) {
+        let mut resolved =
+            build::build_opencode_config_for(effective, level, adapter).map_err(Failure::Gear)?;
+        crate::orchestration::plugin::remove_ocg_plugin_for(&mut resolved, adapter.plugin_key());
         let content = serde_json::to_string(&resolved).map_err(|error| {
             Failure::Gear(GearError::config(format!(
                 "cannot serialize the OpenCode config for runtime model checks: {error}"
@@ -1287,7 +1490,7 @@ fn doctor_command(
         doctor.line(
             "info",
             "runtime models",
-            "not checked because no usable OpenCode runtime is installed",
+            "not checked because no usable, supported OpenCode runtime is installed",
         );
     }
 
@@ -2590,14 +2793,25 @@ fn throttle_command(
         env.xdg_config_home.as_deref(),
         env.home_dir.as_deref(),
     );
+    config::reject_stale_json(&path, "user")?;
+    if path
+        .extension()
+        .map(|extension| extension.eq_ignore_ascii_case("json"))
+        .unwrap_or(false)
+    {
+        return Err(Failure::Gear(GearError::config(format!(
+            "refusing to write the user config as JSON: {}\nOpenCode Gear reads and writes YAML only; pass a .yaml path.",
+            path.display()
+        ))));
+    }
     let mut existing = if path.is_file() {
-        json::read_json_object(&path).map_err(Failure::Gear)?
+        yaml::read_yaml_object(&path).map_err(Failure::Gear)?
     } else {
         json!({})
     };
     let object = existing.as_object_mut().ok_or_else(|| {
         Failure::Gear(GearError::config(format!(
-            "{} must contain a JSON object",
+            "{} must contain a YAML mapping",
             path.display()
         )))
     })?;
@@ -2621,13 +2835,13 @@ fn throttle_command(
                 .map_err(Failure::Gear)?;
         }
     }
-    let text = serde_json::to_string_pretty(&existing).map_err(|error| {
+    let text = yaml::to_yaml_string(&existing).map_err(|error| {
         Failure::Gear(GearError::config(format!(
             "cannot serialize {}: {error}",
             path.display()
         )))
     })?;
-    std::fs::write(&path, format!("{text}\n"))
+    std::fs::write(&path, text)
         .map_err(|error| GearError::write(&path, error))
         .map_err(Failure::Gear)?;
     println!("default throttle set to {level} in {}", path.display());

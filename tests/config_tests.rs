@@ -4,7 +4,7 @@
 mod common;
 
 use common::*;
-use opencode_gear::config::Effective;
+use opencode_gear::config::{build_effective, Effective};
 use opencode_gear::defaults::{load_defaults, GearSource, LEAD_LEVELS};
 use opencode_gear::{build, model, observability, prompt, validate};
 use serde_json::json;
@@ -129,8 +129,8 @@ fn throttle_precedence_is_cli_env_default() {
 #[test]
 fn project_override_can_change_the_default_throttle() {
     let (_dir, home, project) = setup();
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"throttle": {"default": "mid"}}),
     );
     let effective = disk(&home, &project);
@@ -250,8 +250,8 @@ fn enabled_providers_are_the_routing_providers() {
 #[test]
 fn fallback_is_reported_and_validated() {
     let (_dir, home, project) = setup();
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"routing": {"roles": {"build": {
             "model": "deepseek-v4.1-flash",
             "variant": "high",
@@ -277,8 +277,8 @@ fn default_config_is_valid() {
 #[test]
 fn missing_model_key_is_reported() {
     let (_dir, home, project) = setup();
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"routing": {"roles": {"build": {"model": "no-such-model"}}}}),
     );
     let effective = disk(&home, &project);
@@ -292,11 +292,11 @@ fn missing_model_key_is_reported() {
 #[test]
 fn missing_provider_is_reported() {
     let (_dir, home, project) = setup();
-    patch_json(&home.join("config").join("models.json"), |value| {
+    patch_yaml(&home.join("config").join("models.yaml"), |value| {
         value["models"]["mystery"] = json!({"provider": "no-such-provider", "id": "mystery-1"});
     });
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"routing": {"roles": {"build": {"model": "mystery"}}}}),
     );
     let effective = disk(&home, &project);
@@ -312,8 +312,8 @@ fn missing_provider_is_reported() {
 #[test]
 fn unknown_variant_is_reported() {
     let (_dir, home, project) = setup();
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"routing": {"roles": {"build": {
             "model": "deepseek-v4.1-flash", "variant": "impossible"
         }}}}),
@@ -329,8 +329,8 @@ fn unknown_variant_is_reported() {
 #[test]
 fn valid_variant_is_accepted() {
     let (_dir, home, project) = setup();
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"routing": {"roles": {"build": {
             "model": "deepseek-v4.1-flash", "variant": "max"
         }}}}),
@@ -340,9 +340,37 @@ fn valid_variant_is_accepted() {
 }
 
 #[test]
+fn invalid_lead_variant_is_rejected() {
+    let (_dir, home, project) = setup();
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
+        &json!({"throttle": {"levels": {"mid": {"variant": "impossible"}}}}),
+    );
+    let effective = disk(&home, &project);
+    let errors = validate::validate(&effective);
+    assert!(
+        errors.iter().any(|error| error.contains("impossible")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn lead_without_a_variant_is_valid() {
+    let (_dir, home, project) = setup();
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
+        &json!({"throttle": {"levels": {"mid": {"model": "kimi-k3", "variant": null}}}}),
+    );
+    let effective = disk(&home, &project);
+    assert_eq!(validate::validate(&effective), Vec::<String>::new());
+    let contract = model::lead_contract(&effective.data, "mid").unwrap();
+    assert_eq!(contract.variant, None);
+}
+
+#[test]
 fn unknown_throttle_model_is_reported() {
     let (_dir, home, project) = setup();
-    patch_json(&home.join("config").join("throttle.json"), |value| {
+    patch_yaml(&home.join("config").join("throttle.yaml"), |value| {
         value["levels"]["mid"]["model"] = json!("ghost");
     });
     let effective = disk(&home, &project);
@@ -364,8 +392,8 @@ fn missing_prompt_is_reported() {
 #[test]
 fn require_valid_raises() {
     let (_dir, home, project) = setup();
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"routing": {"roles": {"build": {"model": "no-such-model"}}}}),
     );
     let effective = disk(&home, &project);
@@ -375,7 +403,7 @@ fn require_valid_raises() {
 #[test]
 fn missing_config_file_is_reported() {
     let (dir, home, _project) = setup();
-    fs::remove_file(home.join("config").join("models.json")).expect("remove models");
+    fs::remove_file(home.join("config").join("models.yaml")).expect("remove models");
     assert!(load_defaults(&GearSource::Dir(home)).is_err());
     drop(dir);
 }
@@ -383,8 +411,8 @@ fn missing_config_file_is_reported() {
 #[test]
 fn project_override_swaps_a_model() {
     let (_dir, home, project) = setup();
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"models": {"models": {"glm-5.3": {
             "provider": "opencode-go", "id": "glm-5.3", "label": "GLM-5.3 custom"
         }}}}),
@@ -399,13 +427,13 @@ fn project_override_swaps_a_model() {
 #[test]
 fn project_override_beats_user_override() {
     let (dir, home, project) = setup();
-    let user = dir.join("user.json");
-    write_json(
+    let user = dir.join("user.yaml");
+    write_yaml(
         &user,
         &json!({"routing": {"roles": {"build": {"model": "glm-5.3"}}}}),
     );
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"routing": {"roles": {"build": {"model": "glm-5.3-flash"}}}}),
     );
     let effective = load_disk_effective(&home, &project, Some(&user), None);
@@ -418,8 +446,8 @@ fn project_override_beats_user_override() {
 #[test]
 fn user_override_is_used_when_project_is_absent() {
     let (dir, home, project) = setup();
-    let user = dir.join("user.json");
-    write_json(
+    let user = dir.join("user.yaml");
+    write_yaml(
         &user,
         &json!({"routing": {"roles": {"build": {"model": "glm-5.3"}}}}),
     );
@@ -438,8 +466,8 @@ fn missing_override_files_are_ignored() {
     let effective = load_disk_effective(
         &home,
         &project,
-        Some(&dir.join("nope-user.json")),
-        Some(&dir.join("nope-project.json")),
+        Some(&dir.join("nope-user.yaml")),
+        Some(&dir.join("nope-project.yaml")),
     );
     assert!(effective.applied.is_empty());
     assert_eq!(validate::validate(&effective), Vec::<String>::new());
@@ -450,8 +478,8 @@ fn project_override_can_replace_a_prompt() {
     let (dir, home, project) = setup();
     let prompt_path = dir.join("custom-lead.md");
     fs::write(&prompt_path, "Custom lead prompt.\n").expect("write prompt");
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"prompts": {"lead": prompt_path.to_string_lossy()}}),
     );
     let effective = disk(&home, &project);
@@ -462,8 +490,8 @@ fn project_override_can_replace_a_prompt() {
 #[test]
 fn raw_opencode_override_is_merged_last() {
     let (_dir, home, project) = setup();
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"opencode": {"username": "gearbox"}}),
     );
     let effective = disk(&home, &project);
@@ -475,8 +503,8 @@ fn raw_opencode_override_is_merged_last() {
 fn relative_prompt_path_resolves_against_project() {
     let (_dir, home, project) = setup();
     fs::write(project.join("lead.md"), "Relative lead prompt.\n").expect("write");
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"prompts": {"lead": "lead.md"}}),
     );
     let effective = disk(&home, &project);
@@ -489,8 +517,8 @@ fn append_keeps_core_prompt_and_adds_policy() {
     let (_dir, home, project) = setup();
     let policy = project.join("lead-policy.md");
     fs::write(&policy, "# Project policy\n\nNever touch production.\n").expect("write");
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"prompts": {"lead": {"append": [policy.to_string_lossy()]}}}),
     );
     let effective = disk(&home, &project);
@@ -506,8 +534,8 @@ fn append_only_uses_the_gear_default_not_a_replacement() {
     let (_dir, home, project) = setup();
     let policy = project.join("policy.md");
     fs::write(&policy, "Project-only clause.\n").expect("write");
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"prompts": {"lead": {"append": [policy.to_string_lossy()]}}}),
     );
     let effective = disk(&home, &project);
@@ -519,8 +547,8 @@ fn append_only_uses_the_gear_default_not_a_replacement() {
 #[test]
 fn append_accepts_inline_text() {
     let (_dir, home, project) = setup();
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"prompts": {"lead": {"append": [{"text": "Inline clause."}]}}}),
     );
     let effective = disk(&home, &project);
@@ -535,8 +563,8 @@ fn path_then_append_replaces_and_extends() {
     fs::write(&replacement, "Replacement core.\n").expect("write");
     let extra = project.join("extra.md");
     fs::write(&extra, "Extra policy.\n").expect("write");
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"prompts": {"lead": {
             "path": replacement.to_string_lossy(),
             "append": [extra.to_string_lossy()]
@@ -558,8 +586,8 @@ fn append_accepts_relative_project_path() {
         "Relative project policy.\n",
     )
     .expect("write");
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"prompts": {"lead": {"append": ["policy/lead.md"]}}}),
     );
     let effective = disk(&home, &project);
@@ -572,8 +600,8 @@ fn appended_policy_reaches_the_rendered_lead_agent() {
     let (_dir, home, project) = setup();
     let policy = project.join("lead-policy.md");
     fs::write(&policy, "Use `{{build}}` only for approved scope.\n").expect("write");
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"prompts": {"lead": {"append": [policy.to_string_lossy()]}}}),
     );
     let effective = disk(&home, &project);
@@ -585,8 +613,8 @@ fn appended_policy_reaches_the_rendered_lead_agent() {
 #[test]
 fn missing_appended_file_is_reported() {
     let (_dir, home, project) = setup();
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"prompts": {"lead": {"append": ["missing-policy.md"]}}}),
     );
     let effective = disk(&home, &project);
@@ -598,8 +626,8 @@ fn missing_appended_file_is_reported() {
 #[test]
 fn append_must_be_a_list() {
     let (_dir, home, project) = setup();
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"prompts": {"lead": {"append": "not-a-list"}}}),
     );
     let effective = disk(&home, &project);
@@ -613,8 +641,8 @@ fn append_does_not_leak_into_consumer_prompts() {
     let (_dir, home, project) = setup();
     let policy = project.join("lead-policy.md");
     fs::write(&policy, "Lead-only clause.\n").expect("write");
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"prompts": {"lead": {"append": [policy.to_string_lossy()]}}}),
     );
     let effective = disk(&home, &project);
@@ -645,8 +673,8 @@ fn core_lead_prompt_stays_project_agnostic() {
 #[test]
 fn project_override_is_loaded_only_for_that_project() {
     let (dir, home, project) = setup();
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"throttle": {"default": "high"}}),
     );
     let here = disk(&home, &project);
@@ -686,8 +714,8 @@ fn trace_is_disabled_by_default() {
 fn trace_writes_local_jsonl_without_content() {
     let (dir, home, project) = setup();
     let trace_file = dir.join("events.jsonl");
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"observability": {"enabled": true, "path": trace_file.to_string_lossy()}}),
     );
     let effective = disk(&home, &project);
@@ -712,8 +740,8 @@ fn trace_writes_local_jsonl_without_content() {
 #[test]
 fn trace_env_override_is_used() {
     let (dir, home, project) = setup();
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({"observability": {"enabled": true}}),
     );
     let effective = disk(&home, &project);
@@ -727,8 +755,8 @@ fn trace_env_override_is_used() {
 #[test]
 fn arbitrary_routing_roles_are_supported() {
     let (_dir, home, project) = setup();
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({
             "routing": {"roles": {"audit": {"model": "glm-5.3", "description": "audit role"}}},
             "prompts": {"audit": {"text": "You audit changes."}}
@@ -757,8 +785,8 @@ fn arbitrary_role_placeholders_are_substituted_in_the_lead() {
     let (_dir, home, project) = setup();
     let policy = project.join("policy.md");
     fs::write(&policy, "Delegate audits to `{{audit}}`.\n").expect("write");
-    write_json(
-        &project.join(".opencode-gear.json"),
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
         &json!({
             "routing": {"roles": {"audit": {"model": "glm-5.3"}}},
             "prompts": {
@@ -783,4 +811,167 @@ fn embedded_defaults_match_the_disk_config() {
         let b = build::build_opencode_config(&disk_effective, level).expect("disk build");
         assert_eq!(a, b, "embedded and disk config differ at level {level}");
     }
+}
+
+fn build_with(
+    home: &Path,
+    project: &Path,
+    user_path: &Path,
+    project_path: &Path,
+) -> opencode_gear::error::Result<Effective> {
+    let defaults = load_defaults(&GearSource::Dir(home.to_path_buf())).expect("defaults");
+    build_effective(
+        defaults,
+        Some(home.to_path_buf()),
+        project,
+        user_path,
+        project_path,
+        None,
+    )
+}
+
+#[test]
+fn stale_project_json_is_rejected_and_named() {
+    let (dir, home, project) = setup();
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
+        &json!({"throttle": {"default": "mid"}}),
+    );
+    let stale = project.join(".opencode-gear.json");
+    fs::write(&stale, "{\"throttle\":{\"default\":\"high\"}}\n").expect("stale json");
+
+    let error = build_with(
+        &home,
+        &project,
+        &dir.join("no-user.yaml"),
+        &project.join(".opencode-gear.yaml"),
+    )
+    .expect_err("stale project JSON must be rejected");
+    let text = error.to_string();
+    assert!(text.contains(stale.to_str().unwrap()), "{text}");
+    assert!(
+        text.contains(".opencode-gear.yaml"),
+        "the YAML target must be named: {text}"
+    );
+    assert!(text.to_lowercase().contains("yaml"), "{text}");
+    assert!(
+        !text.contains("mid") && !text.contains("high"),
+        "the stale JSON must not be merged or applied: {text}"
+    );
+}
+
+#[test]
+fn stale_user_json_is_rejected_and_named() {
+    let (dir, home, project) = setup();
+    let stale = dir.join("user.yaml");
+    fs::write(dir.join("user.json"), "throttle:\n  default: high\n").expect("stale json");
+
+    let error = build_with(
+        &home,
+        &project,
+        &stale,
+        &project.join(".opencode-gear.yaml"),
+    )
+    .expect_err("stale user JSON must be rejected");
+    let text = error.to_string();
+    assert!(text.contains("user.json"), "{text}");
+    assert!(text.contains("user.yaml"), "{text}");
+    assert!(text.to_lowercase().contains("yaml"), "{text}");
+}
+
+#[test]
+fn explicit_json_override_is_rejected() {
+    let (dir, home, project) = setup();
+    let json_path = dir.join("custom.json");
+    fs::write(&json_path, "throttle:\n  default: high\n").expect("json override");
+
+    let error = build_with(
+        &home,
+        &project,
+        &json_path,
+        &project.join(".opencode-gear.yaml"),
+    )
+    .expect_err("an explicit JSON override must be rejected");
+    let text = error.to_string();
+    assert!(text.contains("custom.json"), "{text}");
+    assert!(text.contains("custom.yaml"), "{text}");
+}
+
+#[test]
+fn comment_only_yaml_override_is_a_noop() {
+    let (_dir, home, project) = setup();
+    fs::write(
+        project.join(".opencode-gear.yaml"),
+        "# This project has no overrides yet.\n",
+    )
+    .expect("write override");
+    let effective = disk(&home, &project);
+    assert_eq!(model::resolve_throttle(&effective.data, None, None), "low");
+    assert_eq!(validate::validate(&effective), Vec::<String>::new());
+}
+
+#[test]
+fn missing_yaml_override_files_are_ignored() {
+    let (dir, home, project) = setup();
+    let effective = build_with(
+        &home,
+        &project,
+        &dir.join("nope-user.yaml"),
+        &dir.join("nope-project.yaml"),
+    )
+    .expect("missing YAML overrides are fine");
+    assert!(effective.applied.is_empty());
+    assert_eq!(validate::validate(&effective), Vec::<String>::new());
+}
+
+#[test]
+fn v2_config_uses_the_plugins_array_subagent_key_and_a_canonical_uri() {
+    let (_dir, home, project) = setup();
+    let effective = disk(&home, &project);
+
+    let v1 = build::build_opencode_config(&effective, "low").expect("v1 build");
+    let v2 = build::build_opencode_config_for(
+        &effective,
+        "low",
+        opencode_gear::runtime::compat::v2_adapter(),
+    )
+    .expect("v2 build");
+
+    // v1 keeps the historical singular plugin array and `task` permission key.
+    assert!(v1.get("plugin").is_some(), "v1 must keep `plugin`");
+    assert!(v1.get("plugins").is_none());
+    assert!(v1["agent"]["lead-low"]["permission"].get("task").is_some());
+    assert_eq!(
+        v1["agent"]["ocg-build"]["permission"]["task"],
+        json!("deny")
+    );
+
+    // v2 uses the plural `plugins` array with a canonical absolute file:// URI.
+    assert!(v2.get("plugin").is_none(), "v2 must not emit `plugin`");
+    let plugins = v2["plugins"].as_array().expect("plugins array");
+    let uri = plugins
+        .last()
+        .and_then(|entry| entry.as_str())
+        .expect("plugin uri");
+    assert!(uri.starts_with("file:///"), "{uri}");
+    assert!(uri.ends_with("ocg-orchestration.js"), "{uri}");
+    assert!(Path::new(uri.trim_start_matches("file://")).is_absolute());
+
+    // v2 renamed the delegation tool/permission key to `subagent`.
+    assert!(v2["agent"]["lead-low"]["permission"]
+        .get("subagent")
+        .is_some());
+    assert!(v2["agent"]["lead-low"]["permission"].get("task").is_none());
+    assert_eq!(
+        v2["agent"]["ocg-build"]["permission"]["subagent"],
+        json!("deny")
+    );
+
+    // Agent/role structure and the Lead model selection are unchanged.
+    assert_eq!(v2["default_agent"], v1["default_agent"]);
+    assert_eq!(v2["model"], v1["model"]);
+    assert_eq!(
+        v2["agent"]["lead-low"]["model"],
+        v1["agent"]["lead-low"]["model"]
+    );
 }

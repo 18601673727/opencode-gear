@@ -1,12 +1,12 @@
 //! Shipped defaults.
 //!
-//! The release binary embeds `config/*.json` and `config/prompts/*.md` so it is
+//! The release binary embeds `config/*.yaml` and `config/prompts/*.md` so it is
 //! self-contained. For development and tests a gear home directory with the
 //! same layout can be supplied through `OPENCODE_GEAR_HOME` (legacy
 //! `OC_GEAR_HOME`), and its files replace the embedded defaults.
 
 use crate::error::{GearError, Result};
-use crate::json::{parse_json_object, read_json_object};
+use crate::yaml::{parse_yaml_object, read_yaml_object};
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
 
@@ -39,11 +39,11 @@ pub const PROMPT_APPEND_SEPARATOR: &str = "\n\n---\n\n";
 /// cannot appear in a real path, so it can never collide with a user file.
 pub const EMBEDDED_PROMPT_PREFIX: &str = "\u{0}embedded:";
 
-const BASE_JSON: &str = include_str!("../config/base.json");
-const MODELS_JSON: &str = include_str!("../config/models.json");
-const PERMISSIONS_JSON: &str = include_str!("../config/permissions.json");
-const ROUTING_JSON: &str = include_str!("../config/routing.json");
-const THROTTLE_JSON: &str = include_str!("../config/throttle.json");
+const BASE_YAML: &str = include_str!("../config/base.yaml");
+const MODELS_YAML: &str = include_str!("../config/models.yaml");
+const PERMISSIONS_YAML: &str = include_str!("../config/permissions.yaml");
+const ROUTING_YAML: &str = include_str!("../config/routing.yaml");
+const THROTTLE_YAML: &str = include_str!("../config/throttle.yaml");
 
 const LEAD_PROMPT: &str = include_str!("../config/prompts/lead.md");
 const EXPLORE_PROMPT: &str = include_str!("../config/prompts/explore.md");
@@ -89,31 +89,31 @@ pub fn embedded_prompt(role: &str) -> Option<&'static str> {
 pub fn load_defaults(source: &GearSource) -> Result<Value> {
     let (models, throttle, routing, permissions, base, prompt_dir) = match source {
         GearSource::Embedded => (
-            parse_json_object("config/models.json", MODELS_JSON)?,
-            parse_json_object("config/throttle.json", THROTTLE_JSON)?,
-            parse_json_object("config/routing.json", ROUTING_JSON)?,
-            parse_json_object("config/permissions.json", PERMISSIONS_JSON)?,
-            parse_json_object("config/base.json", BASE_JSON)?,
+            parse_yaml_object("config/models.yaml", MODELS_YAML)?,
+            parse_yaml_object("config/throttle.yaml", THROTTLE_YAML)?,
+            parse_yaml_object("config/routing.yaml", ROUTING_YAML)?,
+            parse_yaml_object("config/permissions.yaml", PERMISSIONS_YAML)?,
+            parse_yaml_object("config/base.yaml", BASE_YAML)?,
             None,
         ),
         GearSource::Dir(home) => {
             let config = home.join("config");
             (
-                read_json_object(&config.join("models.json"))?,
-                read_json_object(&config.join("throttle.json"))?,
-                read_json_object(&config.join("routing.json"))?,
-                read_json_object(&config.join("permissions.json"))?,
-                read_json_object(&config.join("base.json"))?,
+                read_yaml_object(&config.join("models.yaml"))?,
+                read_yaml_object(&config.join("throttle.yaml"))?,
+                read_yaml_object(&config.join("routing.yaml"))?,
+                read_yaml_object(&config.join("permissions.yaml"))?,
+                read_yaml_object(&config.join("base.yaml"))?,
                 Some(config.join("prompts")),
             )
         }
     };
 
-    require_key(&models, "providers", "config/models.json")?;
-    require_key(&models, "models", "config/models.json")?;
-    require_key(&throttle, "default", "config/throttle.json")?;
-    require_key(&throttle, "levels", "config/throttle.json")?;
-    require_key(&routing, "roles", "config/routing.json")?;
+    require_key(&models, "providers", "config/models.yaml")?;
+    require_key(&models, "models", "config/models.yaml")?;
+    require_key(&throttle, "default", "config/throttle.yaml")?;
+    require_key(&throttle, "levels", "config/throttle.yaml")?;
+    require_key(&routing, "roles", "config/routing.yaml")?;
 
     let mut prompts = Map::new();
     let mut prompt_defaults = Map::new();

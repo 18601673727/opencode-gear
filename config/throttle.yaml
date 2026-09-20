@@ -1,0 +1,22 @@
+---
+"$comment": Throttle controls ONLY the Lead tier. It must never decide which
+  consumer model handles EXPLORE / BUILD / VERIFY / DEBUG - that is config/routing.yaml.
+  `model` references a key in config/models.yaml; `variant` is optional and, when
+  present, must be one of that model's declared variants. Omit it (or set it to
+  null) to run at the provider default.
+default: low
+levels:
+  low:
+    model: sol
+    variant: low
+    description: Economical Lead. Sol at its lowest reasoning variant; best default
+      when cost matters.
+  mid:
+    model: sol
+    variant: medium
+    description: Balanced Lead. The same Sol model at medium reasoning.
+  high:
+    model: astra
+    variant: low
+    description: Premium Lead. The larger Astra model at its lowest variant for a
+      bigger context and stronger model.

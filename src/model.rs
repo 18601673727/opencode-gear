@@ -1,7 +1,7 @@
 //! Model registry and role resolution.
 //!
 //! Roles are durable; providers and model ids are replaceable and live in
-//! `config/models.json`. Routing roles are arbitrary: the code only assumes a
+//! `config/models.yaml`. Routing roles are arbitrary: the code only assumes a
 //! role maps to a model key.
 
 use crate::error::{GearError, Result};
@@ -86,13 +86,20 @@ pub fn consumer_agent_id(role: &str) -> String {
 /// This value is resolved in Rust and handed to the thin OpenCode plugin for
 /// enforcement at `chat.message`, after OpenCode has applied sticky UI/session
 /// selection but before the user message is saved or sent to a provider.
+///
+/// The Lead is provider-agnostic: `provider_id`/`model_id` come from the
+/// configured registry, not from a hardcoded OpenAI assumption. A reasoning
+/// `variant` is optional and provider-specific. When the resolved model declares
+/// no variant (or the throttle omits one), it is `None` and the request is left
+/// at the provider default; it is never fabricated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeadContract {
     pub level: String,
     pub agent: String,
     pub provider_id: String,
     pub model_id: String,
-    pub variant: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
 }
 
 impl LeadContract {
@@ -128,17 +135,13 @@ pub fn lead_contract(data: &Value, level: &str) -> Result<LeadContract> {
         .get("variant")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            GearError::config(format!(
-                "throttle level '{level}' must define a runtime variant"
-            ))
-        })?;
+        .map(str::to_string);
     Ok(LeadContract {
         level: level.to_string(),
         agent: lead_agent_id(level),
         provider_id: provider_id.to_string(),
         model_id: model_id.to_string(),
-        variant: variant.to_string(),
+        variant,
     })
 }
 
@@ -175,7 +178,7 @@ pub fn runtime_model_requirements(data: &Value) -> Result<Vec<ModelRequirement>>
                 label: contract.agent.clone(),
                 agent: contract.agent,
                 full_model_id,
-                variant: Some(contract.variant),
+                variant: contract.variant,
                 kind: ModelRequirementKind::Lead,
             });
         }

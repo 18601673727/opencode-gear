@@ -14,7 +14,7 @@ fn base_command(cwd: &Path, work: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ocg"));
     command
         .current_dir(cwd)
-        .env("OPENCODE_GEAR_USER_CONFIG", work.join("no-user.json"))
+        .env("OPENCODE_GEAR_USER_CONFIG", work.join("no-user.yaml"))
         .env_remove("OPENCODE_GEAR_PROJECT_CONFIG")
         .env_remove("OPENCODE_GEAR_THROTTLE")
         .env_remove("OPENCODE_GEAR_HOME")
@@ -97,7 +97,7 @@ fn invalid_verification_config_is_reported() {
     let project = dir.project();
     write_project_file(
         &project,
-        ".opencode-gear.json",
+        ".opencode-gear.yaml",
         "{\"verification\": {\"stages\": {\"turbo\": {}}}}\n",
     );
     let project_arg = project.to_string_lossy().into_owned();
@@ -120,7 +120,7 @@ fn shell_control_commands_are_rejected() {
     let project = dir.project();
     write_project_file(
         &project,
-        ".opencode-gear.json",
+        ".opencode-gear.yaml",
         "{\"verification\": {\"stages\": {\"fast\": {\"commands\": [\"cargo check; rm -rf .\"]}}}}\n",
     );
     let project_arg = project.to_string_lossy().into_owned();
@@ -176,7 +176,7 @@ fn verify_runs_configured_command_distills_failure_and_keeps_raw_logs() {
             }
         }
     });
-    write_project_file(&project, ".opencode-gear.json", &format!("{config}\n"));
+    write_project_file(&project, ".opencode-gear.yaml", &format!("{config}\n"));
     let project_arg = project.to_string_lossy().into_owned();
 
     let output = run(
@@ -330,7 +330,7 @@ fn fixture_flow_context_edit_stale_verify_checkpoint() {
             "stages": {"normal": {"commands": [{"program": script.to_string_lossy(), "args": []}]}}
         }
     });
-    write_project_file(&project, ".opencode-gear.json", &format!("{config}\n"));
+    write_project_file(&project, ".opencode-gear.yaml", &format!("{config}\n"));
     // Edit a source file so the diff and targeted proposal are non-empty.
     fs::write(
         project.join("src/parser.rs"),
@@ -470,7 +470,7 @@ fn capabilities_disabled_is_reflected_and_not_planned() {
     write_project_file(&project, "src/lib.rs", "pub fn a() {}\n");
     write_project_file(
         &project,
-        ".opencode-gear.json",
+        ".opencode-gear.yaml",
         "{\"capabilities\": {\"enabled\": false}}\n",
     );
     let project_arg = project.to_string_lossy().into_owned();
@@ -639,7 +639,7 @@ fn verify_skips_context_when_disabled_but_still_runs_commands() {
             "stages": {"normal": {"commands": [{"program": script.to_string_lossy(), "args": []}]}}
         }
     });
-    write_project_file(&project, ".opencode-gear.json", &format!("{config}\n"));
+    write_project_file(&project, ".opencode-gear.yaml", &format!("{config}\n"));
     let project_arg = project.to_string_lossy().into_owned();
 
     let output = run(

@@ -48,6 +48,20 @@ pub fn plugin_uri(root: &Path) -> Option<String> {
     Some(format!("file://{}", absolute.to_string_lossy()))
 }
 
+/// The canonical, absolute `file://` URL for the generated adapter.
+///
+/// OpenCode 2 requires a canonical local plugin URI; a URI that could not be
+/// made absolute is refused rather than silently passed through.
+pub fn canonical_plugin_uri(root: &Path) -> Option<String> {
+    let uri = plugin_uri(root)?;
+    let absolute = uri
+        .strip_prefix("file://")
+        .map(Path::new)
+        .map(Path::is_absolute)
+        .unwrap_or(false);
+    absolute.then_some(uri)
+}
+
 fn relative_from_state() -> PathBuf {
     Path::new(crate::context::repomap::GEAR_DIR)
         .join(crate::orchestration::state::ORCHESTRATION_DIR)
@@ -69,25 +83,32 @@ pub fn is_installed(root: &Path) -> bool {
     plugin_path(root).is_file()
 }
 
-/// Materialize the generated adapter. Writes only under ignored local state.
+/// Materialize the v1 generated adapter. Writes only under ignored local state.
 pub fn materialize(root: &Path) -> Result<PathBuf> {
+    materialize_with(root, plugin_source())
+}
+
+/// Materialize a generated adapter from an explicit source. Writes only under
+/// ignored local state.
+pub fn materialize_with(root: &Path, source: &str) -> Result<PathBuf> {
     crate::runtime::install::ensure_gitignore(root)?;
     let path = plugin_path(root);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| GearError::io(format!("cannot create {}", parent.display()), error))?;
     }
-    std::fs::write(&path, plugin_source()).map_err(|error| GearError::write(&path, error))?;
+    std::fs::write(&path, source).map_err(|error| GearError::write(&path, error))?;
     Ok(path)
 }
 
-/// Inject the plugin URL into a config, preserving every existing plugin entry
+/// Inject the plugin URL under the given config array key (`plugin` for
+/// OpenCode 1.x, `plugins` for OpenCode 2.x), preserving every existing entry
 /// and never adding a duplicate.
-pub fn inject_plugin(config: &mut Value, uri: &str) {
+pub fn inject_plugin_for(config: &mut Value, key: &str, uri: &str) {
     let Some(object) = config.as_object_mut() else {
         return;
     };
-    let mut entries: Vec<Value> = match object.get("plugin") {
+    let mut entries: Vec<Value> = match object.get(key) {
         Some(Value::Array(values)) => values
             .iter()
             .filter(|value| !entry_is_uri(value, uri))
@@ -96,7 +117,12 @@ pub fn inject_plugin(config: &mut Value, uri: &str) {
         _ => Vec::new(),
     };
     entries.push(Value::String(uri.to_string()));
-    object.insert("plugin".to_string(), Value::Array(entries));
+    object.insert(key.to_string(), Value::Array(entries));
+}
+
+/// Inject the plugin URL under the historical singular `plugin` key.
+pub fn inject_plugin(config: &mut Value, uri: &str) {
+    inject_plugin_for(config, "plugin", uri);
 }
 
 /// Whether one configured plugin entry already names `uri`.
@@ -108,30 +134,42 @@ fn entry_is_uri(value: &Value, uri: &str) -> bool {
     }
 }
 
-/// Whether a config already contains an OCG plugin entry (used by diagnostics
-/// and by tests that assert disabled orchestration emits nothing).
-pub fn has_ocg_plugin(config: &Value) -> bool {
+/// Whether a config already contains an OCG plugin entry under `key` (used by
+/// diagnostics and by tests that assert disabled orchestration emits nothing).
+pub fn has_ocg_plugin_for(config: &Value, key: &str) -> bool {
     config
-        .get("plugin")
+        .get(key)
         .and_then(Value::as_array)
         .map(|entries| entries.iter().any(entry_is_ocg))
         .unwrap_or(false)
 }
 
-/// Remove the generated OCG plugin entry while preserving every user plugin.
-/// Used for non-coding sessions (`ocg models`) that must not depend on the
-/// adapter being materialized.
-pub fn remove_ocg_plugin(config: &mut Value) {
+/// Whether a config already contains an OCG plugin entry under the historical
+/// singular `plugin` key.
+pub fn has_ocg_plugin(config: &Value) -> bool {
+    has_ocg_plugin_for(config, "plugin")
+}
+
+/// Remove the generated OCG plugin entry from `key` while preserving every user
+/// plugin. Used for non-coding sessions (`ocg models`) that must not depend on
+/// the adapter being materialized.
+pub fn remove_ocg_plugin_for(config: &mut Value, key: &str) {
     let Some(object) = config.as_object_mut() else {
         return;
     };
-    let Some(Value::Array(entries)) = object.get_mut("plugin") else {
+    let Some(Value::Array(entries)) = object.get_mut(key) else {
         return;
     };
     entries.retain(|entry| !entry_is_ocg(entry));
     if entries.is_empty() {
-        object.remove("plugin");
+        object.remove(key);
     }
+}
+
+/// Remove the generated OCG plugin entry from the historical singular `plugin`
+/// key.
+pub fn remove_ocg_plugin(config: &mut Value) {
+    remove_ocg_plugin_for(config, "plugin");
 }
 
 fn entry_is_ocg(value: &Value) -> bool {
@@ -185,10 +223,21 @@ function leadContract() {
   } catch (_) {
     throw new Error("OCG Lead contract is invalid");
   }
-  for (const key of ["agent", "provider_id", "model_id", "variant"]) {
+  for (const key of ["agent", "provider_id", "model_id"]) {
     if (typeof value[key] !== "string" || value[key].length === 0) {
       throw new Error("OCG Lead contract is incomplete");
     }
+  }
+  // A reasoning variant is optional and provider-specific. When the resolved
+  // Lead declares none, it is absent (or null) and the request stays at the
+  // provider default; it is never fabricated. A present variant must be a
+  // non-empty string.
+  if (value.variant !== undefined && value.variant !== null) {
+    if (typeof value.variant !== "string" || value.variant.length === 0) {
+      throw new Error("OCG Lead contract is incomplete");
+    }
+  } else {
+    value.variant = undefined;
   }
   return value;
 }
@@ -214,18 +263,23 @@ function enforceLeadContract(input, output) {
     throw new Error("OpenCode did not expose a mutable Lead request");
   }
   output.message.agent = contract.agent;
-  output.message.model = {
+  // Assign a fresh model object so a stale sticky variant cannot survive a
+  // provider-default contract: absent variant means no `variant` key at all.
+  const model = {
     providerID: contract.provider_id,
     modelID: contract.model_id,
-    variant: contract.variant,
   };
+  if (contract.variant !== undefined) {
+    model.variant = contract.variant;
+  }
+  output.message.model = model;
   const actual = output.message.model;
   if (
     output.message.agent !== contract.agent ||
     !actual ||
     actual.providerID !== contract.provider_id ||
     actual.modelID !== contract.model_id ||
-    actual.variant !== contract.variant
+    (contract.variant !== undefined && actual.variant !== contract.variant)
   ) {
     throw new Error("OpenCode rejected the OCG Lead request contract");
   }
@@ -329,7 +383,143 @@ export const server = async (_input) => ({
     if (result && result.context) appendToPrompt(args, result.context);
   },
   "tool.execute.after": async (input, output) => {
-    if (input.tool !== "task") return;
+    // A missing delivery (a cancelled subagent, or an absent hook output) is
+    // ignored: the bridge is optional and must never break the session.
+    if (!input || input.tool !== "task") return;
+    if (!output) return;
+    const result = await bridge("tool.execute.after", {
+      session_id: input.sessionID,
+      tool: input.tool,
+      args: input.args,
+      result: output,
+    });
+    if (result && result.context) appendToOutput(output, result.context);
+  },
+});
+"#;
+
+/// The generated OpenCode 2 adapter source. OpenCode 2 selects the Lead at the
+/// session level in Rust, so this adapter is even thinner than v1: it never
+/// rewrites the request model or agent.
+pub fn v2_plugin_source() -> &'static str {
+    PLUGIN_SOURCE_V2
+}
+
+const PLUGIN_SOURCE_V2: &str = r#"// Generated by OpenCode Gear (ocg) for OpenCode 2.x. Do not edit by hand.
+// Thin adapter: all ranking, projection and policy live in the `ocg` Rust
+// bridge. Lead agent/model/variant selection is session-level and performed in
+// Rust; this adapter never rewrites the request model.
+//
+// Hooks:
+//   chat.message          -> append dynamic context for the Lead session
+//   tool.execute.before   -> append the role hand-off to a `subagent` prompt
+//   tool.execute.after    -> append verification feedback to a `subagent` result
+//
+// Every bridge failure is swallowed: a broken bridge must never break a
+// session. A missing `tool.execute.after` delivery is ignored as well.
+
+const START = "<<<OCG:DYNAMIC_CONTEXT v1>>>";
+const END = "<<<OCG:END>>>";
+
+function executable() {
+  return process.env.OPENCODE_GEAR_OCG || "ocg";
+}
+
+function project() {
+  return process.env.OPENCODE_GEAR_PROJECT || process.cwd();
+}
+
+function orchestrationEnabled() {
+  return process.env.OPENCODE_GEAR_ORCHESTRATION_ENABLED === "1";
+}
+
+async function bridge(event, payload) {
+  try {
+    const proc = Bun.spawn([executable(), "__bridge", event, "--project", project()], {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "ignore",
+      env: process.env,
+    });
+    try {
+      proc.stdin.write(JSON.stringify(payload));
+      proc.stdin.end();
+    } catch (_) {
+      // stdin may already be closed; the bridge still answers or fails soft.
+    }
+    const text = await new Response(proc.stdout).text();
+    await proc.exited;
+    if (!text) return null;
+    return JSON.parse(text);
+  } catch (_) {
+    return null;
+  }
+}
+
+function hasContext(text) {
+  return typeof text === "string" && text.includes(START) && text.includes(END);
+}
+
+function suffix(context) {
+  return "\n\n" + START + "\n" + context + "\n" + END + "\n";
+}
+
+function textParts(parts) {
+  return (parts || []).filter(
+    (part) => part && part.type === "text" && typeof part.text === "string",
+  );
+}
+
+function appendToParts(parts, context) {
+  const texts = textParts(parts);
+  if (texts.length === 0) return;
+  const target = texts[texts.length - 1];
+  if (hasContext(target.text)) return;
+  target.text = target.text + suffix(context);
+}
+
+function appendToPrompt(args, context) {
+  if (!args || typeof args.prompt !== "string" || hasContext(args.prompt)) return;
+  args.prompt = args.prompt + suffix(context);
+}
+
+function appendToOutput(output, context) {
+  if (!output || typeof output.output !== "string" || hasContext(output.output)) return;
+  output.output = output.output + suffix(context);
+}
+
+export const server = async (_input) => ({
+  "chat.message": async (input, output) => {
+    if (!orchestrationEnabled()) return;
+    const agent = input && typeof input.agent === "string" ? input.agent : "";
+    if (agent && !agent.startsWith("lead-")) return;
+    const parts = output && output.parts ? output.parts : [];
+    const text = textParts(parts)
+      .map((part) => part.text)
+      .join("\n");
+    if (!text) return;
+    const result = await bridge("chat.message", {
+      session_id: input.sessionID,
+      agent: input.agent,
+      text,
+    });
+    if (result && result.context) appendToParts(parts, result.context);
+  },
+  "tool.execute.before": async (input, output) => {
+    if (!input || input.tool !== "subagent") return;
+    const args = output && output.args ? output.args : {};
+    const result = await bridge("tool.execute.before", {
+      session_id: input.sessionID,
+      tool: input.tool,
+      args,
+    });
+    if (result && result.context) appendToPrompt(args, result.context);
+  },
+  "tool.execute.after": async (input, output) => {
+    // A missing delivery (a cancelled subagent, or an absent hook output) is
+    // ignored: the bridge is optional and must never break the session.
+    if (!input || input.tool !== "subagent") return;
+    if (!output) return;
     const result = await bridge("tool.execute.after", {
       session_id: input.sessionID,
       tool: input.tool,
@@ -415,7 +605,9 @@ mod tests {
         assert!(source.contains("output.message.agent = contract.agent"));
         assert!(source.contains("providerID: contract.provider_id"));
         assert!(source.contains("modelID: contract.model_id"));
-        assert!(source.contains("variant: contract.variant"));
+        // The variant is optional: it is only written when the contract has one.
+        assert!(source.contains("if (contract.variant !== undefined)"));
+        assert!(source.contains("model.variant = contract.variant"));
     }
 
     #[test]
@@ -508,6 +700,55 @@ console.log(JSON.stringify({lead, reused, consumer, unknown}));
             json!("deepseek-v4.1-flash")
         );
         assert_eq!(value["unknown"]["model"]["variant"], json!("high"));
+    }
+
+    #[test]
+    fn chat_message_omits_a_variant_when_the_contract_has_none() {
+        if !node_or_skip("chat_message_omits_a_variant_when_the_contract_has_none") {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        write_plugin(
+            &dir,
+            r#"import { server } from "./plugin.mjs";
+const hooks = await server({});
+process.env.OPENCODE_GEAR_ORCHESTRATION_ENABLED = "0";
+async function check(contract, providerID, modelID, variant) {
+  process.env.OPENCODE_GEAR_LEAD_CONTRACT = JSON.stringify(contract);
+  const output = {message: {agent: "lead-custom", model: {providerID, modelID, variant}}, parts: []};
+  await hooks["chat.message"]({sessionID: "session", agent: "lead-custom"}, output);
+  return output.message;
+}
+// A provider-default contract (no variant) must not inherit a sticky variant
+// and must not fabricate one.
+const providerDefault = await check(
+  {agent: "lead-custom", provider_id: "acme", model_id: "widget"},
+  "acme", "widget", "high",
+);
+// An explicit variant is still enforced over any sticky selection.
+const explicit = await check(
+  {agent: "lead-custom", provider_id: "acme", model_id: "widget", variant: "max"},
+  "acme", "widget", "low",
+);
+console.log(JSON.stringify({providerDefault, explicit}));
+"#,
+        );
+        let value = run_plugin_script(&dir);
+        assert_eq!(
+            value["providerDefault"]["model"]["providerID"],
+            json!("acme")
+        );
+        assert_eq!(
+            value["providerDefault"]["model"]["modelID"],
+            json!("widget")
+        );
+        assert!(
+            value["providerDefault"]["model"].get("variant").is_none(),
+            "provider-default contract must not carry a variant: {}",
+            value["providerDefault"]["model"]
+        );
+        assert_eq!(value["explicit"]["model"]["variant"], json!("max"));
     }
 
     #[test]
@@ -617,5 +858,88 @@ console.log(JSON.stringify(requests));
         inject_plugin(&mut config, "file:///tmp/ocg-orchestration.js");
         assert!(has_ocg_plugin(&config));
         assert_eq!(config["plugin"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn injection_uses_the_plural_key_for_v2_and_preserves_user_plugins() {
+        let mut config = json!({"plugins": ["my-plugin"]});
+        let uri = "file:///tmp/project/.opencode-gear/orchestration/plugin/ocg-orchestration.js";
+        inject_plugin_for(&mut config, "plugins", uri);
+        assert!(config.get("plugin").is_none());
+        let entries = config["plugins"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], json!("my-plugin"));
+        assert_eq!(entries[1], json!(uri));
+        assert!(has_ocg_plugin_for(&config, "plugins"));
+        assert!(!has_ocg_plugin(&config));
+        remove_ocg_plugin_for(&mut config, "plugins");
+        assert_eq!(config["plugins"], json!(["my-plugin"]));
+        assert!(!has_ocg_plugin_for(&config, "plugins"));
+    }
+
+    #[test]
+    fn v2_source_targets_subagent_and_never_rewrites_the_request() {
+        let source = v2_plugin_source();
+        assert!(source.contains("\"tool.execute.before\": async"));
+        assert!(source.contains("\"tool.execute.after\": async"));
+        assert!(source.contains("input.tool !== \"subagent\""));
+        assert!(source.contains("Bun.spawn"));
+        // The v2 adapter is thinner: no request-message Lead enforcement.
+        assert!(!source.contains("enforceLeadContract"));
+        assert!(!source.contains("output.message.agent"));
+        assert!(!source.contains("providerID:"));
+    }
+
+    #[test]
+    fn tool_after_registration_ignores_a_missing_delivery() {
+        for source in [plugin_source(), v2_plugin_source()] {
+            assert!(source.contains("\"tool.execute.after\": async"));
+            assert!(
+                source.contains("if (!input || input.tool !=="),
+                "the after hook must tolerate a missing input"
+            );
+            assert!(
+                source.contains("if (!output) return;"),
+                "the after hook must tolerate a missing delivery"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_after_hook_executes_fail_soft_when_the_bridge_is_absent() {
+        if !node_or_skip("v2_after_hook_executes_fail_soft") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("plugin.mjs"), v2_plugin_source()).unwrap();
+        std::fs::write(
+            dir.path().join("check.mjs"),
+            r#"import { server } from "./plugin.mjs";
+const hooks = await server({});
+process.env.OPENCODE_GEAR_OCG = "/nonexistent/ocg-bridge-must-not-exist";
+process.env.OPENCODE_GEAR_ORCHESTRATION_ENABLED = "0";
+// A missing input and a missing delivery must both be ignored, not thrown.
+await hooks["tool.execute.after"](undefined, undefined);
+await hooks["tool.execute.after"]({tool: "subagent", sessionID: "s"}, undefined);
+await hooks["tool.execute.before"](undefined, undefined);
+const output = {output: "result"};
+await hooks["tool.execute.after"]({tool: "subagent", sessionID: "s", args: {}}, output);
+console.log(JSON.stringify({ok: true, output: output.output}));
+"#,
+        )
+        .unwrap();
+        let output = std::process::Command::new("node")
+            .arg("check.mjs")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["ok"], json!(true));
+        assert_eq!(value["output"], json!("result"));
     }
 }

@@ -13,7 +13,7 @@ fn base_command(cwd: &Path, work: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ocg"));
     command
         .current_dir(cwd)
-        .env("OPENCODE_GEAR_USER_CONFIG", work.join("no-user.json"))
+        .env("OPENCODE_GEAR_USER_CONFIG", work.join("no-user.yaml"))
         .env_remove("OPENCODE_GEAR_PROJECT_CONFIG")
         .env_remove("OPENCODE_GEAR_THROTTLE")
         .env_remove("OPENCODE_GEAR_HOME")
@@ -288,8 +288,8 @@ fn doctor_reports_missing_project_config_as_info() {
 fn doctor_marks_user_and_project_layers_as_found() {
     let dir = TestDir::new();
     let project = dir.project();
-    let user = dir.join("user-config.json");
-    let project_config = project.join("project-config.json");
+    let user = dir.join("user-config.yaml");
+    let project_config = project.join("project-config.yaml");
     fs::write(&user, "{\"throttle\":{\"default\":\"mid\"}}\n").unwrap();
     fs::write(&project_config, "{\"throttle\":{\"default\":\"high\"}}\n").unwrap();
     let output = base_command(dir.path(), dir.path())

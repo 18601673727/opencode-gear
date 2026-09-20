@@ -67,7 +67,9 @@ pub fn read_json_object(path: &Path) -> Result<Value> {
 }
 
 /// Parse a JSON document that must contain an object. `label` is used in
-/// error messages (for embedded defaults that is e.g. `config/models.json`).
+/// error messages. OpenCode Gear's own configuration is YAML; these helpers are
+/// retained for genuinely JSON protocols (for example generated OpenCode
+/// config, bridge payloads and state files).
 pub fn parse_json_object(label: &str, text: &str) -> Result<Value> {
     let value: Value = serde_json::from_str(text)
         .map_err(|error| GearError::config(format!("{label} is not valid JSON: {error}")))?;

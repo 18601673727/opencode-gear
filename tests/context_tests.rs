@@ -746,10 +746,10 @@ fn prepare_is_silent_when_the_context_is_disabled() {
     use opencode_gear::defaults::{load_defaults, GearSource};
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let project = root.join(".opencode-gear.json");
+    let project = root.join(".opencode-gear.yaml");
     write(
         root,
-        ".opencode-gear.json",
+        ".opencode-gear.yaml",
         "{\"context\": {\"enabled\": false}}\n",
     );
     let defaults = load_defaults(&GearSource::Embedded).unwrap();
@@ -757,7 +757,7 @@ fn prepare_is_silent_when_the_context_is_disabled() {
         defaults,
         None,
         root,
-        &root.join("no-user.json"),
+        &root.join("no-user.yaml"),
         &project,
         None,
     )

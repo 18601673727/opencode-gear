@@ -1,15 +1,15 @@
 # Configuration reference
 
-All configuration is JSON. There is no framework, no plugin system and no
+All configuration is YAML. There is no framework, no plugin system and no
 database. `ocg` is a single Rust binary that embeds the shipped defaults and
 merges overrides on top.
 
 ## Layers
 
 ```text
-1. embedded defaults  config/*.json (compiled into ocg)
-2. user config        ~/.config/opencode-gear/config.json
-3. project config     <project>/.opencode-gear.json
+1. embedded defaults  config/*.yaml (compiled into ocg)
+2. user config        ~/.config/opencode-gear/config.yaml
+3. project config     <project>/.opencode-gear.yaml
 4. CLI / environment  ocg high, --throttle, OPENCODE_GEAR_THROTTLE
 ```
 
@@ -18,6 +18,18 @@ key and lists are replaced wholesale.
 
 An explicit `OPENCODE_GEAR_HOME` (legacy `OC_GEAR_HOME`) directory containing
 `config/` replaces layer 1 with files from disk.
+
+The user and project paths can also be set with `OPENCODE_GEAR_USER_CONFIG` /
+`OPENCODE_GEAR_PROJECT_CONFIG` or `--user-config` / `--project-config`.
+
+### JSON is rejected, not migrated
+
+The legacy JSON paths — `~/.config/opencode-gear/config.json` and
+`<project>/.opencode-gear.json` — are **not** read. When an existing JSON
+override is found next to a YAML layer (or an explicit `.json` path is passed),
+`ocg` fails with the offending path named and asks you to convert it to YAML.
+Config files are never migrated or merged. `ocg init` also refuses when a stale
+`.opencode-gear.json` exists.
 
 `ocg layers` prints which files were found. `ocg status` prints the resolved
 values.
@@ -28,67 +40,77 @@ An override file uses the same top-level keys as the gear's `config/` files:
 
 | Key | Mirrors | Purpose |
 | --- | --- | --- |
-| `throttle` | `config/throttle.json` | `{ "default": "low", "levels": { ... } }` |
-| `models` | `config/models.json` | `{ "providers": {...}, "models": {...} }` |
-| `routing` | `config/routing.json` | `{ "small_model": "...", "roles": {...} }` |
-| `permissions` | `config/permissions.json` | profiles, role bindings, isolation |
-| `prompts` | `config/prompts/` | role -> path or `{"text": "..."}` |
-| `observability` | — | `{ "enabled": bool, "path": "..." }` |
+| `throttle` | `config/throttle.yaml` | `default` plus `levels` |
+| `models` | `config/models.yaml` | `providers` and `models` |
+| `routing` | `config/routing.yaml` | `small_model` and `roles` |
+| `permissions` | `config/permissions.yaml` | profiles, role bindings, isolation |
+| `prompts` | `config/prompts/` | role -> path or `text` |
+| `observability` | — | `enabled` and `path` |
 | `runtime` | — | managed OpenCode runtime policy (see below) |
 | `context` | — | local context engine policy (see below) |
 | `opencode` | — | raw OpenCode config merged into the result last |
 
 Example:
 
-```json
-{
-  "throttle": { "default": "mid" },
-  "routing": { "roles": { "build": { "model": "glm-5.3", "variant": "max" } } },
-  "opencode": { "username": "you" }
-}
+```yaml
+throttle:
+  default: mid
+routing:
+  roles:
+    build:
+      model: glm-5.3
+      variant: max
+opencode:
+  username: you
 ```
+
+A comment-only override file (or the empty mapping `{}`) is a valid no-op.
 
 ## Registries
 
-### `config/models.json`
+### `config/models.yaml`
 
-```json
-{
-  "providers": { "<provider-id>": { "label": "...", "note": "..." } },
-  "models": {
-    "<key>": {
-      "provider": "<provider-id>",
-      "id": "<real provider model id>",
-      "label": "human name",
-      "variants": ["low", "high"]
-    }
-  }
-}
+```yaml
+providers:
+  <provider-id>:
+    label: human name
+    note: how to authenticate
+models:
+  <key>:
+    provider: <provider-id>
+    id: <real provider model id>
+    label: human name
+    variants: [low, high]
 ```
 
 `variants` is optional and documents the reasoning variants the provider
 really exposes. If present, `ocg validate` rejects any configured variant that
 is not in the list, which stops invented reasoning levels from sneaking in.
 
-### `config/throttle.json`
+### `config/throttle.yaml`
 
-```json
-{
-  "default": "low",
-  "levels": {
-    "low":  { "model": "<model key>", "variant": "low" },
-    "mid":  { "model": "<model key>", "variant": "medium" },
-    "high": { "model": "<model key>", "variant": "low" }
-  }
-}
+```yaml
+default: low
+levels:
+  low:
+    model: <model key>
+    variant: low
+  mid:
+    model: <model key>
+    variant: medium
+  high:
+    model: <model key>
+    variant: low
 ```
 
-All three levels must exist and each Lead level must name its exact runtime
-variant; static validation (`ocg validate`, `ocg doctor`) requires it, because
-the runtime contract cannot be satisfied without one. OCG exports that resolved
-contract to its generated plugin, which enforces the selected Lead
-agent/model/variant at `chat.message`; sticky TUI or reused-session state cannot
-override it. Consumer requests are left unchanged.
+All three levels must exist. `variant` is optional and provider-specific: when
+omitted (or set to `null`), the Lead runs at the provider default and neither
+the generated config nor the exported contract carries a `variant` key. When
+present, static validation (`ocg validate`, `ocg doctor`) rejects any variant the
+model does not declare. OCG exports the resolved contract to its generated
+plugin, which enforces the selected Lead agent/model (and variant, when one is
+configured) at `chat.message`; sticky TUI or reused-session state cannot override
+it. Consumer requests are left unchanged.
 
 A coding launch also runs a read-only `opencode models` preflight against the
 generated config. A definitely missing active Lead model is a launch error, not
@@ -98,20 +120,18 @@ reports all configured Lead tiers and consumer routes separately from static
 config validation. `ocg models` remains a plain pass-through and neither
 materializes nor loads the generated plugin.
 
-### `config/routing.json`
+### `config/routing.yaml`
 
-```json
-{
-  "small_model": "<model key>",
-  "roles": {
-    "<role>": {
-      "model": "<model key>",
-      "variant": "high",
-      "description": "shown to the Lead",
-      "fallback": [ { "model": "<model key>", "variant": "high" } ]
-    }
-  }
-}
+```yaml
+small_model: <model key>
+roles:
+  <role>:
+    model: <model key>
+    variant: high
+    description: shown to the Lead
+    fallback:
+      - model: <model key>
+        variant: high
 ```
 
 The shipped roles are `explore`, `explore-deep`, `build`, `verify`, `debug`
@@ -120,15 +140,21 @@ prompt and, if you want a non-default profile, a `permissions.role_profiles`
 entry. The generated agent is named `ocg-<role>`, and `{{<role>}}` placeholders
 (underscores for dashes) are substituted in the Lead prompt.
 
-### `config/permissions.json`
+### `config/permissions.yaml`
 
-```json
-{
-  "profiles": { "<name>": { "<permission>": "allow" | "deny" | "ask" } },
-  "role_profiles": { "<role>": "<profile>" },
-  "subagent": { "hidden": true, "permission": { "task": "deny" } },
-  "lead": { "temperature": 0.1, "task_default": "deny" }
-}
+```yaml
+profiles:
+  <name>:
+    <permission>: allow
+role_profiles:
+  <role>: <profile>
+subagent:
+  hidden: true
+  permission:
+    task: deny
+lead:
+  temperature: 0.1
+  task_default: deny
 ```
 
 Permission objects are last-match-wins; `"*"` sets the default and specific
@@ -164,8 +190,11 @@ placeholder substitution applies to the whole assembled prompt. This is the
 supported way to layer repository-specific policy on top of the gear prompt
 without forking it:
 
-```json
-{ "prompts": { "lead": { "append": [".opencode/lead-policy.md"] } } }
+```yaml
+prompts:
+  lead:
+    append:
+      - .opencode/lead-policy.md
 ```
 
 The gear keeps the unmodified prompt for every role, so an append-only override
@@ -176,16 +205,13 @@ never has to restate the core prompt.
 The managed OpenCode runtime is configured by the top-level `runtime` object.
 It is deliberately separate from the raw `opencode` config key.
 
-```json
-{
-  "runtime": {
-    "channel": "latest",
-    "autoUpgrade": true,
-    "checkIntervalHours": 24,
-    "fallback": "project-local",
-    "version": "1.18.31"
-  }
-}
+```yaml
+runtime:
+  channel: latest
+  autoUpgrade: true
+  checkIntervalHours: 24
+  fallback: project-local
+  version: 1.18.31
 ```
 
 | Field | Default | Meaning |
@@ -232,23 +258,20 @@ The optional local context engine is configured by the top-level `context`
 object. Every field is optional and the defaults are conservative; no user
 configuration is required.
 
-```json
-{
-  "context": {
-    "enabled": true,
-    "cache": true,
-    "maxFileBytes": 1000000,
-    "maxRepositoryFiles": 100000,
-    "maxCandidates": 200,
-    "maxFiles": 24,
-    "maxSlices": 48,
-    "maxBytes": 262144,
-    "maxDiffBytes": 131072,
-    "maxHunks": 40,
-    "maxSymbolsPerFile": 200,
-    "includeUntracked": true
-  }
-}
+```yaml
+context:
+  enabled: true
+  cache: true
+  maxFileBytes: 1000000
+  maxRepositoryFiles: 100000
+  maxCandidates: 200
+  maxFiles: 24
+  maxSlices: 48
+  maxBytes: 262144
+  maxDiffBytes: 131072
+  maxHunks: 40
+  maxSymbolsPerFile: 200
+  includeUntracked: true
 ```
 
 | Field | Default | Meaning |
@@ -291,22 +314,21 @@ The optional verification subsystem is configured by the top-level
 `verification` object. Every field is optional. Stages start empty, so a
 manifest existing never causes a command to run.
 
-```json
-{
-  "verification": {
-    "enabled": true,
-    "defaultStage": "normal",
-    "stopOnFailure": true,
-    "maxRawLogBytes": 2000000,
-    "maxLogStorageBytes": 52428800,
-    "includeTestProposal": true,
-    "stages": {
-      "fast": { "commands": ["cargo fmt --check"] },
-      "normal": { "commands": ["cargo check", "cargo test"] },
-      "full": { "commands": [] }
-    }
-  }
-}
+```yaml
+verification:
+  enabled: true
+  defaultStage: normal
+  stopOnFailure: true
+  maxRawLogBytes: 2000000
+  maxLogStorageBytes: 52428800
+  includeTestProposal: true
+  stages:
+    fast:
+      commands: [cargo fmt --check]
+    normal:
+      commands: [cargo check, cargo test]
+    full:
+      commands: []
 ```
 
 | Field | Default | Meaning |
@@ -328,8 +350,10 @@ rejected. `ocg validate` reports violations.
 The optional top-level `capabilities` object registers custom capability names
 that a task may select by keyword:
 
-```json
-{ "capabilities": { "enabled": true, "custom": ["warehouse"] } }
+```yaml
+capabilities:
+  enabled: true
+  custom: [warehouse]
 ```
 
 With `enabled: false` the planner is disabled end-to-end: the plan carries
@@ -343,8 +367,10 @@ Capability planning is a context/config diagnostic, not a security sandbox; see
 
 The optional top-level `telemetry` object controls local event collection:
 
-```json
-{ "telemetry": { "enabled": true, "localOnly": true } }
+```yaml
+telemetry:
+  enabled: true
+  localOnly: true
 ```
 
 | Field | Default | Meaning |
@@ -364,16 +390,13 @@ written. A telemetry failure warns and never blocks a command. Set
 The optional top-level `orchestration` object controls the Rust orchestration
 controller and whether a launch generates/injects the OpenCode plugin adapter:
 
-```json
-{
-  "orchestration": {
-    "enabled": true,
-    "maxBuildRetries": 2,
-    "maxDebugRetries": 1,
-    "maxHandoffBytes": 16384,
-    "maxHandoffRatioPercent": 60
-  }
-}
+```yaml
+orchestration:
+  enabled: true
+  maxBuildRetries: 2
+  maxDebugRetries: 1
+  maxHandoffBytes: 16384
+  maxHandoffRatioPercent: 60
 ```
 
 | Field | Default | Bounds | Meaning |
@@ -467,6 +490,7 @@ ocg routing  [--project DIR]
 ocg status   [--throttle LEVEL] [--project DIR]
 ocg throttle [LEVEL] [--project DIR]
 ocg layers   [--project DIR]
+ocg init     [--project DIR]
 ocg trace    --event launch [--project DIR]
 ocg context  <task...> [--pretty] [--project DIR]
 ocg context  symbols <query> [--project DIR]

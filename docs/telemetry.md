@@ -150,10 +150,11 @@ The policy is a small top-level object:
   The legacy `OC_GEAR_TELEMETRY` alias is accepted.
 - A disabled store writes nothing and creates no `.opencode-gear/` directory.
 
-Example per-project disable file (`.opencode-gear.json`):
+Example per-project disable file (`.opencode-gear.yaml`):
 
-```json
-{ "telemetry": { "enabled": false } }
+```yaml
+telemetry:
+  enabled: false
 ```
 
 ## Corruption recovery

@@ -14,6 +14,7 @@
 
 pub mod archive;
 pub mod cache;
+pub mod compat;
 pub mod hash;
 pub mod install;
 pub mod policy;
@@ -21,6 +22,7 @@ pub mod release;
 pub mod resolve;
 pub mod self_update;
 
+pub use compat::{detect, detect_from_host, Major, RuntimeAdapter, RuntimeVersion, SessionClient};
 pub use policy::{Channel, Fallback, RuntimePolicy};
 pub use resolve::{RuntimeManager, RuntimeReport, RuntimeSelection, RuntimeSource, UpgradeOutcome};
 

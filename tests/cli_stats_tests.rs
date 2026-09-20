@@ -12,7 +12,7 @@ fn base_command(cwd: &Path, work: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ocg"));
     command
         .current_dir(cwd)
-        .env("OPENCODE_GEAR_USER_CONFIG", work.join("no-user.json"))
+        .env("OPENCODE_GEAR_USER_CONFIG", work.join("no-user.yaml"))
         .env_remove("OPENCODE_GEAR_PROJECT_CONFIG")
         .env_remove("OPENCODE_GEAR_THROTTLE")
         .env_remove("OPENCODE_GEAR_HOME")
@@ -75,7 +75,7 @@ fn stats_reports_disabled_telemetry() {
     let project = dir.project();
     write_project_file(
         &project,
-        ".opencode-gear.json",
+        ".opencode-gear.yaml",
         "{\"telemetry\": {\"enabled\": false}}\n",
     );
     let project_arg = project.to_string_lossy().into_owned();
@@ -233,7 +233,7 @@ fn stats_after_verify_reports_attempts_and_log_bytes() {
                 ]}}
             }
         });
-        write_project_file(&project, ".opencode-gear.json", &format!("{config}\n"));
+        write_project_file(&project, ".opencode-gear.yaml", &format!("{config}\n"));
         let project_arg = project.to_string_lossy().into_owned();
 
         let verify = run(
