@@ -837,12 +837,12 @@ mod tests {
     #[test]
     fn registration_path_follows_the_opencode_state_layout() {
         assert_eq!(
-            service_registration_path(Some(Path::new("/state")), Path::new("/home/u")),
+            service_registration_path(Some(Path::new("/state")), Path::new("/tmp/ocg-test-user")),
             PathBuf::from("/state/opencode/service.json")
         );
         assert_eq!(
-            service_registration_path(None, Path::new("/home/u")),
-            PathBuf::from("/home/u/.local/state/opencode/service.json")
+            service_registration_path(None, Path::new("/tmp/ocg-test-user")),
+            PathBuf::from("/tmp/ocg-test-user/.local/state/opencode/service.json")
         );
     }
 

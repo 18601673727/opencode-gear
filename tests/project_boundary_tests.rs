@@ -228,7 +228,6 @@ fn read_only_commands_work_outside_an_initialized_project() {
         vec!["layers"],
         vec!["status"],
         vec!["stats"],
-        vec!["doctor"],
     ] {
         let output = run(&plain, dir.path(), &args);
         assert!(
@@ -237,6 +236,21 @@ fn read_only_commands_work_outside_an_initialized_project() {
             stderr(&output)
         );
     }
+
+    // This assertion is about project-boundary behavior, not the host's
+    // installed OpenCode runtime or provider state.
+    let empty_bin = dir.join("empty-bin");
+    fs::create_dir_all(&empty_bin).expect("create empty bin");
+    let doctor = base_command(&plain, dir.path())
+        .env("PATH", &empty_bin)
+        .arg("doctor")
+        .output()
+        .expect("run doctor");
+    assert!(
+        doctor.status.success(),
+        "[\"doctor\"] must work outside a project: {}",
+        stderr(&doctor)
+    );
     assert!(
         !has_state(&plain),
         "read-only commands must not create project state"

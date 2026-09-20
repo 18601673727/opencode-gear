@@ -103,7 +103,17 @@ fn broken_explicit_override_errors_instead_of_falling_back() {
 #[test]
 fn doctor_is_read_only_and_reports_the_checks() {
     let dir = TestDir::new();
-    let output = run(dir.path(), dir.path(), &["doctor"]);
+
+    // Keep this generic doctor contract independent of any host OpenCode
+    // installation or provider state.
+    let empty_bin = dir.join("empty-bin");
+    fs::create_dir_all(&empty_bin).expect("create empty bin");
+
+    let output = base_command(dir.path(), dir.path())
+        .env("PATH", &empty_bin)
+        .arg("doctor")
+        .output()
+        .expect("run");
     assert!(
         output.status.success(),
         "{}",
