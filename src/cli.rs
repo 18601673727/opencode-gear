@@ -36,7 +36,11 @@ use crate::yaml;
 use semver::Version;
 use serde_json::{json, Value};
 use std::ffi::OsString;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command as ProcessCommand, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 /// Printed by `version` and embedded in the help header.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -836,8 +840,13 @@ fn launch(
     if !coding_session {
         crate::orchestration::plugin::remove_ocg_plugin_for(&mut resolved, adapter.plugin_key());
     }
+    // OpenCode 2 discovers a generated local plugin through
+    // OPENCODE_CONFIG_DIR/plugins, so it intentionally has no config-array
+    // entry to inspect here.
     let plugin_active = coding_session
-        && crate::orchestration::plugin::has_ocg_plugin_for(&resolved, adapter.plugin_key());
+        && crate::orchestration::OrchestrationConfig::from_config(&effective.data)
+            .map_err(Failure::Gear)?
+            .enabled;
     // The catalogue probe runs before local plugin materialization. Keep every
     // user plugin/config entry, but do not ask OpenCode to load OCG's generated
     // file before that file exists.
@@ -861,6 +870,7 @@ fn launch(
         )))
     })?;
 
+    let mut v2_runtime = None;
     if coding_session {
         match adapter.lead_selection() {
             // v1 enforces the Lead on the mutable request message; the runtime
@@ -908,6 +918,26 @@ fn launch(
                     lead.full_model_id(),
                     lead.variant.as_deref().unwrap_or("provider-default")
                 );
+
+                // Run an invocation-scoped server. A V2 client otherwise uses
+                // the user's long-lived daemon, whose catalog cannot be made
+                // to match this generated config safely.
+                let plugin_env = if plugin_active {
+                    runtime_plugin_env(effective, project_root, level, adapter)
+                        .map_err(Failure::Gear)?
+                } else {
+                    Vec::new()
+                };
+                let runtime =
+                    PrivateV2Runtime::start(&selection.path, &content, &plugin_env, &proxy_env)
+                        .map_err(Failure::Gear)?;
+                let mut client = compat::v2_client::V2SessionClient::connect(
+                    runtime.registration(),
+                    invocation_dir.to_string_lossy(),
+                )
+                .map_err(Failure::Gear)?;
+                compat::select_session_lead(&mut client, &lead).map_err(Failure::Gear)?;
+                v2_runtime = Some(runtime);
             }
         }
     }
@@ -921,10 +951,146 @@ fn launch(
     } else {
         Vec::new()
     };
+    if let Some(runtime) = v2_runtime {
+        let private_args = private_server_args(args, runtime.url());
+        let mut private_env = extra_env;
+        private_env.push((
+            OsString::from("OPENCODE_SERVER_PASSWORD"),
+            OsString::from(runtime.password()),
+        ));
+        // Keep `runtime` alive until its client exits. Its Drop implementation
+        // terminates and reaps the private server on every return path.
+        return runner
+            .run(
+                &private_args,
+                invocation_dir,
+                &content,
+                &private_env,
+                &proxy_env,
+            )
+            .map_err(Failure::Gear);
+    }
     runner
         .exec(args, invocation_dir, &content, &extra_env, &proxy_env)
         .map_err(Failure::Gear)?;
     Ok(0)
+}
+
+/// `--server` is accepted by OpenCode 2.0.11's `run` command, but not before
+/// the subcommand. Interactive launch has no subcommand, where it remains a
+/// root flag.
+fn private_server_args(args: &[OsString], url: &str) -> Vec<OsString> {
+    let mut result = Vec::with_capacity(args.len() + 2);
+    if let Some((first, rest)) = args.split_first() {
+        result.push(first.clone());
+        result.push(OsString::from("--server"));
+        result.push(OsString::from(url));
+        result.extend(rest.iter().cloned());
+    } else {
+        result.push(OsString::from("--server"));
+        result.push(OsString::from(url));
+    }
+    result
+}
+
+/// An invocation-scoped OpenCode 2 server. `opencode serve --port 0` chooses a
+/// loopback port and prints its ephemeral password; neither value is persisted
+/// in or read from the user's background-service registration.
+struct PrivateV2Runtime {
+    child: Child,
+    registration: compat::v2_client::ServiceRegistration,
+}
+
+impl PrivateV2Runtime {
+    fn start(
+        program: &Path,
+        config_content: &str,
+        extra_env: &[(OsString, OsString)],
+        proxy: &crate::proxy::ChildProxyEnv,
+    ) -> crate::error::Result<Self> {
+        let mut command = ProcessCommand::new(program);
+        command
+            .args(["serve", "--hostname", "127.0.0.1", "--port", "0"])
+            .env("OPENCODE_CONFIG_CONTENT", config_content)
+            .env_remove("OPENCODE_CONFIG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        proxy.apply(&mut command);
+        let mut child = command.spawn().map_err(|error| {
+            GearError::io(
+                format!(
+                    "cannot start private OpenCode V2 server at {}",
+                    program.display()
+                ),
+                error,
+            )
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            GearError::config("private OpenCode V2 server did not provide startup output")
+        })?;
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                // After startup the receiver is dropped, but keep draining so
+                // a chatty private server cannot block on its stdout pipe.
+                let _ = sender.send(line.unwrap_or_default());
+            }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut url = None;
+        let mut password = None;
+        while std::time::Instant::now() < deadline && (url.is_none() || password.is_none()) {
+            match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(line) => {
+                    if let Some(value) = line.strip_prefix("server listening on ") {
+                        url = Some(value.trim().to_string());
+                    } else if let Some(value) = line.strip_prefix("server password ") {
+                        password = Some(value.trim().to_string());
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        match (url, password) {
+            (Some(url), Some(password)) if !url.is_empty() && !password.is_empty() => Ok(Self {
+                child,
+                registration: compat::v2_client::ServiceRegistration::new(url, password),
+            }),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(GearError::config(
+                    "private OpenCode V2 server did not report its loopback URL and password",
+                ))
+            }
+        }
+    }
+
+    fn registration(&self) -> &compat::v2_client::ServiceRegistration {
+        &self.registration
+    }
+
+    fn url(&self) -> &str {
+        self.registration.url()
+    }
+
+    fn password(&self) -> &str {
+        self.registration.password().expose()
+    }
+}
+
+impl Drop for PrivateV2Runtime {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }
 
 /// Resolve the compatibility adapter for a runtime selection.
@@ -967,7 +1133,14 @@ fn runtime_plugin_env(
     level: &str,
     adapter: &dyn RuntimeAdapter,
 ) -> crate::error::Result<Vec<(OsString, OsString)>> {
-    let path = crate::orchestration::plugin::materialize_with(cwd, adapter.plugin_source())?;
+    let path = match adapter.major() {
+        compat::Major::V1 => {
+            crate::orchestration::plugin::materialize_with(cwd, adapter.plugin_source())?
+        }
+        compat::Major::V2 => {
+            crate::orchestration::plugin::materialize_v2_with(cwd, adapter.plugin_source())?
+        }
+    };
     let mut env = Vec::new();
     let exe = std::env::current_exe().map_err(|error| {
         GearError::io(
@@ -995,6 +1168,12 @@ fn runtime_plugin_env(
         OsString::from("OPENCODE_GEAR_ORCHESTRATION_ENABLED"),
         OsString::from("1"),
     ));
+    if adapter.major() == compat::Major::V2 {
+        env.push((
+            OsString::from("OPENCODE_CONFIG_DIR"),
+            crate::orchestration::plugin::v2_config_dir(cwd).into_os_string(),
+        ));
+    }
     let contract = model::lead_contract(&effective.data, level)?;
     let contract = serde_json::to_string(&contract).map_err(|error| {
         GearError::config(format!(

@@ -219,7 +219,7 @@ pub fn build_opencode_config_for(
     // addition to optional dynamic orchestration. Preserve the explicit
     // no-hook escape hatch: disabled orchestration emits no OCG plugin.
     if crate::orchestration::OrchestrationConfig::from_config(data)?.enabled {
-        if let Ok(uri) = adapter.local_plugin_uri(&effective.cwd) {
+        if let Some(uri) = adapter.local_plugin_uri(&effective.cwd)? {
             crate::orchestration::plugin::inject_plugin_for(
                 &mut merged,
                 adapter.plugin_key(),

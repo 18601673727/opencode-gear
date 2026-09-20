@@ -39,6 +39,20 @@ pub fn plugin_path(root: &Path) -> PathBuf {
         .join(PLUGIN_FILE)
 }
 
+/// OpenCode 2 discovers local plugins from the `plugins/` child of its custom
+/// config directory. Keep it inside OCG's ignored state rather than writing an
+/// untracked `.opencode/plugins` file into the project.
+pub fn v2_plugin_path(root: &Path) -> PathBuf {
+    crate::orchestration::state::state_dir(root)
+        .join("plugins")
+        .join(PLUGIN_FILE)
+}
+
+/// The custom config directory which makes [`v2_plugin_path`] discoverable.
+pub fn v2_config_dir(root: &Path) -> PathBuf {
+    crate::orchestration::state::state_dir(root)
+}
+
 /// The `file://` URL injected into the OpenCode config.
 pub fn plugin_uri(root: &Path) -> Option<String> {
     let path = plugin_path(root);
@@ -93,6 +107,18 @@ pub fn materialize(root: &Path) -> Result<PathBuf> {
 pub fn materialize_with(root: &Path, source: &str) -> Result<PathBuf> {
     crate::runtime::install::ensure_gitignore(root)?;
     let path = plugin_path(root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| GearError::io(format!("cannot create {}", parent.display()), error))?;
+    }
+    std::fs::write(&path, source).map_err(|error| GearError::write(&path, error))?;
+    Ok(path)
+}
+
+/// Materialize the adapter at the local-discovery path used by OpenCode 2.
+pub fn materialize_v2_with(root: &Path, source: &str) -> Result<PathBuf> {
+    crate::runtime::install::ensure_gitignore(root)?;
+    let path = v2_plugin_path(root);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| GearError::io(format!("cannot create {}", parent.display()), error))?;

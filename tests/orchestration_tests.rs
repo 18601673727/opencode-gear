@@ -467,14 +467,17 @@ fn disabled_orchestration_emits_no_plugin_and_no_state() {
 }
 
 #[test]
-fn v2_plugin_contract_uses_the_plural_key_and_subagent_tool() {
+fn v2_plugin_contract_uses_local_discovery_and_subagent_tool() {
     use opencode_gear::orchestration::plugin;
 
-    let mut config = json!({"plugins": ["user-plugin"]});
-    plugin::inject_plugin_for(&mut config, "plugins", "file:///tmp/ocg-orchestration.js");
-    assert!(config.get("plugin").is_none(), "v2 must not emit `plugin`");
-    assert!(plugin::has_ocg_plugin_for(&config, "plugins"));
-    assert_eq!(config["plugins"].as_array().unwrap().len(), 2);
+    let dir = tempfile::tempdir().unwrap();
+    let path = plugin::materialize_v2_with(dir.path(), plugin::v2_plugin_source()).unwrap();
+    assert_eq!(path, plugin::v2_plugin_path(dir.path()));
+    assert!(path.is_file());
+    assert_eq!(
+        path.parent().unwrap().parent().unwrap(),
+        plugin::v2_config_dir(dir.path())
+    );
 
     // The v2 adapter is thin: no request-message Lead rewrite, and the
     // delegation hooks target the renamed `subagent` tool.

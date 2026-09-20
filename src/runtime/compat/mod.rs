@@ -5,7 +5,7 @@
 //! ```text
 //! runtime/common contract
 //! ├── v1 adapter   (1.18.x: `plugin`, `task`, request-scoped Lead)
-//! └── v2 adapter   (2.0.x: `plugins`, `subagent`, session-scoped Lead)
+//! └── v2 adapter   (2.0.x: `plugin`, `subagent`, session-scoped Lead)
 //! ```
 //!
 //! Every version-specific decision lives here. No unrelated module may branch
@@ -22,6 +22,7 @@
 
 pub mod v1;
 pub mod v2;
+pub mod v2_client;
 
 use crate::error::{GearError, Result};
 use crate::model::LeadContract;
@@ -42,7 +43,7 @@ pub fn v2_floor() -> Version {
 
 /// The OpenCode 2 release Gear is currently verified against.
 pub fn v2_verified_baseline() -> Version {
-    Version::new(2, 0, 10)
+    Version::new(2, 0, 11)
 }
 
 /// A supported OpenCode major family.
@@ -186,7 +187,7 @@ pub trait RuntimeAdapter: Send + Sync {
     /// The family this adapter implements.
     fn major(&self) -> Major;
 
-    /// The generated-config array key for local plugins (`plugin` vs `plugins`).
+    /// The generated-config array key for package plugins.
     fn plugin_key(&self) -> &'static str;
 
     /// The OpenCode permission/tool key for consumer delegation.
@@ -195,8 +196,10 @@ pub trait RuntimeAdapter: Send + Sync {
     /// The generated plugin source for this runtime.
     fn plugin_source(&self) -> &'static str;
 
-    /// The `file://` URL for a local adapter, canonical and absolute.
-    fn local_plugin_uri(&self, path: &Path) -> Result<String>;
+    /// The `file://` URL for a local adapter when this runtime supports local
+    /// adapters in its config array. Runtimes which discover local plugins via
+    /// a config directory return `Ok(None)`.
+    fn local_plugin_uri(&self, path: &Path) -> Result<Option<String>>;
 
     /// How the Lead contract is applied.
     fn lead_selection(&self) -> LeadSelectionMode;
@@ -526,7 +529,7 @@ mod tests {
         assert_eq!(v1.major(), Major::V1);
         assert_eq!(v1.version(), &Version::new(1, 18, 31));
 
-        let v2 = detect("2.0.10").unwrap();
+        let v2 = detect("2.0.11").unwrap();
         assert_eq!(v2.major(), Major::V2);
         assert_eq!(v2.version(), &v2_verified_baseline());
 
@@ -552,9 +555,9 @@ mod tests {
         assert!(v1.is_task_tool("task"));
         assert!(!v1.is_task_tool("subagent"));
 
-        let v2 = adapter_for(&detect("2.0.10").unwrap());
+        let v2 = adapter_for(&detect("2.0.11").unwrap());
         assert_eq!(v2.major(), Major::V2);
-        assert_eq!(v2.plugin_key(), "plugins");
+        assert_eq!(v2.plugin_key(), "plugin");
         assert_eq!(v2.task_key(), "subagent");
         assert_eq!(v2.lead_selection(), LeadSelectionMode::Session);
         assert_eq!(v2.launch_mode(), LaunchMode::Daemon);

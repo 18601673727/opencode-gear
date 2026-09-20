@@ -1048,11 +1048,11 @@ fn v1_adapter_preserves_the_supported_118_contract() {
 
 #[test]
 fn a_2_0_x_runtime_selects_the_v2_adapter() {
-    for raw in ["2.0.0", "2.0.10", "2.1.2", "opencode v2.0.10"] {
+    for raw in ["2.0.0", "2.0.10", "2.0.11", "2.1.2", "opencode v2.0.10"] {
         let detected = detect(raw).unwrap();
         assert_eq!(detected.major(), compat::Major::V2, "{raw}");
         let adapter = adapter_for(&detected);
-        assert_eq!(adapter.plugin_key(), "plugins", "{raw}");
+        assert_eq!(adapter.plugin_key(), "plugin", "{raw}");
         assert_eq!(adapter.task_key(), "subagent", "{raw}");
         assert_eq!(adapter.launch_mode(), compat::LaunchMode::Daemon, "{raw}");
         assert_eq!(
@@ -1066,7 +1066,7 @@ fn a_2_0_x_runtime_selects_the_v2_adapter() {
         classify(Version::new(2, 0, 10)).unwrap().major(),
         compat::Major::V2
     );
-    assert_eq!(compat::v2_verified_baseline(), Version::new(2, 0, 10));
+    assert_eq!(compat::v2_verified_baseline(), Version::new(2, 0, 11));
 }
 
 #[test]

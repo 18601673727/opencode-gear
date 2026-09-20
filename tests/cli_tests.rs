@@ -196,6 +196,9 @@ fn report_subcommands() {
 /// `provider-default` rather than inventing a value.
 #[test]
 fn status_and_doctor_report_provider_default_when_no_variant_is_configured() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     let dir = TestDir::new();
     let project = dir.project();
     write_yaml(
@@ -218,18 +221,28 @@ fn status_and_doctor_report_provider_default_when_no_variant_is_configured() {
         "status must not fabricate a variant: {text}"
     );
 
-    let doctor = run(
-        dir.path(),
-        dir.path(),
-        &[
+    // Doctor output under test is config-only. Keep the test hermetic rather
+    // than accidentally probing whichever OpenCode happens to be on PATH.
+    let fake = dir.join("doctor-opencode.sh");
+    fs::write(
+        &fake,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'opencode v1.18.31'; exit 0; fi\nif [ \"$1\" = \"models\" ]; then printf '%s\\n' openai/gpt-5.6-sol openai/gpt-6-astra volcengine-coding/kimi-k2.7-code volcengine-coding/kimi-k3 opencode-go/deepseek-v4.1-flash opencode-go/glm-5.3-flash opencode-go/glm-5.3; exit 0; fi\nexit 0\n",
+    )
+    .expect("write hermetic OpenCode");
+    #[cfg(unix)]
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod hermetic OpenCode");
+    let doctor = base_command(dir.path(), dir.path())
+        .env("OPENCODE_GEAR_OPENCODE", fake)
+        .args([
             "--project",
             &project_arg,
             "--disable-proxy",
             "--throttle",
             "high",
             "doctor",
-        ],
-    );
+        ])
+        .output()
+        .expect("run hermetic doctor");
     assert!(doctor.status.success(), "{}", stdout_text(&doctor));
     let text = stdout_text(&doctor);
     assert!(text.contains("provider-default"), "{text}");

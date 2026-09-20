@@ -2,8 +2,8 @@
 //!
 //! OpenCode 2 changes the surrounding shape, not Gear's policy:
 //!
-//! - the generated local plugin lives under the plural `plugins` array and
-//!   must be a canonical, absolute `file://` URI,
+//! - local plugins are discovered from `OPENCODE_CONFIG_DIR/plugins`, not from
+//!   a config array entry,
 //! - the v1 `task` tool/permission key became `subagent`,
 //! - the runtime is a daemon reached over HTTP/SSE; Gear selects the Lead on
 //!   the *session* (create/resolve, switch agent/model/variant, verify) rather
@@ -15,7 +15,7 @@
 //! context and hand-offs. Session-level Lead policy, model choice and variant
 //! resolution stay in Rust.
 
-use crate::error::{GearError, Result};
+use crate::error::Result;
 use crate::runtime::compat::{LaunchMode, LeadSelectionMode, Major, RuntimeAdapter};
 use std::path::Path;
 
@@ -29,7 +29,7 @@ impl RuntimeAdapter for V2Adapter {
     }
 
     fn plugin_key(&self) -> &'static str {
-        "plugins"
+        "plugin"
     }
 
     fn task_key(&self) -> &'static str {
@@ -40,10 +40,8 @@ impl RuntimeAdapter for V2Adapter {
         crate::orchestration::plugin::v2_plugin_source()
     }
 
-    fn local_plugin_uri(&self, root: &Path) -> Result<String> {
-        crate::orchestration::plugin::canonical_plugin_uri(root).ok_or_else(|| {
-            GearError::config("cannot resolve the canonical local OpenCode plugin URI")
-        })
+    fn local_plugin_uri(&self, _root: &Path) -> Result<Option<String>> {
+        Ok(None)
     }
 
     fn lead_selection(&self) -> LeadSelectionMode {

@@ -85,6 +85,37 @@ impl ProcessRunner {
             std::process::exit(status.code().unwrap_or(1));
         }
     }
+
+    /// Run OpenCode as a child and return its exit code. V2 uses this rather
+    /// than `exec` so the invocation-scoped private server can be reaped after
+    /// the OpenCode client exits. The v1 path deliberately continues to use
+    /// [`Self::exec`].
+    pub fn run(
+        &self,
+        args: &[OsString],
+        cwd: &Path,
+        config_content: &str,
+        extra_env: &[(OsString, OsString)],
+        proxy_env: &ChildProxyEnv,
+    ) -> Result<i32> {
+        let mut command = Command::new(&self.program);
+        command
+            .args(args)
+            .current_dir(cwd)
+            .env("OPENCODE_CONFIG_CONTENT", config_content)
+            .env_remove("OPENCODE_CONFIG");
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        proxy_env.apply(&mut command);
+        let status = command.status().map_err(|error| {
+            GearError::io(
+                format!("cannot run {}", self.program.to_string_lossy()),
+                error,
+            )
+        })?;
+        Ok(status.code().unwrap_or(1))
+    }
 }
 
 /// Reads static macOS proxy configuration through `/usr/sbin/scutil --proxy`.

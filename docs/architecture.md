@@ -141,7 +141,7 @@ version-specific decision is isolated behind one narrow boundary:
 ```text
 runtime/common contract
 ├── v1 adapter   OpenCode 1.18.x
-└── v2 adapter   OpenCode 2.x (verified against 2.0.10)
+└── v2 adapter   OpenCode 2.x (verified against 2.0.11)
 ```
 
 - **Detection is explicit.** A launch classifies the resolved runtime's
@@ -150,20 +150,28 @@ runtime/common contract
   failure. A runtime whose version genuinely cannot be probed keeps the
   historical v1 contract, so the supported 1.18.x path is never regressed.
 - **One boundary, no scattered conditionals.** Unrelated modules never branch
-  on the major version. They ask the adapter for the plugin array key
-  (`plugin` vs `plugins`), the delegation tool/permission key (`task` vs
-  `subagent`), the canonical local `file://` plugin URI, the Lead-selection
-  mode and the launch mode.
+  on the major version. They ask the adapter for the package-plugin key, the
+  delegation tool/permission key (`task` vs `subagent`), local-plugin discovery,
+  the Lead-selection mode and the launch mode.
 - **V1 stays request-scoped.** The Rust-resolved Lead contract is enforced on
   the mutable `chat.message` request, and the runtime catalogue probe proves
   the active Lead model exists before launch.
-- **V2 is session-scoped.** OpenCode 2 runs a daemon reached over HTTP/SSE and
-  keeps `OPENCODE_CONFIG_CONTENT`. Gear never enumerates the whole catalogue on
-  every launch: it resolves the Lead in Rust, exports the contract via
-  environment, and emits a deterministic session-selection plan. In 0.3.0 the
-  actual daemon session client that would apply/verify the Lead is not yet
-  wired into the production launch path (covered by offline mocks and unit
-  tests). Optional catalogue/debug probes warn and continue when unavailable.
+- **V2 is session-scoped and private per invocation.** For the verified 2.0.11
+  contract, Gear starts `opencode serve --hostname 127.0.0.1 --port 0` with the
+  generated inline config and its local plugin directory. It reads the
+  child-only URL/password startup output, connects the production SessionClient
+  to that same child, resolves or creates the project session, selects the Lead
+  agent/model (sending a variant only when configured), then reads the effective
+  state back and fails on a mismatch. The OpenCode client is pointed at that
+  same private server and the child is terminated and reaped when it exits;
+  Gear never restarts or reconfigures the user's shared service.
+- **V2 config and plugins are owned together.** The 2.0.11 singular `provider`,
+  `agent`, and package `plugin` surfaces, plus `enabled_providers` and
+  `small_model`, are preserved. The generated local adapter is discovered from
+  `OPENCODE_CONFIG_DIR/plugins`, rather than injected as a file URI. A missing
+  variant is provider-default, never a serialized `"provider-default"`; an
+  overlay changing a model clears an inherited variant while an unchanged model
+  retains it.
 - **The plugin adapter stays thin.** The generated adapter only transports
   bytes to and from `ocg __bridge`; it performs no ranking, projection or
   policy, and every bridge failure is swallowed so a broken bridge cannot

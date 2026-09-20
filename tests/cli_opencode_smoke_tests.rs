@@ -9,7 +9,6 @@
 mod common;
 
 use common::{load_embedded_effective, TestDir};
-use serde_json::Value;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -26,14 +25,21 @@ fn project(dir: &TestDir) -> std::path::PathBuf {
 }
 
 fn generated_config(project: &Path) -> String {
-    // Materialize the adapter the way `launch` would, then generate the config.
-    opencode_gear::orchestration::plugin::materialize(project).unwrap();
+    // Materialize the V2 adapter through the exact local-discovery directory,
+    // then build the V2 config. Local plugins deliberately do not appear in
+    // the package-only `plugin` array.
+    opencode_gear::orchestration::plugin::materialize_v2_with(
+        project,
+        opencode_gear::runtime::compat::v2_adapter().plugin_source(),
+    )
+    .unwrap();
     let effective = load_embedded_effective(project);
-    let config = opencode_gear::build::build_opencode_config(&effective, "low").unwrap();
-    assert!(
-        opencode_gear::orchestration::plugin::has_ocg_plugin(&config),
-        "the generated config must reference the adapter"
-    );
+    let config = opencode_gear::build::build_opencode_config_for(
+        &effective,
+        "low",
+        opencode_gear::runtime::compat::v2_adapter(),
+    )
+    .unwrap();
     serde_json::to_string(&config).unwrap()
 }
 
@@ -47,10 +53,10 @@ fn fake_opencode_executable_accepts_the_generated_config() {
     fs::write(
         &fake,
         "#!/bin/sh\n\
-         # Fake `opencode debug config`: validate the injected plugin, call no model.\n\
+         # Fake V2 config probe: validate local plugin discovery, call no model.\n\
          case \"${OPENCODE_CONFIG_CONTENT:-}\" in\n\
-           *ocg-orchestration.js*) printf '%s' \"$OPENCODE_CONFIG_CONTENT\"; exit 0 ;;\n\
-           *) echo 'plugin missing from config' >&2; exit 1 ;;\n\
+           *'\"agent\"'*) test -f \"$OPENCODE_CONFIG_DIR/plugins/ocg-orchestration.js\" && printf '%s' \"$OPENCODE_CONFIG_CONTENT\" && exit 0 ;;\n\
+           *) echo 'config or plugin missing' >&2; exit 1 ;;\n\
          esac\n",
     )
     .unwrap();
@@ -63,6 +69,10 @@ fn fake_opencode_executable_accepts_the_generated_config() {
     let output = Command::new(&fake)
         .current_dir(&project)
         .env("OPENCODE_CONFIG_CONTENT", &content)
+        .env(
+            "OPENCODE_CONFIG_DIR",
+            opencode_gear::orchestration::plugin::v2_config_dir(&project),
+        )
         .output()
         .unwrap();
     assert!(
@@ -70,7 +80,7 @@ fn fake_opencode_executable_accepts_the_generated_config() {
         "fake opencode rejected the config: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("ocg-orchestration.js"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"agent\""));
 }
 
 #[test]
@@ -89,11 +99,16 @@ fn real_opencode_debug_config_accepts_the_plugin_when_available() {
         return;
     }
 
+    let config_path = dir.join("opencode.json");
+    fs::write(&config_path, &content).expect("write private OpenCode config");
+    let config_dir = opencode_gear::orchestration::plugin::v2_config_dir(&project);
     let output = Command::new("opencode")
-        .args(["debug", "config"])
+        // `api --standalone` creates a private server. Unlike `debug config`,
+        // it does not silently query the existing background daemon.
+        .args(["api", "--standalone", "GET", "/api/config"])
         .current_dir(&project)
-        .env("OPENCODE_CONFIG_CONTENT", &content)
-        .env_remove("OPENCODE_CONFIG")
+        .env("OPENCODE_CONFIG", &config_path)
+        .env("OPENCODE_CONFIG_DIR", &config_dir)
         .output()
         .expect("run opencode debug config");
     assert!(
@@ -101,21 +116,15 @@ fn real_opencode_debug_config_accepts_the_plugin_when_available() {
         "opencode debug config failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let resolved: Value = serde_json::from_slice(&output.stdout).expect("resolved config JSON");
-    let plugins: Vec<String> = resolved
-        .get("plugin")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .map(|value| value.as_str().unwrap_or_default().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
+    let text = String::from_utf8_lossy(&output.stdout);
+    // `/api/config` reports config sources, not the server's loaded local
+    // plugin modules. Its successful private-runtime response must nevertheless
+    // include the exact directory containing the materialized adapter; the
+    // explicit file assertion below prevents this from becoming an ambient
+    // daemon/config test.
     assert!(
-        plugins
-            .iter()
-            .any(|plugin| plugin.contains("ocg-orchestration.js")),
-        "resolved plugin list did not include the adapter: {plugins:?}"
+        text.contains(config_dir.to_string_lossy().as_ref()),
+        "private V2 config did not use the adapter config directory: {text}"
     );
+    assert!(config_dir.join("plugins/ocg-orchestration.js").is_file());
 }

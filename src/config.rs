@@ -136,7 +136,9 @@ pub fn build_effective(
         reject_stale_json(path, name)?;
         if path.is_file() {
             let overlay = read_yaml_object(path)?;
+            let prior = data.clone();
             data = deep_merge(&data, &overlay);
+            normalize_model_variant_overrides(&prior, &mut data, &overlay);
             applied.push((name, path.to_path_buf()));
         }
     }
@@ -149,4 +151,45 @@ pub fn build_effective(
         project_path: project_path.to_path_buf(),
         applied,
     })
+}
+
+/// A variant belongs to a model, not to a route name. Deep merge deliberately
+/// preserves omitted scalars, but a model replacement must not retain the old
+/// model's variant. Omitted variants still inherit when the model is unchanged;
+/// an explicit null remains provider-default.
+fn normalize_model_variant_overrides(prior: &Value, merged: &mut Value, overlay: &Value) {
+    for (section, routes_key) in [("throttle", "levels"), ("routing", "roles")] {
+        let Some(overrides) = overlay
+            .get(section)
+            .and_then(|value| value.get(routes_key))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        let Some(routes) = merged
+            .get_mut(section)
+            .and_then(|value| value.get_mut(routes_key))
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        for (name, route_override) in overrides {
+            let Some(route_override) = route_override.as_object() else {
+                continue;
+            };
+            if route_override.contains_key("model") && !route_override.contains_key("variant") {
+                let old_model = prior
+                    .get(section)
+                    .and_then(|value| value.get(routes_key))
+                    .and_then(|value| value.get(name))
+                    .and_then(|value| value.get("model"));
+                let new_model = route_override.get("model");
+                if old_model != new_model {
+                    if let Some(route) = routes.get_mut(name).and_then(Value::as_object_mut) {
+                        route.remove("variant");
+                    }
+                }
+            }
+        }
+    }
 }

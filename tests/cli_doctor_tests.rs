@@ -33,7 +33,8 @@ fn base_command(cwd: &Path, work: &Path) -> Command {
         .env_remove("NO_PROXY")
         .env_remove("no_proxy")
         .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN");
+        .env_remove("GITHUB_TOKEN")
+        .env("PATH", "");
     command
 }
 

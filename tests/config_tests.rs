@@ -925,7 +925,7 @@ fn missing_yaml_override_files_are_ignored() {
 }
 
 #[test]
-fn v2_config_uses_the_plugins_array_subagent_key_and_a_canonical_uri() {
+fn v2_config_uses_the_2011_local_plugin_discovery_contract() {
     let (_dir, home, project) = setup();
     let effective = disk(&home, &project);
 
@@ -946,16 +946,14 @@ fn v2_config_uses_the_plugins_array_subagent_key_and_a_canonical_uri() {
         json!("deny")
     );
 
-    // v2 uses the plural `plugins` array with a canonical absolute file:// URI.
-    assert!(v2.get("plugin").is_none(), "v2 must not emit `plugin`");
-    let plugins = v2["plugins"].as_array().expect("plugins array");
-    let uri = plugins
-        .last()
-        .and_then(|entry| entry.as_str())
-        .expect("plugin uri");
-    assert!(uri.starts_with("file:///"), "{uri}");
-    assert!(uri.ends_with("ocg-orchestration.js"), "{uri}");
-    assert!(Path::new(uri.trim_start_matches("file://")).is_absolute());
+    // 2.0.11 discovers local plugins from OPENCODE_CONFIG_DIR/plugins. Its
+    // singular `plugin` array is for npm packages, so a generated local file
+    // must not be represented as a file:// package entry.
+    assert!(v2.get("plugins").is_none(), "2.0.11 has no `plugins` key");
+    assert!(
+        v2.get("plugin").is_none(),
+        "local discovery adds no package entry"
+    );
 
     // v2 renamed the delegation tool/permission key to `subagent`.
     assert!(v2["agent"]["lead-low"]["permission"]
@@ -973,5 +971,34 @@ fn v2_config_uses_the_plugins_array_subagent_key_and_a_canonical_uri() {
     assert_eq!(
         v2["agent"]["lead-low"]["model"],
         v1["agent"]["lead-low"]["model"]
+    );
+}
+
+#[test]
+fn changed_model_clears_inherited_variant_but_same_model_preserves_it() {
+    let (_dir, home, project) = setup();
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
+        &json!({
+            "throttle": {"levels": {"mid": {"model": "glm-5.3"}}},
+            "routing": {"roles": {"build": {"model": "glm-5.3"}}}
+        }),
+    );
+    let effective = disk(&home, &project);
+    assert!(effective.data["throttle"]["levels"]["mid"]
+        .get("variant")
+        .is_none());
+    assert!(effective.data["routing"]["roles"]["build"]
+        .get("variant")
+        .is_none());
+
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
+        &json!({"throttle": {"levels": {"mid": {"model": "sol"}}}}),
+    );
+    let effective = disk(&home, &project);
+    assert_eq!(
+        effective.data["throttle"]["levels"]["mid"]["variant"],
+        json!("medium")
     );
 }

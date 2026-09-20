@@ -34,8 +34,9 @@ impl RuntimeAdapter for V1Adapter {
         crate::orchestration::plugin::plugin_source()
     }
 
-    fn local_plugin_uri(&self, root: &Path) -> Result<String> {
+    fn local_plugin_uri(&self, root: &Path) -> Result<Option<String>> {
         crate::orchestration::plugin::plugin_uri(root)
+            .map(Some)
             .ok_or_else(|| GearError::config("cannot resolve the local OpenCode plugin path"))
     }
 
