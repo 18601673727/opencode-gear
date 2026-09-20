@@ -480,9 +480,17 @@ fn v2_plugin_contract_uses_local_discovery_and_subagent_tool() {
     );
 
     // The v2 adapter is thin: no request-message Lead rewrite, and the
-    // delegation hooks target the renamed `subagent` tool.
+    // delegation hooks target the renamed `subagent` tool through the V2
+    // `ctx.tool.hook("execute.before")` registration (the event carries the
+    // tool name, unlike the V1 hook's `input`).
     let source = plugin::v2_plugin_source();
-    assert!(source.contains("input.tool !== \"subagent\""));
+    assert!(source.contains("event.tool !== \"subagent\""));
+    assert!(source.contains("ctx.tool.hook(\"execute.before\""));
+    assert!(source.contains("ctx.session.hook(\"prompt\""));
+    // The V2 runtime may be Node, so the bridge is spawned via
+    // `node:child_process` with an exact argv and no shell.
+    assert!(source.contains("import { spawn } from \"node:child_process\""));
+    assert!(source.contains("shell: false"));
     assert!(!source.contains("output.message.agent"));
     assert!(!source.contains("enforceLeadContract"));
 }

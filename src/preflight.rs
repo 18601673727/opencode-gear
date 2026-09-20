@@ -191,7 +191,7 @@ mod tests {
     }
 
     fn all_models() -> &'static str {
-        "openai/gpt-5.6-sol\nopenai/gpt-6-astra\nvolcengine-coding/kimi-k2.7-code\nvolcengine-coding/kimi-k3\nopencode-go/deepseek-v4.1-flash\nopencode-go/glm-5.3-flash\nopencode-go/glm-5.3\n"
+        "openai/gpt-5.6-sol\nopenai/gpt-6-astra\nvolcengine-coding-plan/kimi-k2.7-code\nvolcengine-coding-plan/kimi-k3\nopencode-go/deepseek-v4.1-flash\nopencode-go/glm-5.3-flash\nopencode-go/glm-5.3\n"
     }
 
     #[test]
@@ -220,8 +220,8 @@ mod tests {
         let decorated = "\u{1b}[1mprovider/model\u{1b}[0m          description\n\
              \u{1b}[32mopenai/gpt-5.6-sol\u{1b}[0m         Sol medium\n\
              | openai/gpt-6-astra      | premium lead |\n\
-             * volcengine-coding/kimi-k2.7-code (code plans)\n\
-             volcengine-coding/kimi-k3\n\
+* volcengine-coding-plan/kimi-k2.7-code (code plans)\n\
+              volcengine-coding-plan/kimi-k3\n\
              opencode-go/deepseek-v4.1-flash,\n\
              opencode-go/glm-5.3-flash\n\
              opencode-go/glm-5.3\n";

@@ -516,7 +516,7 @@ file:
 ```json
 {"ts":"2026-01-01T00:00:00+00:00","event":"launch","throttle":"low",
  "default_agent":"lead-low","lead":"openai/gpt-5.6-sol",
- "routing":{"explore":"volcengine-coding/kimi-k2.7-code","build":"opencode-go/deepseek-v4.1-flash"}}
+ "routing":{"explore":"volcengine-coding-plan/kimi-k2.7-code","build":"opencode-go/deepseek-v4.1-flash"}}
 ```
 
 - Local file only. No remote telemetry, no network calls.

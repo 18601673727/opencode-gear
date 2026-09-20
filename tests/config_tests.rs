@@ -168,8 +168,8 @@ fn shipped_routes_are_stable() {
             .expect("model key");
         model::model_full_id(&effective.data, key).unwrap().1
     };
-    assert_eq!(full("explore"), "volcengine-coding/kimi-k2.7-code");
-    assert_eq!(full("explore-deep"), "volcengine-coding/kimi-k3");
+    assert_eq!(full("explore"), "volcengine-coding-plan/kimi-k2.7-code");
+    assert_eq!(full("explore-deep"), "volcengine-coding-plan/kimi-k3");
     assert_eq!(full("build"), "opencode-go/deepseek-v4.1-flash");
     assert_eq!(full("verify"), "opencode-go/glm-5.3-flash");
     assert_eq!(full("debug"), "opencode-go/glm-5.3");
@@ -184,7 +184,7 @@ fn provider_binding_is_deterministic() {
         let key = spec["model"].as_str().unwrap();
         let (provider, _) = model::model_full_id(&effective.data, key).unwrap();
         if role.starts_with("explore") {
-            assert_eq!(provider, "volcengine-coding");
+            assert_eq!(provider, "volcengine-coding-plan");
         } else {
             assert_eq!(provider, "opencode-go");
         }
@@ -243,7 +243,7 @@ fn enabled_providers_are_the_routing_providers() {
         .collect();
     assert_eq!(
         providers,
-        vec!["openai", "volcengine-coding", "opencode-go"]
+        vec!["openai", "volcengine-coding-plan", "opencode-go"]
     );
 }
 

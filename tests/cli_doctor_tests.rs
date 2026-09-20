@@ -186,7 +186,7 @@ fn doctor_reports_static_config_separately_from_available_runtime_models() {
     let script = dir.join("fake-opencode.sh");
     write_executable(
         &script,
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.18.31; exit 0; fi\nif [ \"$1\" = \"models\" ]; then printf '%s\\n' openai/gpt-5.6-sol openai/gpt-6-astra volcengine-coding/kimi-k2.7-code volcengine-coding/kimi-k3 opencode-go/deepseek-v4.1-flash opencode-go/glm-5.3-flash opencode-go/glm-5.3; exit 0; fi\nexit 2\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.18.31; exit 0; fi\nif [ \"$1\" = \"models\" ]; then printf '%s\\n' openai/gpt-5.6-sol openai/gpt-6-astra volcengine-coding-plan/kimi-k2.7-code volcengine-coding-plan/kimi-k3 opencode-go/deepseek-v4.1-flash opencode-go/glm-5.3-flash opencode-go/glm-5.3; exit 0; fi\nexit 2\n",
     );
     let output = base_command(&project, dir.path())
         .env("OPENCODE_GEAR_OPENCODE", &script)
@@ -263,7 +263,10 @@ fn doctor_reports_layering_contracts_and_summary() {
     assert!(text.contains("openai/gpt-5.6-sol variant medium"), "{text}");
     assert!(text.contains("openai/gpt-6-astra variant low"), "{text}");
     // The Consumer Router is reported alongside, and is not the Lead.
-    assert!(text.contains("volcengine-coding/kimi-k2.7-code"), "{text}");
+    assert!(
+        text.contains("volcengine-coding-plan/kimi-k2.7-code"),
+        "{text}"
+    );
     assert!(text.contains("opencode-go/deepseek-v4.1-flash"), "{text}");
     // A clean environment has no FAIL.
     assert!(text.contains("0 failures"), "{text}");
@@ -410,7 +413,7 @@ fn doctor_warns_when_the_system_and_runtime_versions_differ() {
     let runtime = dir.join("fake-runtime.sh");
     write_executable(
         &runtime,
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.18.31; exit 0; fi\nif [ \"$1\" = \"models\" ]; then printf '%s\\n' openai/gpt-5.6-sol openai/gpt-6-astra volcengine-coding/kimi-k2.7-code volcengine-coding/kimi-k3 opencode-go/deepseek-v4.1-flash opencode-go/glm-5.3-flash opencode-go/glm-5.3; exit 0; fi\nexit 2\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.18.31; exit 0; fi\nif [ \"$1\" = \"models\" ]; then printf '%s\\n' openai/gpt-5.6-sol openai/gpt-6-astra volcengine-coding-plan/kimi-k2.7-code volcengine-coding-plan/kimi-k3 opencode-go/deepseek-v4.1-flash opencode-go/glm-5.3-flash opencode-go/glm-5.3; exit 0; fi\nexit 2\n",
     );
     let path = format!(
         "{}:{}",

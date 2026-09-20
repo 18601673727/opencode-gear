@@ -163,12 +163,12 @@ fn custom_provider_without_a_variant_is_provider_default() {
     );
 
     let high = model::lead_contract(&effective.data, "high").unwrap();
-    assert_eq!(high.full_model_id(), "volcengine-coding/kimi-k3");
+    assert_eq!(high.full_model_id(), "volcengine-coding-plan/kimi-k3");
     assert_eq!(high.variant, None);
 
     let config = build::build_opencode_config(&effective, "high").unwrap();
     let agent = lead_agent(&config, "high");
-    assert_eq!(agent["model"], json!("volcengine-coding/kimi-k3"));
+    assert_eq!(agent["model"], json!("volcengine-coding-plan/kimi-k3"));
     assert!(
         agent.get("variant").is_none(),
         "provider-default must not fabricate a variant: {agent}"
@@ -192,13 +192,13 @@ fn absent_variant_is_omitted_from_config_and_contract() {
     assert!(config["agent"]["lead-high"].get("variant").is_none());
     assert_eq!(
         config["agent"]["lead-high"]["model"],
-        json!("volcengine-coding/kimi-k3")
+        json!("volcengine-coding-plan/kimi-k3")
     );
 
     // V2: the exported contract serializes without a `variant` key.
     let contract = model::lead_contract(&effective.data, "high").unwrap();
     let serialized = serde_json::to_value(&contract).unwrap();
-    assert_eq!(serialized["provider_id"], json!("volcengine-coding"));
+    assert_eq!(serialized["provider_id"], json!("volcengine-coding-plan"));
     assert_eq!(serialized["model_id"], json!("kimi-k3"));
     assert!(
         serialized.get("variant").is_none(),

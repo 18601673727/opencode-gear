@@ -164,7 +164,7 @@ fn consumer_routing_is_independent_of_throttle() {
     let config = stdout_json(&output);
     assert_eq!(
         config["agent"]["ocg-explore"]["model"],
-        json!("volcengine-coding/kimi-k2.7-code")
+        json!("volcengine-coding-plan/kimi-k2.7-code")
     );
     assert_eq!(
         config["agent"]["ocg-build"]["model"],
@@ -215,7 +215,7 @@ fn status_and_doctor_report_provider_default_when_no_variant_is_configured() {
     assert!(status.status.success(), "{}", stdout_text(&status));
     let text = stdout_text(&status);
     assert!(text.contains("provider-default"), "{text}");
-    assert!(text.contains("volcengine-coding/kimi-k3"), "{text}");
+    assert!(text.contains("volcengine-coding-plan/kimi-k3"), "{text}");
     assert!(
         !text.contains("kimi-k3 variant"),
         "status must not fabricate a variant: {text}"
@@ -226,7 +226,7 @@ fn status_and_doctor_report_provider_default_when_no_variant_is_configured() {
     let fake = dir.join("doctor-opencode.sh");
     fs::write(
         &fake,
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'opencode v1.18.31'; exit 0; fi\nif [ \"$1\" = \"models\" ]; then printf '%s\\n' openai/gpt-5.6-sol openai/gpt-6-astra volcengine-coding/kimi-k2.7-code volcengine-coding/kimi-k3 opencode-go/deepseek-v4.1-flash opencode-go/glm-5.3-flash opencode-go/glm-5.3; exit 0; fi\nexit 0\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'opencode v1.18.31'; exit 0; fi\nif [ \"$1\" = \"models\" ]; then printf '%s\\n' openai/gpt-5.6-sol openai/gpt-6-astra volcengine-coding-plan/kimi-k2.7-code volcengine-coding-plan/kimi-k3 opencode-go/deepseek-v4.1-flash opencode-go/glm-5.3-flash opencode-go/glm-5.3; exit 0; fi\nexit 0\n",
     )
     .expect("write hermetic OpenCode");
     #[cfg(unix)]
@@ -246,7 +246,7 @@ fn status_and_doctor_report_provider_default_when_no_variant_is_configured() {
     assert!(doctor.status.success(), "{}", stdout_text(&doctor));
     let text = stdout_text(&doctor);
     assert!(text.contains("provider-default"), "{text}");
-    assert!(text.contains("volcengine-coding/kimi-k3"), "{text}");
+    assert!(text.contains("volcengine-coding-plan/kimi-k3"), "{text}");
 }
 
 #[test]

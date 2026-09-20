@@ -8,10 +8,10 @@ providers:
   openai:
     label: OpenAI
     note: Lead tier. Configure with `opencode auth login openai`.
-  volcengine-coding:
+  volcengine-coding-plan:
     label: Volcano Coding Plan Pro
-    note: EXPLORE models (Kimi). Declared in base.yaml. Configure with `opencode
-      auth login volcengine-coding`.
+    note: EXPLORE models (Kimi). Native provider in OpenCode 2.0.11+. Configure with `opencode
+      auth login volcengine-coding-plan`.
   opencode-go:
     label: OpenCode Go
     note: BUILD / VERIFY / DEBUG models (DeepSeek, GLM). Configure with `opencode
@@ -39,11 +39,11 @@ models:
     - xhigh
     - max
   kimi-k2.7:
-    provider: volcengine-coding
+    provider: volcengine-coding-plan
     id: kimi-k2.7-code
     label: Kimi K2.7
   kimi-k3:
-    provider: volcengine-coding
+    provider: volcengine-coding-plan
     id: kimi-k3
     label: Kimi K3
   deepseek-v4.1-flash:

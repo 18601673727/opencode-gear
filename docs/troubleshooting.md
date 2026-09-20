@@ -131,7 +131,7 @@ actually exposes with the gear config:
 ```bash
 ocg models
 opencode models openai --verbose
-opencode models volcengine-coding --verbose
+opencode models volcengine-coding-plan
 ```
 
 Then update `config/models.yaml` (or your override). Reasoning variants are
@@ -160,26 +160,12 @@ If `OPENCODE_GEAR_ORCHESTRATION=0` or
 `"orchestration": {"enabled": false}` is set, the explicit no-hook path emits
 no generated plugin, so this enforcement is intentionally unavailable.
 
-## `volcengine-coding` rejects a model as unsupported
+## Volcano provider or model not visible
 
-The Volcano Coding Plan endpoint accepts coding-plan aliases, which are not
-always the same as the raw public catalogue. `config/base.yaml` declares the
-models this project expects for that provider:
-
-```yaml
-models:
-  glm-5.3:
-    name: GLM-5.3
-  glm-5.3-flash:
-    name: GLM-5.3-Flash
-  kimi-k2.7-code:
-    name: Kimi K2.7
-  kimi-k3:
-    name: Kimi K3
-```
-
-If your plan exposes a different alias, add it to that block and to
-`config/models.yaml`.
+OCG 0.3.0+ uses the native `volcengine-coding-plan` provider from OpenCode
+2.0.11. Run `ocg doctor` to verify the EXPLORE routes resolve to
+`volcengine-coding-plan/kimi-k2.7-code` and `volcengine-coding-plan/kimi-k3`.
+If the provider is absent, authenticate it with OpenCode's `/connect` flow.
 
 ## A consumer ignores its read-only permission
 

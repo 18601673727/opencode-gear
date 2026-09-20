@@ -194,12 +194,20 @@ Authenticate the providers once with OpenCode itself:
 
 ```bash
 opencode auth login openai
-opencode auth login volcengine-coding
+opencode auth login volcengine-coding-plan
 opencode auth login opencode-go
 ```
 
 The exact provider ids depend on your OpenCode build; check the list with
 `opencode auth login` or `ocg models`.
+
+> **Note on first-time `/connect` or `auth login`**: these steps authenticate
+> the provider for OpenCode. OpenCode may prompt you to pick a default model
+> and reasoning effort; any choice is fine for OCG. Those are OpenCode's
+> session defaults and do **not** configure OCG's Lead or Consumer Router.
+> OCG applies its own contracts from `config/models.yaml` + throttle at
+> runtime. The provider must be authenticated and the referenced models
+> (`volcengine-coding-plan/kimi-*` etc.) must be visible.
 
 ## Build from source
 
@@ -372,7 +380,7 @@ effective Lead contracts
   default throttle       [INFO] low
   default agent          [INFO] lead-low
 consumer router (independent of throttle)
-  ocg-explore            [PASS] volcengine-coding/kimi-k2.7-code (explore)
+   ocg-explore            [PASS] volcengine-coding-plan/kimi-k2.7-code (explore)
   ...
 environment / proxy
   HTTP_PROXY             [INFO] not set
@@ -790,7 +798,7 @@ local file — never to a remote service:
 ```json
 {"ts":"...","event":"launch","throttle":"mid","default_agent":"lead-mid",
  "lead":"openai/gpt-5.6-sol",
- "routing":{"explore":"volcengine-coding/kimi-k2.7-code","build":"opencode-go/deepseek-v4.1-flash"}}
+   "routing":{"explore":"volcengine-coding-plan/kimi-k2.7-code","build":"opencode-go/deepseek-v4.1-flash"}}
 ```
 
 - Local-only; there is no remote telemetry.
@@ -1109,16 +1117,15 @@ faster than this README. Check what your OpenCode actually exposes:
 
 ```bash
 ocg models                       # everything OpenCode can see with this config
-opencode models openai --verbose
+opencode models openai
 ```
 
 Then update `config/models.yaml` (or your user override).
 
-**`volcengine-coding` model rejected as unsupported** — the Volcano Coding
-Plan endpoint accepts coding-plan aliases, which may differ from the raw Ark
-catalogue. `config/base.yaml` declares `glm-5.3`, `glm-5.3-flash`,
-`kimi-k2.7-code` and `kimi-k3`; add a model to that provider block if you need
-another alias.
+**`volcengine-coding-plan` model rejected as unsupported** — ensure the
+Volcengine Ark Coding Plan provider is authenticated via `/connect` (or
+`opencode auth login`) and that the Kimi models are visible in the runtime
+catalogue (`ocg doctor`). OCG now references the native provider.
 
 **A consumer ignores its read-only permission** — permissions are OpenCode
 agent config, not prompt text. Confirm the active agent is the generated one

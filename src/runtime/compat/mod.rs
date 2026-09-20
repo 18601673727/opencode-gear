@@ -153,7 +153,7 @@ pub fn v2_adapter() -> &'static dyn RuntimeAdapter {
     &v2::V2Adapter
 }
 
-fn parse_version_token(raw: &str) -> Option<Version> {
+pub(crate) fn parse_version_token(raw: &str) -> Option<Version> {
     raw.split_whitespace().find_map(|token| {
         let token =
             token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');

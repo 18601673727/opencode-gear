@@ -1275,6 +1275,18 @@ fn describe_runtime_version(version: Option<&Version>) -> String {
         .unwrap_or_else(|| "unknown version".to_string())
 }
 
+/// Treat "2.0.11", "v2.0.11" and "opencode v2.0.11" as equivalent for doctor
+/// warnings. Genuine mismatches still produce a warning.
+fn versions_equivalent(a: &str, b: &str) -> bool {
+    match (
+        compat::parse_version_token(a),
+        compat::parse_version_token(b),
+    ) {
+        (Some(va), Some(vb)) => va == vb,
+        _ => a.trim() == b.trim(),
+    }
+}
+
 /// Severity-tracked doctor output.
 ///
 /// Every line is one of PASS / INFO / WARN / FAIL. Only FAIL makes `ocg doctor`
@@ -1554,14 +1566,15 @@ fn doctor_command(
     }
     let runtime_version = report.version.as_ref().map(ToString::to_string);
     match (report.source, &runtime_version, &system_version) {
-        (Some(source), Some(runtime), Some(path)) if runtime != path => doctor.line(
-            "warn",
-            "opencode version",
-            &format!(
-                "runtime ({}) is {runtime} but system PATH is {path}; launches use the runtime",
-                source.label()
+        (Some(source), Some(runtime), Some(path)) if !versions_equivalent(runtime, path) => doctor
+            .line(
+                "warn",
+                "opencode version",
+                &format!(
+                    "runtime ({}) is {runtime} but system PATH is {path}; launches use the runtime",
+                    source.label()
+                ),
             ),
-        ),
         (Some(source), Some(runtime), _) => doctor.line(
             "ok",
             "opencode version",
@@ -1941,15 +1954,23 @@ fn doctor_command(
                 ),
             );
             if config.enabled {
-                let plugin = crate::orchestration::plugin::plugin_path(project_root);
+                let (plugin, mechanism) = match adapter {
+                    Some(a) if a.major() == compat::Major::V2 => {
+                        let path = crate::orchestration::plugin::v2_plugin_path(project_root);
+                        let mech = "local-discovery JS adapter at OPENCODE_CONFIG_DIR/plugins; hooks: prompt, execute.before/after";
+                        (path, mech)
+                    }
+                    _ => {
+                        let path = crate::orchestration::plugin::plugin_path(project_root);
+                        let mech = "file:// JS adapter injected via config.plugin; hooks: chat.message, tool.execute.before/after";
+                        (path, mech)
+                    }
+                };
                 if plugin.is_file() {
                     doctor.line(
                         "ok",
                         "orchestration plugin",
-                        &format!(
-                            "{} (mechanism: file:// JS adapter injected via config.plugin; hooks: chat.message, tool.execute.before/after)",
-                            plugin.display()
-                        ),
+                        &format!("{} (mechanism: {mechanism})", plugin.display()),
                     );
                 } else {
                     doctor.line(

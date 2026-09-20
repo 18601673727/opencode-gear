@@ -89,13 +89,47 @@ fn real_opencode_debug_config_accepts_the_plugin_when_available() {
     let project = project(&dir);
     let content = generated_config(&project);
 
-    let available = Command::new("opencode")
+    // The system `opencode` may be V1 (1.x) which lacks `api --standalone`.
+    // Detect the major version and only run the V2 private-server probe when
+    // the installed binary is V2.
+    let version_text = Command::new("opencode")
         .arg("--version")
         .output()
-        .map(|output| output.status.success())
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            } else {
+                None
+            }
+        });
+    let version_text = match version_text {
+        Some(v) => v,
+        None => {
+            eprintln!("skipping: opencode is not on PATH");
+            return;
+        }
+    };
+    let is_v2 = version_text
+        .split_whitespace()
+        .find_map(|token| {
+            let token =
+                token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');
+            let token = token.strip_prefix('v').unwrap_or(token);
+            semver::Version::parse(token).ok()
+        })
+        .map(|v| v.major >= 2)
         .unwrap_or(false);
-    if !available {
-        eprintln!("skipping: opencode is not on PATH");
+    if !is_v2 {
+        eprintln!("skipping: installed opencode is V1 ({version_text}), V2 private-server probe requires V2");
+        // The plugin file is still materialized for V1 regression: confirm
+        // the materialization path works.
+        assert!(
+            opencode_gear::orchestration::plugin::v2_config_dir(&project)
+                .join("plugins/ocg-orchestration.js")
+                .is_file(),
+            "V2 plugin materialization failed"
+        );
         return;
     }
 
@@ -110,10 +144,10 @@ fn real_opencode_debug_config_accepts_the_plugin_when_available() {
         .env("OPENCODE_CONFIG", &config_path)
         .env("OPENCODE_CONFIG_DIR", &config_dir)
         .output()
-        .expect("run opencode debug config");
+        .expect("run opencode api --standalone");
     assert!(
         output.status.success(),
-        "opencode debug config failed: {}",
+        "opencode api --standalone failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let text = String::from_utf8_lossy(&output.stdout);
