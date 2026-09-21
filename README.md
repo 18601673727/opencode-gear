@@ -11,7 +11,7 @@ THROTTLE
     how strong (and how expensive) the Lead is
         low  /  mid  /  high
 
-CONSUMER ROUTER
+WORKER ROUTER
     which specialist model does the delegated work
         EXPLORE / BUILD / VERIFY / DEBUG
 ```
@@ -42,7 +42,7 @@ specialists that are good at their one job and cheap enough to use often.
 - [Quick start](#quick-start)
 - [Managed runtime](#managed-runtime)
 - [Throttle semantics](#throttle-semantics)
-- [Consumer Router semantics](#consumer-router-semantics)
+- [Worker Router semantics](#worker-router-semantics)
 - [Provider and model mapping](#provider-and-model-mapping)
 - [Configuration and overrides](#configuration-and-overrides)
 - [Project-local policy](#project-local-policy)
@@ -75,7 +75,7 @@ Lead                             ← throttle picks the tier
  ├── delegate ────────────────┐
  └── accept / reject results  │
                               ▼
-                     Consumer Router        ← config/routing.yaml
+                     Worker Router          ← config/routing.yaml
                               │
       ┌───────────────┬───────┴────────┬────────────────┐
       ▼               ▼                ▼                ▼
@@ -107,10 +107,10 @@ OpenCode binds exactly one model per agent, so the gear materialises:
 
 - one **Lead agent per throttle level** (`lead-low`, `lead-mid`, `lead-high`)
   so the TUI can switch tiers live, and
-- one **consumer agent per role** (`ocg-explore`, `ocg-build`, ...) shared by
+- one **worker agent per role** (`ocg-explore`, `ocg-build`, ...) shared by
   all Lead levels.
 
-Because the consumer agents do not depend on the throttle, switching throttle
+Because the worker agents do not depend on the throttle, switching throttle
 during a session cannot silently re-route BUILD or VERIFY.
 
 The shipped Lead request contracts are exact:
@@ -126,7 +126,7 @@ catalogue. A definitely missing active Lead model blocks the launch instead of
 silently falling back; an unavailable probe warns and continues. The generated
 plugin then enforces the selected Lead agent/model/variant on each mutable
 `chat.message`, so sticky TUI or reused-session state cannot change the request.
-Consumer subagent requests are not rewritten. The explicit no-hook escape hatch
+Worker subagent requests are not rewritten. The explicit no-hook escape hatch
 (`OPENCODE_GEAR_ORCHESTRATION=0` or `orchestration.enabled=false`) intentionally
 disables the generated plugin and therefore this runtime enforcement.
 
@@ -204,7 +204,7 @@ The exact provider ids depend on your OpenCode build; check the list with
 > **Note on first-time `/connect` or `auth login`**: these steps authenticate
 > the provider for OpenCode. OpenCode may prompt you to pick a default model
 > and reasoning effort; any choice is fine for OCG. Those are OpenCode's
-> session defaults and do **not** configure OCG's Lead or Consumer Router.
+> session defaults and do **not** configure OCG's Lead or Worker Router.
 > OCG applies its own contracts from `config/models.yaml` + throttle at
 > runtime. The provider must be authenticated and the referenced models
 > (`volcengine-coding-plan/kimi-*` etc.) must be visible.
@@ -379,7 +379,7 @@ effective Lead contracts
   lead-high              [PASS] openai/gpt-6-astra variant low
   default throttle       [INFO] low
   default agent          [INFO] lead-low
-consumer router (independent of throttle)
+worker router (independent of throttle)
    ocg-explore            [PASS] volcengine-coding-plan/kimi-k2.7-code (explore)
   ...
 environment / proxy
@@ -398,7 +398,7 @@ It reports:
   the project root, each found or missing;
 - **effective Lead contracts** — the model and variant behind each of `low` /
   `mid` / `high`, the default throttle and the default agent;
-- **consumer router** — the role → provider/model summary, which is independent
+- **worker router** — the role → provider/model summary, which is independent
   of the throttle and never prints a secret;
 - **OpenCode** — the runtime OCG would launch (managed / project-local / system
   / explicit), its version, the `opencode` on `PATH`, and a WARN when they
@@ -433,7 +433,7 @@ bootstrap.
 
 ## Throttle semantics
 
-Throttle selects the Lead tier only. The Lead is provider-agnostic: the shipped
+Throttle selects the Execution Tier only. The Lead is provider-agnostic: the shipped
 defaults use OpenAI, but any configured provider/model works, and a Lead model
 may omit a reasoning variant to run at the provider default.
 
@@ -448,11 +448,11 @@ Notes:
 - The model ids and reasoning variants are centralised in `config/models.yaml`
   and `config/throttle.yaml`. Swap a model there and nothing else changes.
 - **Throttle only changes the Lead contract.** It never rebuilds, copies or
-  follows the Consumer Router, so EXPLORE / BUILD / VERIFY / DEBUG stay bound to
+  follows the Worker Router, so EXPLORE / BUILD / VERIFY / DEBUG stay bound to
   the same models at every level.
 - If a provider does not expose a reasoning variant, omit `variant` and the
   provider default is used.
-- **Throttle never decides which consumer handles EXPLORE / BUILD / VERIFY.**
+- **Throttle never decides which worker handles EXPLORE / BUILD / VERIFY.**
 - Precedence: positional `ocg high` / `--throttle` > `OPENCODE_GEAR_THROTTLE`
   (legacy `OC_GEAR_THROTTLE`) > project config > user config >
   `config/throttle.yaml` default.
@@ -464,7 +464,7 @@ ocg throttle mid
 ocg throttle          # print the resolved default
 ```
 
-## Consumer Router semantics
+## Worker Router semantics
 
 | Role | Responsibility | Read/write |
 | --- | --- | --- |
@@ -478,24 +478,24 @@ ocg throttle          # print the resolved default
 Roles are arbitrary: you can add a new role with its own model and prompt in an
 override. The shipped six roles are the baseline, not a hard limit.
 
-The Lead model is **not** part of the normal consumer pool: it is never a
-consumer target. In the shipped routing, no OpenAI model appears in the
-Consumer Router.
+The Lead model is **not** part of the normal worker pool: it is never a
+worker target. In the shipped routing, no OpenAI model appears in the
+Worker Router.
 
 ### Escalation rules
 
 These are prompt- and policy-level rules, not a scheduler. OpenCode cannot
 enforce them mechanically, so the Lead prompt encodes them explicitly:
 
-- **Two-strike handoff.** If the same consumer fails at substantially the same
+- **Two-strike handoff.** If the same worker fails at substantially the same
   problem twice, do not issue a third identical retry. Escalate to DEBUG. If
   DEBUG cannot resolve it either, the Lead takes the problem back and decides.
-- **Scope explosion.** If a consumer finds that approved work is much larger
+- **Scope explosion.** If a worker finds that approved work is much larger
   than expected (a three-file change turning into a schema + backend +
   frontend + migration redesign), it stops, summarises the new scope, and
-  returns to the Lead. Use EXPLORE for impact analysis if useful. A consumer
+  returns to the Lead. Use EXPLORE for impact analysis if useful. A worker
   must never silently redefine the task.
-- **Consumer disagreement.** If two consumers disagree on an architectural or
+- **Worker disagreement.** If two workers disagree on an architectural or
   semantic decision, neither is the final authority: both opinions go to the
   Lead, which decides.
 
@@ -532,7 +532,7 @@ mirror the files in `config/`: `throttle`, `models`, `routing`, `permissions`,
 plus the gear-only extras `prompts`, `observability`, `runtime` and `opencode`.
 
 ```yaml
-# pick a different default Lead tier
+# pick a different default Execution Tier
 throttle:
   default: mid
 
@@ -645,7 +645,7 @@ Why append:
 
 `{{role}}` placeholders and `{{routing}}` are substituted in appended text too,
 so project policy can refer to the configured agents without hardcoding model
-ids. Appending affects only the role you target — consumer prompts stay
+ids. Appending affects only the role you target — worker prompts stay
 project-agnostic.
 
 ## Commands
@@ -657,7 +657,7 @@ ocg [low|mid|high] [--throttle low|mid|high] [--project DIR] [--dry-run] [--disa
 run <args...>       launch `opencode run`
 models [args...]    run `opencode models`
 status              throttle, routing and config layers
-routing             consumer role -> model table
+routing             worker role -> model table
 throttle [level]    print, or persist, the default throttle level
 validate            validate the merged configuration
 layers              show config layers and trace state
@@ -747,11 +747,11 @@ public rate limit (and its reset) is reported in the error message.
 Enforced through OpenCode agent permissions (`config/permissions.yaml`), not
 just prompt convention:
 
-- **No recursive delegation.** Every consumer has `task: deny`; only a Lead
+- **No recursive delegation.** Every worker has `task: deny`; only a Lead
   orchestrates, so the tree is `User -> Lead -> one level`.
-- **The Lead can only reach its own consumers.** `permission.task` is
-  `{"*": "deny", "<consumer agents>": "allow"}`.
-- **Hidden internals.** Consumers are `hidden: true`, so they stay out of the
+- **The Lead can only reach its own workers.** `permission.task` is
+  `{"*": "deny", "<worker agents>": "allow"}`.
+- **Hidden internals.** Workers are `hidden: true`, so they stay out of the
   `@` autocomplete while remaining callable by the Lead.
 - **The explorer is read-only.** `read` / `glob` / `grep` / `list` / `lsp`
   allowed; `edit`, `bash`, `webfetch`, `websearch` and `external_directory`
@@ -941,7 +941,7 @@ contract asking for one JSON object (`goal`, `constraints`, `findings`,
 parser still works if a model ignores it.
 
 The `chat.message` hook only injects dynamic context into the **Lead** session
-(the request agent starts with `lead-`); consumer subagent sessions do not
+(the request agent starts with `lead-`); worker subagent sessions do not
 receive a duplicate Lead context, and a request whose agent cannot be
 established is left untouched. The task before/after hooks stay active in every
 session. The bridge reads and caps its stdin (4 MiB) before any early
@@ -1127,7 +1127,7 @@ Volcengine Ark Coding Plan provider is authenticated via `/connect` (or
 `opencode auth login`) and that the Kimi models are visible in the runtime
 catalogue (`ocg doctor`). OCG now references the native provider.
 
-**A consumer ignores its read-only permission** — permissions are OpenCode
+**A worker ignores its read-only permission** — permissions are OpenCode
 agent config, not prompt text. Confirm the active agent is the generated one
 (`ocg build --pretty` and inspect `agent.<name>.permission`), and that your
 project does not override it.
@@ -1243,23 +1243,23 @@ The runtime tests never touch the network or the real home directory.
 ## Migrating from an older Gear/profile setup
 
 Older setups often used one word — "Gear" — for two different things: the
-whole model bundle and the Lead tier. That made two questions impossible to
+whole model bundle and the Execution Tier. That made two questions impossible to
 answer independently.
 
 The new model is:
 
 ```text
-Throttle        = Lead tier only               (low / mid / high)
-Consumer Router = delegated execution routing  (EXPLORE / BUILD / VERIFY / DEBUG)
+Throttle        = Execution Tier only            (low / mid / high)
+Worker Router   = delegated execution routing    (EXPLORE / BUILD / VERIFY / DEBUG)
 ```
 
 Practical mapping:
 
 | Old concept | New home |
 | --- | --- |
-| "Gear" as the Lead tier | Throttle (`low` / `mid` / `high`) |
-| "Gear" as the full model bundle | removed; consumer roles are fixed and independent |
-| Old per-gear duplicate consumer agents | one consumer agent per role, shared by all Leads |
+| "Gear" as the Execution Tier | Throttle (`low` / `mid` / `high`) |
+| "Gear" as the full model bundle | removed; worker roles are fixed and independent |
+| Old per-gear duplicate worker agents | one worker agent per role, shared by all Leads |
 | Per-gear explorer/builder/verifier model swaps | `config/routing.yaml` |
 | "Mode" / provider-scope presets | project or user override files |
 | `oc use <mode>` interactive switching | `ocg <level>` / `ocg --throttle <level>` / Tab in the TUI |

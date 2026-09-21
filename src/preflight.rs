@@ -3,7 +3,7 @@
 //! Static OCG validation proves that configured model keys and variants are
 //! internally coherent. This module performs the separate runtime check: the
 //! selected OpenCode executable must currently expose every configured Lead
-//! and consumer provider/model ID. It uses OpenCode's supported `models` CLI
+//! and worker provider/model ID. It uses OpenCode's supported `models` CLI
 //! output and never reads provider credential stores.
 
 use crate::error::Result;

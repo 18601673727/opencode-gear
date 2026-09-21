@@ -410,7 +410,7 @@ Commands:
   run <args...>         launch `opencode run` with the gear config
   models [args...]      run `opencode models` with the gear config
   status                show throttle, routing and config layers
-  routing               show the consumer role -> model table
+  routing               show the worker role -> model table
   throttle [level]      print, or persist, the default throttle level
   validate              validate the merged configuration
   layers                show configuration layers and trace state
@@ -432,7 +432,7 @@ Commands:
 
 Options:
   low|mid|high          positional throttle level (same as --throttle)
-  --throttle LEVEL      low | mid | high   (Lead tier, this launch only)
+  --throttle LEVEL      low | mid | high   (Execution Tier, this launch only)
   --project DIR         project directory used for project-local overrides
   --dry-run             print the merged OpenCode config instead of launching
   --disable-proxy       never use a proxy (overrides env and system discovery)
@@ -1492,16 +1492,16 @@ fn doctor_command(
     doctor.line("info", "default throttle", default_throttle);
     doctor.line("info", "default agent", &model::lead_agent_id(level));
 
-    // The Consumer Router, independent of the throttle. Only role names and
+    // The Worker Router, independent of the throttle. Only role names and
     // provider/model ids are printed; no credential ever reaches this section.
-    println!("consumer router (independent of throttle)");
+    println!("worker router (independent of throttle)");
     match model::routing_rows(&effective.data) {
         Ok(rows) => {
             for (role, agent, _provider, full) in rows {
                 doctor.line("ok", &agent, &format!("{full} ({role})"));
             }
         }
-        Err(error) => doctor.line("warn", "consumer router", &error.to_string()),
+        Err(error) => doctor.line("warn", "worker router", &error.to_string()),
     }
     if let Some(small) = effective
         .data

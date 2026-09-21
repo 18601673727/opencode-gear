@@ -77,8 +77,8 @@ pub fn lead_agent_id(level: &str) -> String {
     format!("lead-{level}")
 }
 
-pub fn consumer_agent_id(role: &str) -> String {
-    format!("{}{role}", crate::defaults::CONSUMER_AGENT_PREFIX)
+pub fn worker_agent_id(role: &str) -> String {
+    format!("{}{role}", crate::defaults::WORKER_AGENT_PREFIX)
 }
 
 /// The exact primary Lead request contract selected by one OCG throttle.
@@ -148,7 +148,7 @@ pub fn lead_contract(data: &Value, level: &str) -> Result<LeadContract> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelRequirementKind {
     Lead,
-    Consumer,
+    Worker,
 }
 
 /// One provider/model that must be exposed by the active OpenCode runtime.
@@ -161,7 +161,7 @@ pub struct ModelRequirement {
     pub kind: ModelRequirementKind,
 }
 
-/// Every configured Lead throttle and consumer role, in declaration order.
+/// Every configured Lead throttle and worker role, in declaration order.
 /// Duplicate model IDs deliberately remain separate requirements because, for
 /// example, low and mid may share a model while requiring different variants.
 pub fn runtime_model_requirements(data: &Value) -> Result<Vec<ModelRequirement>> {
@@ -190,13 +190,13 @@ pub fn runtime_model_requirements(data: &Value) -> Result<Vec<ModelRequirement>>
             })?;
             requirements.push(ModelRequirement {
                 label: role.clone(),
-                agent: consumer_agent_id(role),
+                agent: worker_agent_id(role),
                 full_model_id: model_full_id(data, key)?.1,
                 variant: spec
                     .get("variant")
                     .and_then(Value::as_str)
                     .map(str::to_string),
-                kind: ModelRequirementKind::Consumer,
+                kind: ModelRequirementKind::Worker,
             });
         }
     }
@@ -295,7 +295,7 @@ pub fn routing_rows(data: &Value) -> Result<Vec<(String, String, String, String)
             let (provider, full) = model_full_id(data, key)?;
             rows.push((
                 role.clone(),
-                consumer_agent_id(role),
+                worker_agent_id(role),
                 provider_label(data, &provider),
                 full,
             ));

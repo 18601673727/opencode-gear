@@ -34,7 +34,7 @@ pub fn throttle_rows(effective: &Effective) -> Result<Vec<(String, String, Strin
 }
 
 pub fn throttle_text(effective: &Effective) -> Result<String> {
-    let mut lines = vec!["Throttle (Lead tier):".to_string(), String::new()];
+    let mut lines = vec!["Throttle (Execution Tier):".to_string(), String::new()];
     for (level, full, variant) in throttle_rows(effective)? {
         lines.push(format!("  {level:<6} {full:<24} {variant}"));
     }
@@ -50,10 +50,7 @@ pub fn throttle_text(effective: &Effective) -> Result<String> {
 }
 
 pub fn routing_text(effective: &Effective) -> Result<String> {
-    let mut lines = vec![
-        "Consumer router (role -> model):".to_string(),
-        String::new(),
-    ];
+    let mut lines = vec!["Worker router (role -> model):".to_string(), String::new()];
     for (role, agent, provider, full) in model::routing_rows(&effective.data)? {
         lines.push(format!("  {role:<13} {agent:<18} {provider:<24} {full}"));
     }
@@ -103,7 +100,7 @@ pub fn status_text(effective: &Effective, level: &str) -> Result<String> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .unwrap_or("provider-default");
-    let consumers = model::role_specs(&effective.data)
+    let workers = model::role_specs(&effective.data)
         .map(|roles| roles.len())
         .unwrap_or(0);
     let providers = model::enabled_provider_order(&effective.data);
@@ -120,7 +117,7 @@ pub fn status_text(effective: &Effective, level: &str) -> Result<String> {
         format!("  default agent {}", model::lead_agent_id(level)),
         format!("  lead model    {lead}"),
         format!("  lead variant  {lead_variant}"),
-        format!("  consumers     {consumers}"),
+        format!("  workers       {workers}"),
         format!("  providers     {provider_text}"),
         format!("  cwd           {}", effective.cwd.display()),
         String::new(),

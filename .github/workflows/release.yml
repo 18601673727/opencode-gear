@@ -166,7 +166,7 @@ jobs:
               compatible-runtime fallback and `opencode upgrade` delegation.
             - Lead throttle enforcement: the selected agent, model and reasoning
               variant are enforced on the actual Lead request.
-            - Consumer Router independence: EXPLORE / BUILD / VERIFY / DEBUG
+            - Worker Router independence: EXPLORE / BUILD / VERIFY / DEBUG
               routing never follows the throttle.
 
             Default Lead contracts
@@ -182,7 +182,7 @@ jobs:
             `ocg doctor` reports:
             - config layering (embedded / user / project);
             - the effective Lead contracts for every throttle level;
-            - Consumer Router visibility, independent of the throttle;
+            - Worker Router visibility, independent of the throttle;
             - the OpenCode path and runtime OCG would launch, with a WARN when
               they differ;
             - provider and model readiness against the resolved OpenCode
@@ -197,7 +197,7 @@ jobs:
               a reused session cannot change the selected Lead contract.
             - A missing active Lead model blocks the launch instead of silently
               falling back to another model.
-            - Consumer routing is unaffected by throttle switching.
+            - Worker routing is unaffected by throttle switching.
 
             Token efficiency and orchestration
 

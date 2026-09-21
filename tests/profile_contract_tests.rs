@@ -4,7 +4,7 @@
 //! The contract under test: a throttle level resolves, through the whole
 //! pipeline (embedded defaults -> effective config -> generated OpenCode config
 //! -> exported runtime contract), to exactly one Lead model + reasoning variant,
-//! and the Consumer Router never follows the throttle.
+//! and the Worker Router never follows the throttle.
 //!
 //! These are library-level tests. The CLI-level complement (that the dry-run
 //! output equals the contract the bridge actually exports) lives in
@@ -89,14 +89,14 @@ fn switching_levels_never_retains_a_previous_contract() {
 }
 
 #[test]
-fn consumer_agents_do_not_follow_the_throttle() {
+fn worker_agents_do_not_follow_the_throttle() {
     let dir = TestDir::new();
     let project = dir.project();
     let effective = load_embedded_effective(&project);
     let low = build::build_opencode_config(&effective, "low").unwrap();
     let high = build::build_opencode_config(&effective, "high").unwrap();
-    for role in opencode_gear::defaults::CONSUMER_ROLES {
-        let id = model::consumer_agent_id(role);
+    for role in opencode_gear::defaults::WORKER_ROLES {
+        let id = model::worker_agent_id(role);
         assert_eq!(
             low["agent"][id.as_str()],
             high["agent"][id.as_str()],

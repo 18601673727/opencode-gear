@@ -110,13 +110,13 @@ present, static validation (`ocg validate`, `ocg doctor`) rejects any variant th
 model does not declare. OCG exports the resolved contract to its generated
 plugin, which enforces the selected Lead agent/model (and variant, when one is
 configured) at `chat.message`; sticky TUI or reused-session state cannot override
-it. Consumer requests are left unchanged.
+it. Worker requests are left unchanged.
 
 A coding launch also runs a read-only `opencode models` preflight against the
 generated config. A definitely missing active Lead model is a launch error, not
-a fallback opportunity. Missing non-active Lead tiers and consumer routes warn;
+a fallback opportunity. Missing non-active Execution Tiers and worker routes warn;
 if the probe itself cannot run, launch continues with a warning. `ocg doctor`
-reports all configured Lead tiers and consumer routes separately from static
+reports all configured Execution Tiers and worker routes separately from static
 config validation. `ocg models` remains a plain pass-through and neither
 materializes nor loads the generated plugin.
 
@@ -167,12 +167,12 @@ One prompt per role. The Lead prompt is a template and supports:
 
 | Placeholder | Replaced with |
 | --- | --- |
-| `{{explore}}`, `{{explore_deep}}`, `{{build}}`, `{{verify}}`, `{{debug}}`, `{{docs}}` | the consumer agent id |
+| `{{explore}}`, `{{explore_deep}}`, `{{build}}`, `{{verify}}`, `{{debug}}`, `{{docs}}` | the worker agent id |
 | any custom role, e.g. `{{audit}}` | its `ocg-audit` agent id |
 | `{{throttle}}` | the active level |
 | `{{routing}}` | a generated routing table (+ configured fallbacks) |
 
-Consumer prompts may carry YAML front matter with `description` and
+Worker prompts may carry YAML front matter with `description` and
 `temperature`; those become agent config.
 
 Prompt values in an override may be:

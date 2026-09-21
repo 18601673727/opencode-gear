@@ -3,7 +3,7 @@
 //! This is the historical contract Gear has always shipped:
 //!
 //! - the generated local plugin lives under the singular `plugin` array,
-//! - consumer delegation uses the `task` tool/permission key,
+//! - worker delegation uses the `task` tool/permission key,
 //! - the Rust-resolved Lead contract is enforced on the mutable request
 //!   message by the generated adapter (`chat.message`),
 //! - Gear replaces its own process with `opencode` and passes

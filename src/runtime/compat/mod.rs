@@ -190,7 +190,7 @@ pub trait RuntimeAdapter: Send + Sync {
     /// The generated-config array key for package plugins.
     fn plugin_key(&self) -> &'static str;
 
-    /// The OpenCode permission/tool key for consumer delegation.
+    /// The OpenCode permission/tool key for worker delegation.
     fn task_key(&self) -> &'static str;
 
     /// The generated plugin source for this runtime.

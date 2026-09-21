@@ -76,9 +76,9 @@ pub fn build_opencode_config_for(
         .cloned()
         .unwrap_or_default();
 
-    let consumer_agents: Vec<(String, String)> = roles
+    let worker_agents: Vec<(String, String)> = roles
         .keys()
-        .map(|role| (role.clone(), model::consumer_agent_id(role)))
+        .map(|role| (role.clone(), model::worker_agent_id(role)))
         .collect();
 
     let mut agent_config = Map::new();
@@ -104,7 +104,7 @@ pub fn build_opencode_config_for(
                 .cloned()
                 .unwrap_or_else(|| json!("deny")),
         );
-        for (_, agent) in &consumer_agents {
+        for (_, agent) in &worker_agents {
             task.insert(agent.clone(), json!("allow"));
         }
 
@@ -127,7 +127,7 @@ pub fn build_opencode_config_for(
         agent_config.insert(model::lead_agent_id(lead_level), Value::Object(lead_spec));
     }
 
-    // Consumer agents: one per role, independent of the throttle.
+    // Worker agents: one per role, independent of the throttle.
     for (role, spec) in &roles {
         let model_key = spec.get("model").and_then(Value::as_str).ok_or_else(|| {
             GearError::config(format!("routing role '{role}' is missing 'model'"))
@@ -155,27 +155,27 @@ pub fn build_opencode_config_for(
 
         let hidden = subagent.get("hidden").map(is_truthy).unwrap_or(true);
 
-        let mut consumer_spec = Map::new();
-        consumer_spec.insert("mode".to_string(), json!("subagent"));
-        consumer_spec.insert("model".to_string(), json!(full));
-        consumer_spec.insert("description".to_string(), description);
-        consumer_spec.insert("prompt".to_string(), json!(body));
-        consumer_spec.insert("hidden".to_string(), json!(hidden));
-        consumer_spec.insert("permission".to_string(), permission);
+        let mut worker_spec = Map::new();
+        worker_spec.insert("mode".to_string(), json!("subagent"));
+        worker_spec.insert("model".to_string(), json!(full));
+        worker_spec.insert("description".to_string(), description);
+        worker_spec.insert("prompt".to_string(), json!(body));
+        worker_spec.insert("hidden".to_string(), json!(hidden));
+        worker_spec.insert("permission".to_string(), permission);
         if let Some(temperature) = meta.get("temperature") {
             let parsed: f64 = temperature.parse().map_err(|_| {
                 GearError::config(format!("{role} prompt temperature is not a number"))
             })?;
-            consumer_spec.insert("temperature".to_string(), json!(parsed));
+            worker_spec.insert("temperature".to_string(), json!(parsed));
         }
         if let Some(variant) = spec
             .get("variant")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
         {
-            consumer_spec.insert("variant".to_string(), json!(variant));
+            worker_spec.insert("variant".to_string(), json!(variant));
         }
-        agent_config.insert(model::consumer_agent_id(role), Value::Object(consumer_spec));
+        agent_config.insert(model::worker_agent_id(role), Value::Object(worker_spec));
     }
 
     let lead_key = levels

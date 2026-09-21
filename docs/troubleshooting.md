@@ -148,7 +148,7 @@ fallback.
 On ordinary `ocg` / `ocg run` launches, the generated plugin enforces the
 Rust-resolved Lead agent/model/variant on mutable `chat.message` output. This is
 designed to override stale TUI and reused-session Lead state while leaving
-consumer subagent requests unchanged. Check the effective contract and runtime
+worker subagent requests unchanged. Check the effective contract and runtime
 availability with:
 
 ```bash
@@ -167,7 +167,7 @@ OCG 0.3.0+ uses the native `volcengine-coding-plan` provider from OpenCode
 `volcengine-coding-plan/kimi-k2.7-code` and `volcengine-coding-plan/kimi-k3`.
 If the provider is absent, authenticate it with OpenCode's `/connect` flow.
 
-## A consumer ignores its read-only permission
+## A worker ignores its read-only permission
 
 Permissions are OpenCode agent config, not prompt text.
 
@@ -228,10 +228,10 @@ ocg build --pretty | less       # inspect agent.lead-low.prompt
 { "prompts": { "lead": { "append": ["path/to/policy.md"] } } }
 ```
 
-## `opencode run --agent <consumer>` does not run the consumer
+## `opencode run --agent <worker>` does not run the worker
 
 OpenCode only accepts a **primary** agent in `--agent`; a subagent is rejected
-or ignored (`default agent "..." is a subagent`). Consumers are reached through
+or ignored (`default agent "..." is a subagent`). Workers are reached through
 the Lead's Task tool, which is the normal path. To smoke-test routing, ask the
 Lead to delegate explicitly, for example:
 

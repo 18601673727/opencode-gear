@@ -230,7 +230,7 @@ fn doctor_distinguishes_missing_provider_and_missing_model() {
     assert!(!text.contains("0 failures"), "{text}");
 }
 
-/// The layering section, the effective Lead contracts, the consumer router and
+/// The layering section, the effective Lead contracts, the worker router and
 /// the summary are all present for a plain project with no overrides.
 #[test]
 fn doctor_reports_layering_contracts_and_summary() {
@@ -253,7 +253,7 @@ fn doctor_reports_layering_contracts_and_summary() {
         "effective Lead contracts",
         "default throttle",
         "default agent",
-        "consumer router (independent of throttle)",
+        "worker router (independent of throttle)",
         "doctor summary",
     ] {
         assert!(text.contains(label), "missing '{label}' in\n{text}");
@@ -262,7 +262,7 @@ fn doctor_reports_layering_contracts_and_summary() {
     assert!(text.contains("openai/gpt-5.6-sol variant low"), "{text}");
     assert!(text.contains("openai/gpt-5.6-sol variant medium"), "{text}");
     assert!(text.contains("openai/gpt-6-astra variant low"), "{text}");
-    // The Consumer Router is reported alongside, and is not the Lead.
+    // The Worker Router is reported alongside, and is not the Lead.
     assert!(
         text.contains("volcengine-coding-plan/kimi-k2.7-code"),
         "{text}"

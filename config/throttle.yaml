@@ -1,6 +1,6 @@
 ---
-"$comment": Throttle controls ONLY the Lead tier. It must never decide which
-  consumer model handles EXPLORE / BUILD / VERIFY / DEBUG - that is config/routing.yaml.
+"$comment": Throttle controls ONLY the Execution Tier. It must never decide which
+  worker model handles EXPLORE / BUILD / VERIFY / DEBUG - that is config/routing.yaml.
   `model` references a key in config/models.yaml; `variant` is optional and, when
   present, must be one of that model's declared variants. Omit it (or set it to
   null) to run at the provider default.

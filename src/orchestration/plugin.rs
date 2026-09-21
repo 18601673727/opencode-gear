@@ -341,7 +341,7 @@ function agentOf(value) {
 
 // Only a positively identified OCG Lead session is rewritten. OpenCode always
 // resolves an agent before `chat.message` (the selected agent for the primary
-// session, the subagent name for a `task` child), so a consumer request can
+// session, the subagent name for a `task` child), so a worker request can
 // never be mistaken for the Lead. A request whose agent cannot be established
 // is left untouched rather than silently re-routed onto a Lead model.
 function isPrimaryLead(input, output) {
@@ -464,7 +464,7 @@ export const server = async (_input) => ({
     // the actual request and overrides sticky per-model/session UI state,
     // without mutating OpenCode's global saved variant.
     const contract = enforceLeadContract(input, output);
-    // Only the Lead owns the top-level dynamic context. A consumer subagent
+    // Only the Lead owns the top-level dynamic context. A worker subagent
     // session must not receive a second/duplicate Lead context block. The
     // task before/after hooks below stay active in every session.
     const agent = contract ? contract.agent : (typeof input.agent === "string" ? input.agent : "");
@@ -545,11 +545,11 @@ import { spawn } from "node:child_process";
 const START = "<<<OCG:DYNAMIC_CONTEXT v1>>>";
 const END = "<<<OCG:END>>>";
 
-// The generated OCG consumer agents. Only a known consumer `subagent` launched
+// The generated OCG worker agents. Only a known worker `subagent` launched
 // by a Lead session is bridged; any other tool, subagent or caller is ignored.
 // `ocg-explore-deep` is a distinct generated agent, not a variant of
 // `ocg-explore`.
-const CONSUMER_AGENTS = new Set([
+const WORKER_AGENTS = new Set([
   "ocg-explore",
   "ocg-explore-deep",
   "ocg-build",
@@ -574,8 +574,8 @@ function isLead(agent) {
   return typeof agent === "string" && agent.startsWith("lead-");
 }
 
-function isConsumer(agent) {
-  return typeof agent === "string" && CONSUMER_AGENTS.has(agent);
+function isWorker(agent) {
+  return typeof agent === "string" && WORKER_AGENTS.has(agent);
 }
 
 // Spawn `ocg __bridge <event> --project <project>` with an exact argv vector and
@@ -699,7 +699,7 @@ export default {
     const registrations = [];
 
     // The prompt event carries no agent, so the root Lead is resolved through
-    // the session. A consumer session or a child session (`parentID`) is not
+    // the session. A worker session or a child session (`parentID`) is not
     // the root Lead and is left untouched. `event.prompt.text` is mutated
     // directly; the core prompt path consumes it after the hook returns.
     registrations.push(await ctx.session.hook("prompt", async (event) => {
@@ -728,7 +728,7 @@ export default {
     registrations.push(await ctx.tool.hook("execute.before", async (event) => {
       if (!orchestrationEnabled()) return;
       if (!event || event.tool !== "subagent") return;
-      if (!isLead(event.agent) || !isConsumer(event.input && event.input.agent)) return;
+      if (!isLead(event.agent) || !isWorker(event.input && event.input.agent)) return;
       const input = event.input && typeof event.input === "object" ? event.input : {};
       if (typeof input.prompt !== "string" || input.prompt.length === 0) return;
       if (hasContext(input.prompt)) return;
@@ -749,7 +749,7 @@ export default {
     registrations.push(await ctx.tool.hook("execute.after", async (event) => {
       if (!orchestrationEnabled()) return;
       if (!event || event.tool !== "subagent") return;
-      if (!isLead(event.agent) || !isConsumer(event.input && event.input.agent)) return;
+      if (!isLead(event.agent) || !isWorker(event.input && event.input.agent)) return;
       if (event.status !== "completed") return;
       const delivery = event.result;
       if (!delivery || typeof delivery !== "object") return;
@@ -839,7 +839,7 @@ mod tests {
         // The Lead guard is present for chat.message.
         assert!(
             source.contains("startsWith(\"lead-\")"),
-            "chat.message must ignore consumer subagent sessions"
+            "chat.message must ignore worker subagent sessions"
         );
         assert!(source.contains("if (agent && !agent.startsWith(\"lead-\")) return;"));
         // The task before/after hooks are still registered unconditionally.
@@ -854,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_message_enforces_sticky_lead_state_and_preserves_consumers_when_node_is_available() {
+    fn chat_message_enforces_sticky_lead_state_and_preserves_workers_when_node_is_available() {
         if !node_or_skip("chat_message_enforces_sticky_lead_state") {
             return;
         }
@@ -887,10 +887,10 @@ const lead = {
   // A stale UI variant selection must not satisfy high, which needs Astra low.
   high: await check("high", "lead-low", "lead-low", "openai", "gpt-5.6-sol", "high"),
 };
-// A reused session whose sticky state is a different Lead tier must be corrected.
+// A reused session whose sticky state is a different Execution Tier must be corrected.
 const reused = await check("high", "lead-low", "lead-low", "openai", "gpt-5.6-sol", "medium");
-// Consumers keep their own configured route at every throttle level.
-const consumer = {
+// Workers keep their own configured route at every throttle level.
+const worker = {
   low: await check("low", "ocg-build", "ocg-build", "opencode-go", "deepseek-v4.1-flash", "high"),
   mid: await check("mid", "ocg-explore", "ocg-explore", "volcengine-coding-plan", "kimi-k2.7-code", "default"),
   high: await check("high", "ocg-verify", "ocg-verify", "opencode-go", "glm-5.3-flash", "high"),
@@ -898,7 +898,7 @@ const consumer = {
 // A request whose agent cannot be established must be left alone rather than
 // silently re-routed onto a Lead model.
 const unknown = await check("high", "", "", "opencode-go", "deepseek-v4.1-flash", "high");
-console.log(JSON.stringify({lead, reused, consumer, unknown}));
+console.log(JSON.stringify({lead, reused, worker, unknown}));
 "#,
         );
         let value = run_plugin_script(&dir);
@@ -927,14 +927,14 @@ console.log(JSON.stringify({lead, reused, consumer, unknown}));
         assert_eq!(value["reused"]["agent"], json!("lead-high"));
         assert_eq!(value["reused"]["model"]["modelID"], json!("gpt-6-astra"));
         assert_eq!(value["reused"]["model"]["variant"], json!("low"));
-        // Consumer routing is unchanged for every throttle level.
+        // Worker routing is unchanged for every throttle level.
         for (level, agent, model) in [
             ("low", "ocg-build", "deepseek-v4.1-flash"),
             ("mid", "ocg-explore", "kimi-k2.7-code"),
             ("high", "ocg-verify", "glm-5.3-flash"),
         ] {
-            assert_eq!(value["consumer"][level]["agent"], json!(agent));
-            assert_eq!(value["consumer"][level]["model"]["modelID"], json!(model));
+            assert_eq!(value["worker"][level]["agent"], json!(agent));
+            assert_eq!(value["worker"][level]["model"]["modelID"], json!(model));
         }
         // An unidentifiable agent is not a Lead and must not be rewritten.
         assert_eq!(value["unknown"]["agent"], json!(""));
@@ -1136,8 +1136,8 @@ console.log(JSON.stringify(requests));
         assert!(source.contains("event.tool !== \"subagent\""));
         // The exact direct-argv contract: `__bridge <event> --project <project>`.
         assert!(source.contains("[\"__bridge\", event, \"--project\", project()]"));
-        // Only known OCG consumer agents launched from a Lead are bridged.
-        assert!(source.contains("isConsumer(event.input && event.input.agent)"));
+        // Only known OCG worker agents launched from a Lead are bridged.
+        assert!(source.contains("isWorker(event.input && event.input.agent)"));
         assert!(source.contains("isLead(event.agent)"));
         // The v2 adapter is thinner: no request-message Lead enforcement.
         assert!(!source.contains("enforceLeadContract"));
@@ -1328,10 +1328,10 @@ const countAfterFirst = lines();
 await hooks["prompt"](event);
 const countAfterSecond = lines();
 
-// A consumer session is not the root Lead.
+// A worker session is not the root Lead.
 leadSession.agent = "ocg-build";
-const consumer = { sessionID: "s2", prompt: { text: "consumer" } };
-await hooks["prompt"](consumer);
+const worker = { sessionID: "s2", prompt: { text: "worker" } };
+await hooks["prompt"](worker);
 
 // A child session (parentID) is not the root Lead.
 leadSession.agent = "lead-mid";
@@ -1345,7 +1345,7 @@ console.log(JSON.stringify({
   countAfterFirst,
   countAfterSecond,
   totalLines: lines(),
-  consumerText: consumer.prompt.text,
+  workerText: worker.prompt.text,
   childText: child.prompt.text,
 }));
 "#;
@@ -1365,7 +1365,7 @@ console.log(JSON.stringify({
         assert_eq!(
             records.len(),
             1,
-            "a repeated, consumer or child prompt must not bridge"
+            "a repeated, worker or child prompt must not bridge"
         );
         assert_eq!(value["countAfterFirst"], json!(1));
         assert_eq!(value["countAfterSecond"], json!(1));
@@ -1374,7 +1374,7 @@ console.log(JSON.stringify({
         assert!(mutated.starts_with("hello lead"), "{mutated}");
         assert!(mutated.contains(CONTEXT_START) && mutated.contains(CONTEXT_END));
         assert!(mutated.contains("fixture context for chat.message"));
-        assert_eq!(value["consumerText"], json!("consumer"));
+        assert_eq!(value["workerText"], json!("worker"));
         assert_eq!(value["childText"], json!("child"));
         // Exact direct argv and inherited environment. `process.cwd()` is the
         // canonical path, so compare against the canonicalized fixture root.
@@ -1425,9 +1425,9 @@ await hooks["execute.before"](event);
 // A non-OCG subagent launched from a Lead is never bridged.
 const unknown = { tool: "subagent", sessionID: "s2", agent: "lead-mid", input: { agent: "general", prompt: "x" } };
 await hooks["execute.before"](unknown);
-// A known consumer launched by a non-Lead caller is never bridged.
-const consumerCaller = { tool: "subagent", sessionID: "s3", agent: "ocg-debug", input: { agent: "ocg-build", prompt: "y" } };
-await hooks["execute.before"](consumerCaller);
+// A known worker launched by a non-Lead caller is never bridged.
+const workerCaller = { tool: "subagent", sessionID: "s3", agent: "ocg-debug", input: { agent: "ocg-build", prompt: "y" } };
+await hooks["execute.before"](workerCaller);
 // Any other tool is ignored.
 const otherTool = { tool: "bash", sessionID: "s4", agent: "lead-mid", input: {} };
 await hooks["execute.before"](otherTool);
@@ -1437,13 +1437,13 @@ console.log(JSON.stringify({
   firstStdin,
   countAfterRepeat: lines(),
   unknownPrompt: unknown.input.prompt,
-  consumerCallerPrompt: consumerCaller.input.prompt,
+  workerCallerPrompt: workerCaller.input.prompt,
 }));
 "#;
 
     #[test]
-    fn v2_before_hook_bridges_only_known_consumers_from_a_lead() {
-        if !node_or_skip("v2_before_hook_bridges_only_known_consumers") {
+    fn v2_before_hook_bridges_only_known_workers_from_a_lead() {
+        if !node_or_skip("v2_before_hook_bridges_only_known_workers") {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1453,7 +1453,7 @@ console.log(JSON.stringify({
         write_check(&dir, &format!("{JS_PRELUDE}{BEFORE_BODY}"));
         let value = run_check(&dir, &bridge, &record);
         let records = records(&record);
-        assert_eq!(records.len(), 1, "only the Lead/consumer pair may bridge");
+        assert_eq!(records.len(), 1, "only the Lead/worker pair may bridge");
         let mutated = value["mutated"].as_str().unwrap();
         assert!(mutated.starts_with("explore the parser"));
         assert!(mutated.contains(CONTEXT_START) && mutated.contains(CONTEXT_END));
@@ -1465,7 +1465,7 @@ console.log(JSON.stringify({
         assert_eq!(stdin["session_id"], json!("s1"));
         // Role exclusion leaves every other call untouched.
         assert_eq!(value["unknownPrompt"], json!("x"));
-        assert_eq!(value["consumerCallerPrompt"], json!("y"));
+        assert_eq!(value["workerCallerPrompt"], json!("y"));
     }
 
     #[cfg(unix)]
@@ -1591,12 +1591,12 @@ const unknownRole = {
 };
 await hooks["execute.after"](unknownRole);
 
-const consumerCaller = {
+const workerCaller = {
   tool: "subagent", sessionID: "s5", agent: "ocg-debug", status: "completed",
   input: { agent: "ocg-build", prompt: "b" },
   result: { output: { status: "completed", output: "x" }, content: "x" },
 };
-await hooks["execute.after"](consumerCaller);
+await hooks["execute.after"](workerCaller);
 
 await hooks["execute.after"](undefined);
 await hooks["execute.after"](null);
@@ -1607,7 +1607,7 @@ console.log(JSON.stringify({
   errorResult: errorStatus.result,
   missing: missing.result === undefined,
   unknownRole: unknownRole.result,
-  consumerCaller: consumerCaller.result,
+  workerCaller: workerCaller.result,
 }));
 "#;
 
@@ -1632,7 +1632,7 @@ console.log(JSON.stringify({
         assert_eq!(value["errorResult"]["content"], json!("never"));
         assert_eq!(value["missing"], json!(true));
         assert_eq!(value["unknownRole"]["output"]["output"], json!("x"));
-        assert_eq!(value["consumerCaller"]["content"], json!("x"));
+        assert_eq!(value["workerCaller"]["content"], json!("x"));
     }
 
     #[test]

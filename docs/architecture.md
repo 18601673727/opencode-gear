@@ -278,13 +278,13 @@ JavaScript (transport only)
   The supported `chat.message` hook writes it to mutable `output.message`
   before OpenCode saves or executes the user request. This wins over sticky
   model/variant and reused-session state without mutating global OpenCode state.
-  The guard leaves consumer subagent requests untouched.
+  The guard leaves worker subagent requests untouched.
 - **Runtime model preflight.** Coding launches probe `opencode models` with the
   generated config but without loading the local plugin. A definitely missing
   active Lead model blocks launch; probe failure is distinguished from absence
-  and remains nonfatal. Doctor reports every Lead tier and consumer route.
+  and remains nonfatal. Doctor reports every Execution Tier and worker route.
 - **No duplicate Lead context.** Only `chat.message` is scoped to the Lead
-  session (the request agent starts with `lead-`); consumer subagent sessions
+  session (the request agent starts with `lead-`); worker subagent sessions
   and requests with no identifiable agent skip it, while
   `tool.execute.before/after` remain active everywhere.
 - **One snapshot per session.** The injected repository context carries a
@@ -414,10 +414,10 @@ parameter. Two consequences:
 1. The Lead needs one agent per throttle level (`lead-<level>`), because the
    Lead model differs per level. These are the only visible primary agents, so
    the TUI can cycle them.
-2. Because consumers are **not** throttle-dependent, they do not need to be
+2. Because workers are **not** throttle-dependent, they do not need to be
    duplicated per level. There is exactly one `ocg-build`, one `ocg-verify`,
    and so on, shared by every Lead. This is the structural expression of "the
-   throttle does not route consumers".
+   throttle does not route workers".
 
 ## Roles are durable, models are replaceable
 
@@ -437,7 +437,7 @@ Sol/Astra  K2.7/K3  DS4.1   GLMfl   GLM5.3 DS4.1   <- replaceable models
   rewrite.
 - Roles are not hardcoded. Adding a role means adding a routing entry, a
   prompt, and (optionally) a permission profile binding. The generator creates
-  an `ocg-<role>` consumer and substitutes `{{role}}` placeholders in the Lead
+  an `ocg-<role>` worker and substitutes `{{role}}` placeholders in the Lead
   prompt.
 
 ## Provider binding is deterministic
@@ -462,12 +462,12 @@ prompt:
 ```text
 User
  └─ Lead (primary)
-     └─ consumer (subagent, task: deny, hidden)
+     └─ worker (subagent, task: deny, hidden)
 ```
 
-- Consumers cannot delegate (`task: deny`), so the tree is one level deep.
+- Workers cannot delegate (`task: deny`), so the tree is one level deep.
 - The Lead's `permission.task` is `deny` by default with an explicit allow for
-  its own consumers.
+  its own workers.
 - EXPLORE is read-only. VERIFY and DEBUG can read and run checks but cannot
   edit. BUILD and DOCS can edit.
 
@@ -478,7 +478,7 @@ gear therefore encodes the rules in the Lead prompt:
 
 - two-strike handoff to DEBUG,
 - scope-explosion stop-and-report,
-- consumer disagreement returns to the Lead.
+- worker disagreement returns to the Lead.
 
 This is honest about what can and cannot be enforced mechanically. If a future
 OpenCode release exposes a routing hook, the rules are already written down in
@@ -489,7 +489,7 @@ one place (`config/prompts/lead.md`) and `config/routing.yaml`.
 | You want to | Edit |
 | --- | --- |
 | Use a newer model | `config/models.yaml` + `config/routing.yaml` (or an override) |
-| Change Lead tiers | `config/throttle.yaml` |
+| Change Execution Tiers | `config/throttle.yaml` |
 | Add a specialist role | add a prompt, a routing role, a permission profile binding |
 | Pin a project to different models | `<project>/.opencode-gear.yaml` |
 | Add repository-specific Lead policy | `prompts.lead.append` in `<project>/.opencode-gear.yaml` |

@@ -158,7 +158,7 @@ fn throttle_environment_precedence() {
 }
 
 #[test]
-fn consumer_routing_is_independent_of_throttle() {
+fn worker_routing_is_independent_of_throttle() {
     let dir = TestDir::new();
     let output = run(dir.path(), dir.path(), &["--throttle", "high", "--dry-run"]);
     let config = stdout_json(&output);
@@ -333,7 +333,7 @@ fn report_subcommands() {
     let dir = TestDir::new();
     let status = run(dir.path(), dir.path(), &["status"]);
     assert!(status.status.success());
-    assert!(stdout_text(&status).contains("Throttle (Lead tier)"));
+    assert!(stdout_text(&status).contains("Throttle (Execution Tier)"));
 
     let routing = run(dir.path(), dir.path(), &["routing"]);
     assert!(routing.status.success());

@@ -14,12 +14,12 @@ use std::path::PathBuf;
 /// throttle level.
 pub const LEAD_ROLE: &str = "lead";
 
-/// The three required Lead tiers.
-pub const LEAD_LEVELS: [&str; 3] = ["low", "mid", "high"];
+/// The three required Execution Tiers.
+pub const EXECUTION_TIERS: [&str; 3] = ["low", "mid", "high"];
 
-/// Shipped consumer roles. Routing roles are otherwise open-ended; these are
+/// Shipped worker roles. Routing roles are otherwise open-ended; these are
 /// only the roles that ship with a default prompt.
-pub const CONSUMER_ROLES: [&str; 6] = [
+pub const WORKER_ROLES: [&str; 6] = [
     "explore",
     "explore-deep",
     "build",
@@ -28,9 +28,9 @@ pub const CONSUMER_ROLES: [&str; 6] = [
     "docs",
 ];
 
-/// Consumer agent ids are namespaced so they cannot collide with a repository's
+/// Worker agent ids are namespaced so they cannot collide with a repository's
 /// own agents.
-pub const CONSUMER_AGENT_PREFIX: &str = "ocg-";
+pub const WORKER_AGENT_PREFIX: &str = "ocg-";
 
 /// Inserted between the gear prompt for a role and each appended project block.
 pub const PROMPT_APPEND_SEPARATOR: &str = "\n\n---\n\n";
@@ -65,9 +65,9 @@ pub enum GearSource {
 
 /// Roles that ship with a default prompt, Lead first.
 pub fn default_prompt_roles() -> Vec<&'static str> {
-    let mut roles = Vec::with_capacity(1 + CONSUMER_ROLES.len());
+    let mut roles = Vec::with_capacity(1 + WORKER_ROLES.len());
     roles.push(LEAD_ROLE);
-    roles.extend(CONSUMER_ROLES);
+    roles.extend(WORKER_ROLES);
     roles
 }
 

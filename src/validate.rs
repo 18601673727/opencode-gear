@@ -1,7 +1,7 @@
 //! Whole-configuration validation.
 
 use crate::config::Effective;
-use crate::defaults::{LEAD_LEVELS, LEAD_ROLE};
+use crate::defaults::{EXECUTION_TIERS, LEAD_ROLE};
 use crate::error::{GearError, Result};
 use crate::json::{is_truthy, value_to_string};
 use crate::model;
@@ -37,7 +37,7 @@ pub fn validate(effective: &Effective) -> Vec<String> {
             join_keys(levels)
         ));
     }
-    for level in LEAD_LEVELS {
+    for level in EXECUTION_TIERS {
         if !levels.contains_key(level) {
             errors.push(format!("throttle level '{level}' is not defined"));
         }

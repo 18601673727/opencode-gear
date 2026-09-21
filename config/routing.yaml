@@ -1,7 +1,7 @@
 ---
-"$comment": 'Consumer Router. Maps durable ROLE -> replaceable provider/model. The
+"$comment": 'Worker Router. Maps durable ROLE -> replaceable provider/model. The
   Lead provider/model does not belong here in the baseline architecture: the Lead is
-  not a consumer. Set an optional `fallback` on a role to make an explicit, visible
+  not a worker. Set an optional `fallback` on a role to make an explicit, visible
   secondary model available; a fallback is never normal routing and must never become
   the silent default.'
 small_model: deepseek-v4.1-flash

@@ -2,7 +2,7 @@
 
 This document is for people who already had a working, private multi-model
 OpenCode setup and want to keep the workflow while adopting the split between
-**Throttle** and the **Consumer Router**.
+**Throttle** and the **Worker Router**.
 
 ## What usually gets conflated
 
@@ -10,17 +10,17 @@ Older setups tend to use one concept for two jobs. Typical symptoms:
 
 - "Gear" (or "profile", or "mode") names a bundle: `gear-low` means *this Lead*
   **and** *this builder* **and** *this verifier* at the same time.
-- Switching the Lead tier also switches the builder, so a cheap Lead
+- Switching the Execution Tier also switches the builder, so a cheap Lead
   accidentally downgrades your implementation model.
 - Subagents are duplicated per tier (`builder-low`, `builder-mid`,
   `builder-high`) even though the builder model never changes.
-- A "mode" restricts providers and is easy to confuse with the Lead tier.
+- A "mode" restricts providers and is easy to confuse with the Execution Tier.
 
 ## The new truth
 
 ```text
-Throttle        = Lead tier only                 low / mid / high
-Consumer Router = delegated execution routing    EXPLORE / BUILD / VERIFY / DEBUG
+Throttle        = Execution Tier only            low / mid / high
+Worker Router   = delegated execution routing    EXPLORE / BUILD / VERIFY / DEBUG
 ```
 
 ## JSON files are now YAML
@@ -50,16 +50,16 @@ exists and never overwrites an existing YAML file.
    actually use: which Lead model, which builder, which explorer, which
    verifier.
 
-2. **Decide the Lead axis.** Keep at most three Lead tiers. Map old names onto
+2. **Decide the Lead axis.** Keep at most three Execution Tiers. Map old names onto
    `low` / `mid` / `high` and put them in `config/throttle.yaml` (or your user
    override). If your old setup had only one Lead, keep one level and reuse it.
 
-3. **Decide the consumer axis, once.** Pick exactly one model per role:
-   explore, build, verify, debug. These no longer vary by Lead tier. Put them
+3. **Decide the worker axis, once.** Pick exactly one model per role:
+   explore, build, verify, debug. These no longer vary by Execution Tier. Put them
    in `config/routing.yaml` (or your project override).
 
 4. **Collapse duplicated subagents.** Delete per-tier duplicates
-   (`builder-low`, `builder-mid`, ...). OpenCode Gear generates one consumer
+   (`builder-low`, `builder-mid`, ...). OpenCode Gear generates one worker
    agent per role and shares it across all Lead levels.
 
 5. **Move prompts to one place per role.** A single prompt per role lives in
@@ -84,8 +84,8 @@ exists and never overwrites an existing YAML file.
 
 | Old | New |
 | --- | --- |
-| Gear = Lead tier | Throttle level |
-| Gear = full bundle | gone; consumers are throttle-independent |
+| Gear = Execution Tier | Throttle level |
+| Gear = full bundle | gone; workers are throttle-independent |
 | `builder-low/mid/high` | `ocg-build` |
 | `explorer-*` | `ocg-explore`, `ocg-explore-deep` |
 | `verifier-*` | `ocg-verify`, `ocg-debug` |

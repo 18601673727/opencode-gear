@@ -94,14 +94,14 @@ impl Role {
         }
     }
 
-    /// The generated OpenCode consumer agent for this role. The Lead has no
+    /// The generated OpenCode worker agent for this role. The Lead has no
     /// single agent (one exists per throttle level) and returns `None`.
     pub fn agent(self) -> Option<String> {
         match self {
             Role::Lead => None,
             other => Some(format!(
                 "{}{}",
-                crate::defaults::CONSUMER_AGENT_PREFIX,
+                crate::defaults::WORKER_AGENT_PREFIX,
                 other.routing_role()
             )),
         }

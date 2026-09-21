@@ -184,7 +184,7 @@ pub fn routing_block(effective: &Effective) -> Result<String> {
     let roles = model::role_specs(data).cloned().unwrap_or_default();
 
     let mut lines = vec![
-        "## Configured consumer routing".to_string(),
+        "## Configured Worker routing".to_string(),
         String::new(),
         "| Role | Agent | Provider / model |".to_string(),
         "| --- | --- | --- |".to_string(),
@@ -205,7 +205,7 @@ pub fn routing_block(effective: &Effective) -> Result<String> {
         lines.push(format!(
             "| {} | `{}` | {} / {} |",
             role.to_uppercase(),
-            model::consumer_agent_id(role),
+            model::worker_agent_id(role),
             model::provider_label(data, &provider),
             rendered
         ));
@@ -235,7 +235,7 @@ pub fn routing_block(effective: &Effective) -> Result<String> {
     }
 
     lines.push(String::new());
-    lines.push("Consumer roles run only on the models listed above. The Lead is".to_string());
+    lines.push("Worker roles run only on the models listed above. The Lead is".to_string());
     lines.push("provider-agnostic; never substitute the Lead model or any other".to_string());
     lines.push("provider/model unless the user explicitly configures it.".to_string());
     Ok(lines.join("\n"))
@@ -249,7 +249,7 @@ pub fn render_lead_prompt(effective: &Effective, level: &str, template: &str) ->
             let mut placeholder = String::from("{{");
             placeholder.push_str(&role.replace('-', "_"));
             placeholder.push_str("}}");
-            text = text.replace(&placeholder, &model::consumer_agent_id(role));
+            text = text.replace(&placeholder, &model::worker_agent_id(role));
         }
     }
     text = text.replace("{{throttle}}", level);

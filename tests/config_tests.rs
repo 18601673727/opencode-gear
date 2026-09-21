@@ -5,7 +5,7 @@ mod common;
 
 use common::*;
 use opencode_gear::config::{build_effective, Effective};
-use opencode_gear::defaults::{load_defaults, GearSource, LEAD_LEVELS};
+use opencode_gear::defaults::{load_defaults, GearSource, EXECUTION_TIERS};
 use opencode_gear::{build, model, observability, prompt, validate};
 use serde_json::json;
 use std::fs;
@@ -26,9 +26,9 @@ fn lead_prompt(home: &Path) -> String {
     fs::read_to_string(home.join("config").join("prompts").join("lead.md")).expect("lead prompt")
 }
 
-fn consumer_model(effective: &Effective, level: &str, role: &str) -> String {
+fn worker_model(effective: &Effective, level: &str, role: &str) -> String {
     let config = build::build_opencode_config(effective, level).expect("build");
-    config["agent"][model::consumer_agent_id(role)]["model"]
+    config["agent"][model::worker_agent_id(role)]["model"]
         .as_str()
         .expect("model")
         .to_string()
@@ -48,14 +48,14 @@ fn exactly_three_levels_are_shipped() {
     let levels = effective.data["throttle"]["levels"]
         .as_object()
         .expect("levels");
-    assert_eq!(levels.len(), LEAD_LEVELS.len());
-    for level in LEAD_LEVELS {
+    assert_eq!(levels.len(), EXECUTION_TIERS.len());
+    for level in EXECUTION_TIERS {
         assert!(levels.contains_key(level), "missing level {level}");
     }
 }
 
 #[test]
-fn lead_tiers_map_to_the_expected_models() {
+fn execution_tiers_map_to_the_expected_models() {
     let (_dir, home, project) = setup();
     let effective = disk(&home, &project);
     let level = |name: &str| effective.data["throttle"]["levels"][name]["model"].clone();
@@ -95,7 +95,7 @@ fn lead_tiers_map_to_the_expected_models() {
 fn one_lead_agent_per_level() {
     let (_dir, home, project) = setup();
     let effective = disk(&home, &project);
-    for level in LEAD_LEVELS {
+    for level in EXECUTION_TIERS {
         let config = build::build_opencode_config(&effective, level).expect("build");
         assert_eq!(config["default_agent"], json!(model::lead_agent_id(level)));
         let agent = &config["agent"][model::lead_agent_id(level)];
@@ -138,7 +138,7 @@ fn project_override_can_change_the_default_throttle() {
 }
 
 #[test]
-fn throttle_does_not_change_consumer_routing() {
+fn throttle_does_not_change_worker_routing() {
     let (_dir, home, project) = setup();
     let effective = disk(&home, &project);
     let roles: Vec<String> = model::role_specs(&effective.data)
@@ -147,10 +147,10 @@ fn throttle_does_not_change_consumer_routing() {
         .cloned()
         .collect();
     for role in &roles {
-        let baseline = consumer_model(&effective, "low", role);
-        for level in LEAD_LEVELS {
+        let baseline = worker_model(&effective, "low", role);
+        for level in EXECUTION_TIERS {
             assert_eq!(
-                consumer_model(&effective, level, role),
+                worker_model(&effective, level, role),
                 baseline,
                 "{role} changed under throttle {level}"
             );
@@ -188,17 +188,17 @@ fn provider_binding_is_deterministic() {
         } else {
             assert_eq!(provider, "opencode-go");
         }
-        assert_ne!(provider, "openai", "OpenAI must not be a consumer");
+        assert_ne!(provider, "openai", "OpenAI must not be a worker");
     }
 }
 
 #[test]
-fn consumer_agents_are_hidden_and_cannot_delegate() {
+fn worker_agents_are_hidden_and_cannot_delegate() {
     let (_dir, home, project) = setup();
     let effective = disk(&home, &project);
     let config = build::build_opencode_config(&effective, "low").expect("build");
     for role in model::role_specs(&effective.data).unwrap().keys() {
-        let agent = &config["agent"][model::consumer_agent_id(role)];
+        let agent = &config["agent"][model::worker_agent_id(role)];
         assert_eq!(agent["mode"], json!("subagent"));
         assert_eq!(agent["hidden"], json!(true));
         assert_eq!(agent["permission"]["task"], json!("deny"));
@@ -206,7 +206,7 @@ fn consumer_agents_are_hidden_and_cannot_delegate() {
 }
 
 #[test]
-fn lead_can_only_task_its_own_consumers() {
+fn lead_can_only_task_its_own_workers() {
     let (_dir, home, project) = setup();
     let effective = disk(&home, &project);
     let config = build::build_opencode_config(&effective, "low").expect("build");
@@ -222,7 +222,7 @@ fn lead_can_only_task_its_own_consumers() {
     let expected: Vec<String> = model::role_specs(&effective.data)
         .unwrap()
         .keys()
-        .map(|role| model::consumer_agent_id(role))
+        .map(|role| model::worker_agent_id(role))
         .collect();
     assert_eq!(allowed.len(), expected.len());
     for agent in expected {
@@ -637,7 +637,7 @@ fn append_must_be_a_list() {
 }
 
 #[test]
-fn append_does_not_leak_into_consumer_prompts() {
+fn append_does_not_leak_into_worker_prompts() {
     let (_dir, home, project) = setup();
     let policy = project.join("lead-policy.md");
     fs::write(&policy, "Lead-only clause.\n").expect("write");
@@ -648,7 +648,7 @@ fn append_does_not_leak_into_consumer_prompts() {
     let effective = disk(&home, &project);
     let config = build::build_opencode_config(&effective, "low").expect("build");
     for role in model::role_specs(&effective.data).unwrap().keys() {
-        let text = config["agent"][model::consumer_agent_id(role)]["prompt"]
+        let text = config["agent"][model::worker_agent_id(role)]["prompt"]
             .as_str()
             .unwrap();
         assert!(!text.contains("Lead-only clause."));
@@ -806,7 +806,7 @@ fn embedded_defaults_match_the_disk_config() {
     let (_dir, home, project) = setup();
     let embedded = load_embedded_effective(&project);
     let disk_effective = disk(&home, &project);
-    for level in LEAD_LEVELS {
+    for level in EXECUTION_TIERS {
         let a = build::build_opencode_config(&embedded, level).expect("embedded build");
         let b = build::build_opencode_config(&disk_effective, level).expect("disk build");
         assert_eq!(a, b, "embedded and disk config differ at level {level}");

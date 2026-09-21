@@ -7,7 +7,7 @@
 providers:
   openai:
     label: OpenAI
-    note: Lead tier. Configure with `opencode auth login openai`.
+    note: Lead models (Sol/Astra) for the Execution Tier. Configure with `opencode auth login openai`.
   volcengine-coding-plan:
     label: Volcano Coding Plan Pro
     note: EXPLORE models (Kimi). Native provider in OpenCode 2.0.11+. Configure with `opencode
