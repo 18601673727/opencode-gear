@@ -150,7 +150,7 @@ export PATH="$HOME/.local/bin:$PATH"
 To pin a release, or to choose another directory:
 
 ```bash
-OPENCODE_GEAR_VERSION=v0.3.1 sh install.sh
+OPENCODE_GEAR_VERSION=v0.3.2 sh install.sh
 OPENCODE_GEAR_INSTALL_DIR="$HOME/bin" sh install.sh
 ```
 
@@ -366,7 +366,7 @@ ocg doctor
 ```text
 OpenCode Gear doctor
   platform               [PASS] linux-x86_64
-  gear                   [PASS] /usr/local/bin/ocg (Gear 0.3.1)
+  gear                   [PASS] /usr/local/bin/ocg (Gear 0.3.2)
   ...
 config layering
   defaults               [PASS] embedded in the binary (no OPENCODE_GEAR_HOME)
