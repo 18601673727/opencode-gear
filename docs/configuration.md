@@ -422,6 +422,17 @@ and verification integration. See
 [architecture.md](architecture.md) for the mechanism and
 [verification.md](verification.md) for the retry/Debug contract.
 
+The bridge injects the full repository context snapshot on the first Lead
+prompt of a session and records a deterministic `snapshot_id` per session. If
+the effective repository snapshot is unchanged, later prompts in the same
+session receive an empty `context` with `cached: true`, so the snapshot is not
+duplicated across turns; a materially changed snapshot is injected again and
+becomes the new baseline. The response also carries estimate-only metadata
+(`estimated_tokens` = bytes / 4, `bytes`, `file_count`, `symbol_count`);
+estimated tokens are never presented as exact provider billing tokens. Default
+collapsed TUI rendering of that metadata is blocked by the current OpenCode
+presentation API, so OCG emits a plain, compact line and leaves it visible.
+
 ## Environment variables
 
 `OPENCODE_GEAR_*` is canonical; the legacy `OC_GEAR_*` names are accepted as

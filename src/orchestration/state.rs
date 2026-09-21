@@ -103,6 +103,12 @@ pub struct SessionState {
     /// The most recent bounded, real diff rendering. Reused by Debug hand-offs
     /// so they carry a relevant diff without re-planning.
     pub last_diff_context: String,
+    /// The identity of the last repository context snapshot injected into this
+    /// session. The bridge compares the freshly prepared identity against it so
+    /// an unchanged snapshot is not appended again on a later turn. `None`
+    /// means nothing has been injected yet.
+    #[serde(default)]
+    pub last_snapshot_id: Option<String>,
     pub updated_at: i64,
 }
 
@@ -130,6 +136,7 @@ impl Default for SessionState {
             attempts: Attempts::default(),
             last_rich_bytes: 0,
             last_diff_context: String::new(),
+            last_snapshot_id: None,
             updated_at: 0,
         }
     }

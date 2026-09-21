@@ -1399,3 +1399,160 @@ fn secret_user_message_is_not_persisted_in_state_or_checkpoints() {
         );
     }
 }
+
+// ---- Repeated-context (snapshot deduplication) regressions -----------------
+
+fn lead_controller<'a>(
+    root: &'a Path,
+    git: &'a FakeGitHost,
+    clock: &'a FixedClock,
+) -> Controller<'a> {
+    Controller::new(
+        root,
+        OrchestrationConfig::default(),
+        ContextConfig::default(),
+        CapabilityConfig::default(),
+        verification(),
+        git,
+        clock,
+    )
+}
+
+fn dispatch_chat(bridge: &BridgeContext<'_>, session: &str, text: &str) -> serde_json::Value {
+    bridge.dispatch(
+        "chat.message",
+        &json!({"session_id": session, "text": text}),
+    )
+}
+
+/// A. First prompt injects the full snapshot.
+/// B/C. Later prompts with an unchanged repository snapshot are deduplicated.
+/// E. A distinct session still receives its own initial context.
+#[test]
+fn lead_context_snapshot_is_injected_once_and_deduplicated_per_session() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let git = FakeGitHost::new();
+    let clock = FixedClock::new(1_000);
+    let controller = lead_controller(dir.path(), &git, &clock);
+    let runner = FakeCaptureRunner::new();
+    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+
+    // A. The first prompt injects the full repository snapshot plus metadata.
+    let first = dispatch_chat(&bridge, "lead-1", TASK);
+    assert_eq!(first["ok"], json!(true));
+    assert_eq!(first["cached"], json!(false));
+    let first_context = first["context"].as_str().unwrap();
+    assert!(first_context.contains(TASK));
+    let first_id = first["snapshot_id"].as_str().unwrap().to_string();
+    assert!(first_id.starts_with("sha256:"), "{first_id}");
+    assert!(first["bytes"].as_u64().unwrap() > 0);
+    assert_eq!(
+        first["estimated_tokens"].as_u64().unwrap() as usize,
+        first["bytes"].as_u64().unwrap() as usize / 4
+    );
+    assert!(first["file_count"].as_u64().unwrap() > 0);
+    assert!(first["symbol_count"].as_u64().unwrap() > 0);
+    // The identity is persisted on the session.
+    let session = controller
+        .load_state()
+        .state
+        .session("lead-1")
+        .cloned()
+        .unwrap();
+    assert_eq!(session.last_snapshot_id.as_deref(), Some(first_id.as_str()));
+
+    // B. The second prompt with an unchanged repository returns no context.
+    let second = dispatch_chat(&bridge, "lead-1", TASK);
+    assert_eq!(second["ok"], json!(true));
+    assert_eq!(second["cached"], json!(true));
+    assert_eq!(second["context"], json!(""));
+    assert_eq!(second["snapshot_id"], json!(first_id));
+
+    // C. The third prompt stays deduplicated.
+    let third = dispatch_chat(&bridge, "lead-1", TASK);
+    assert_eq!(third["cached"], json!(true));
+    assert_eq!(third["context"], json!(""));
+
+    // E. A distinct session gets its own initial snapshot. The identity is a
+    // property of the repository snapshot, so it is legitimately the same.
+    let other = dispatch_chat(&bridge, "lead-2", TASK);
+    assert_eq!(other["cached"], json!(false));
+    assert!(!other["context"].as_str().unwrap().is_empty());
+    assert_eq!(other["snapshot_id"], json!(first_id));
+}
+
+/// D. A material repository change produces a new identity and a fresh snapshot.
+#[test]
+fn lead_context_snapshot_changes_when_repository_context_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let git = FakeGitHost::new();
+    let clock = FixedClock::new(1_000);
+    let controller = lead_controller(dir.path(), &git, &clock);
+    let runner = FakeCaptureRunner::new();
+    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+
+    let first = dispatch_chat(&bridge, "lead-1", TASK);
+    assert_eq!(first["cached"], json!(false));
+    let first_id = first["snapshot_id"].as_str().unwrap().to_string();
+    assert!(first["context"].as_str().unwrap().contains("parse_1"));
+
+    // Edit the selected file so the repository snapshot materially changes.
+    fs::write(
+        dir.path().join("src/module_1.rs"),
+        "pub fn parse_1(value: u32) -> u32 {\n    value + 2\n}\n// changed\n",
+    )
+    .unwrap();
+
+    let second = dispatch_chat(&bridge, "lead-1", TASK);
+    assert_eq!(second["ok"], json!(true));
+    assert_eq!(second["cached"], json!(false));
+    let second_id = second["snapshot_id"].as_str().unwrap().to_string();
+    assert_ne!(second_id, first_id, "changed context must change identity");
+    assert!(!second["context"].as_str().unwrap().is_empty());
+
+    // The next unchanged prompt is deduplicated against the new baseline.
+    let third = dispatch_chat(&bridge, "lead-1", TASK);
+    assert_eq!(third["cached"], json!(true));
+    assert_eq!(third["context"], json!(""));
+    assert_eq!(third["snapshot_id"], json!(second_id));
+}
+
+/// F. Deduplication is per session: a Worker hand-off in a distinct session is
+/// never suppressed by the Lead session's cached snapshot.
+#[test]
+fn worker_handoff_is_not_suppressed_by_lead_snapshot_deduplication() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let git = FakeGitHost::new();
+    let clock = FixedClock::new(1_000);
+    let controller = lead_controller(dir.path(), &git, &clock);
+    let runner = FakeCaptureRunner::new();
+    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+
+    // Cache the Lead session's snapshot.
+    let first = dispatch_chat(&bridge, "lead-1", TASK);
+    assert_eq!(first["cached"], json!(false));
+    let cached = dispatch_chat(&bridge, "lead-1", TASK);
+    assert_eq!(cached["cached"], json!(true));
+    assert_eq!(cached["context"], json!(""));
+
+    // A Worker subagent delegation runs in its own session and still receives
+    // its typed hand-off context even though the Lead snapshot is cached.
+    let worker = bridge.dispatch(
+        "tool.execute.before",
+        &json!({
+            "session_id": "worker-1",
+            "args": {"subagent_type": "ocg-explore", "prompt": "explore the parser"}
+        }),
+    );
+    assert_eq!(worker["ok"], json!(true));
+    assert_eq!(worker["destination"], json!("explore"));
+    assert!(!worker["context"].as_str().unwrap().is_empty());
+
+    // A distinct Lead session also still gets its own initial snapshot.
+    let other_lead = dispatch_chat(&bridge, "lead-2", TASK);
+    assert_eq!(other_lead["cached"], json!(false));
+    assert!(!other_lead["context"].as_str().unwrap().is_empty());
+}

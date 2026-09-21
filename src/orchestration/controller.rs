@@ -51,11 +51,27 @@ use std::path::{Path, PathBuf};
 pub const EXPLORE_RESPONSE_CONTRACT: &str = "\nExplore response contract (advisory): end your reply with one JSON object and no prose after it:\n{\"goal\":\"...\",\"constraints\":[\"...\"],\"findings\":[{\"summary\":\"...\",\"source\":\"path\",\"severity\":\"info|warning|critical\"}],\"files\":[\"path\"],\"symbols\":[\"name\"]}\n";
 
 /// The dynamic context prepared for an ordinary user message.
+///
+/// `snapshot_id` is a deterministic identity of the *repository* snapshot
+/// (everything in `dynamic_context` except the current user message). It is
+/// what the bridge uses to deduplicate across turns; the metadata fields are
+/// conservative estimates for presentation only, never provider billing.
 #[derive(Debug, Clone)]
 pub struct LeadContext {
     pub session_id: String,
     pub task_id: String,
     pub dynamic_context: String,
+    pub snapshot_id: String,
+    /// Estimated tokens for the injected dynamic context
+    /// (`dynamic_context.len() / 4`). Clearly an estimate; never presented as
+    /// exact provider tokens.
+    pub estimated_tokens: usize,
+    /// Byte length of the injected dynamic context.
+    pub bytes: usize,
+    /// Number of relevant files in the prepared input.
+    pub file_count: usize,
+    /// Number of relevant symbols in the prepared input.
+    pub symbol_count: usize,
     pub goal: Option<String>,
     pub metrics: OrchestrationMetrics,
 }
@@ -347,10 +363,20 @@ impl<'a> Controller<'a> {
         let (plan, warnings) = self.plan(message, Some("lead"));
         let input = self.build_input(&session, plan.as_ref(), message);
         let (input, omitted) = projection::sanitize(&input);
-        let mut dynamic = self.render_lead_context(&input);
-        dynamic.push_str(&render_warnings(&warnings));
-        dynamic.push_str(&render_warnings(&omitted));
-        dynamic.push_str(&self.render_source_slices(&input.slices));
+        let file_count = input.files.len();
+        let symbol_count = input.symbols.len();
+        // The repository snapshot excludes the current user message so the same
+        // effective repository context yields the same identity across turns.
+        // `render_lead_snapshot` renders everything except the `task:` line.
+        let mut snapshot = self.render_lead_snapshot(&input);
+        snapshot.push_str(&render_warnings(&warnings));
+        snapshot.push_str(&render_warnings(&omitted));
+        snapshot.push_str(&self.render_source_slices(&input.slices));
+        let snapshot_id = snapshot_identity(&snapshot);
+        let mut dynamic = self.render_lead_header(&input);
+        dynamic.push_str(&snapshot);
+        let bytes = dynamic.len();
+        let estimated_tokens = bytes / 4;
 
         session.last_rich_bytes = input.rich_bytes();
         session.updated_at = now;
@@ -382,6 +408,11 @@ impl<'a> Controller<'a> {
             session_id: session_key,
             task_id,
             dynamic_context: dynamic,
+            snapshot_id,
+            estimated_tokens,
+            bytes,
+            file_count,
+            symbol_count,
             goal: input.goal,
             metrics,
         })
@@ -1167,13 +1198,21 @@ impl<'a> Controller<'a> {
         })
     }
 
-    fn render_lead_context(&self, input: &ProjectionInput) -> String {
+    /// The volatile header of the injected Lead context: the engine banner and
+    /// the current user message. These are deliberately **excluded** from
+    /// [`Self::render_lead_snapshot`] so the repository snapshot identity does
+    /// not depend on the current message.
+    fn render_lead_header(&self, input: &ProjectionInput) -> String {
+        format!(
+            "ocg orchestration context ({}):\ntask: {}\n",
+            ENGINE_VERSION, input.task
+        )
+    }
+
+    /// The repository-derived body of the Lead context. The current user
+    /// message is not rendered here; it lives in [`Self::render_lead_header`].
+    fn render_lead_snapshot(&self, input: &ProjectionInput) -> String {
         let mut out = String::new();
-        out.push_str(&format!(
-            "ocg orchestration context ({}):\n",
-            ENGINE_VERSION
-        ));
-        out.push_str(&format!("task: {}\n", input.task));
         if let Some(goal) = &input.goal {
             out.push_str(&format!("goal: {goal}\n"));
         }
@@ -1373,6 +1412,19 @@ impl<'a> Controller<'a> {
         capsule.recompute_size();
         capsule
     }
+}
+
+/// A deterministic identity for a rendered repository snapshot.
+///
+/// It hashes exactly the bytes of the message-independent snapshot text, so no
+/// timestamp, secret or current user message can enter it. The same effective
+/// repository context always yields the same identity; a materially different
+/// snapshot yields a different one.
+fn snapshot_identity(snapshot: &str) -> String {
+    format!(
+        "sha256:{}",
+        crate::runtime::hash::sha256_hex(snapshot.as_bytes())
+    )
 }
 
 fn phase_for(role: Role) -> OrchestrationPhase {
@@ -2018,5 +2070,16 @@ mod tests {
         let text = render_diff_context(&plan);
         assert!(text.contains("a.rs"));
         assert!(text.contains("git: dirty"));
+    }
+
+    #[test]
+    fn snapshot_identity_is_deterministic_and_message_free() {
+        let first = snapshot_identity("relevant files:\n- src/a.rs\n");
+        let second = snapshot_identity("relevant files:\n- src/a.rs\n");
+        let changed = snapshot_identity("relevant files:\n- src/b.rs\n");
+        assert_eq!(first, second, "the same snapshot must hash identically");
+        assert_ne!(first, changed, "a changed snapshot must hash differently");
+        assert!(first.starts_with("sha256:"));
+        assert_eq!(first.len(), "sha256:".len() + 64);
     }
 }

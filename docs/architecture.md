@@ -287,6 +287,15 @@ JavaScript (transport only)
   session (the request agent starts with `lead-`); consumer subagent sessions
   and requests with no identifiable agent skip it, while
   `tool.execute.before/after` remain active everywhere.
+- **One snapshot per session.** The injected repository context carries a
+  deterministic `snapshot_id` (SHA-256 of the rendered repository snapshot,
+  excluding the current user message) plus estimate-only metadata
+  (`estimated_tokens` = bytes / 4, `bytes`, `file_count`, `symbol_count`). The
+  bridge records the last injected identity on the session in
+  `.opencode-gear/orchestration/state.json` and returns an empty `context` with
+  `cached: true` when the identity is unchanged, so an unchanged repository
+  snapshot is never appended twice. The adapter treats an empty `context` as a
+  no-op, and a bridge failure is still swallowed.
 - **Typed hand-offs.** The rich `ProjectionInput` (a `TaskCapsule` plus
   selected source slices, a bounded diff summary and an optional verification
   block) is projected into a compact `ModelHandoffCapsule` for exactly one
@@ -318,6 +327,13 @@ JavaScript (transport only)
   orchestration emits no plugin, writes no state and records nothing.
 - **Capabilities stay advisory.** Capability narrowing is included as advice in
   the dynamic context; runtime permission enforcement remains OpenCode's job.
+
+> **Refresh policy.** OCG injects the full repository context snapshot on the
+> first Lead prompt of a session. If the effective repository snapshot is
+> unchanged, later prompts in the same session receive no additional repository
+> context. When the snapshot materially changes (for example file edits, new
+> findings or new verification state), the new snapshot is injected on the next
+> prompt and becomes the new session baseline.
 
 State lives under `.opencode-gear/orchestration/` and the adapter under
 `.opencode-gear/orchestration/plugin/`; both are ignored local state.
