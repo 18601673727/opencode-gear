@@ -2000,7 +2000,7 @@ fn doctor_command(
                 let (plugin, mechanism) = match adapter {
                     Some(a) if a.major() == compat::Major::V2 => {
                         let path = crate::orchestration::plugin::v2_plugin_path(project_root);
-                        let mech = "local-discovery JS adapter at OPENCODE_CONFIG_DIR/plugins; hooks: context, execute.before/after";
+                        let mech = "local-discovery JS adapter at OPENCODE_CONFIG_DIR/plugins; hooks: prompt, context, execute.before/after";
                         (path, mech)
                     }
                     _ => {

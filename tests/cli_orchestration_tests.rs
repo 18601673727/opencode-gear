@@ -213,7 +213,18 @@ fn bridge_chat_message_prepares_context_and_state() {
 fn bridge_session_context_supplies_the_baseline_on_every_dispatch() {
     let dir = TestDir::new();
     let project = project(&dir);
-    let payload = json!({"session_id": "cli-session", "text": "fix the parser"});
+    // Task identity enters through prompt admission, never through dispatch
+    // content: the baseline names the task only after it was admitted.
+    let admitted = bridge(
+        &project,
+        dir.path(),
+        "session.prompt",
+        &json!({"session_id": "cli-session", "text": "fix the parser"}),
+    );
+    assert_eq!(admitted["ok"], json!(true));
+    assert_eq!(admitted["changed"], json!(true));
+
+    let payload = json!({"session_id": "cli-session", "agent": "ocg-lead-low"});
     let first = bridge(&project, dir.path(), "session.context", &payload);
     assert_eq!(first["ok"], json!(true));
     assert_eq!(first["event"], json!("session.context"));
@@ -230,11 +241,95 @@ fn bridge_session_context_supplies_the_baseline_on_every_dispatch() {
     assert_eq!(second["snapshot_id"], first["snapshot_id"]);
     assert_eq!(second["bytes"], first["bytes"]);
     assert!(second["bytes"].as_u64().unwrap() > 0);
+
+    // A dispatch carrying runtime-generated conversation content (an
+    // interruption/resume continuation reaches the model as a user-role
+    // message) is not an admission: the served baseline is unchanged and the
+    // admitted task identity is untouched.
+    let synthetic = bridge(
+        &project,
+        dir.path(),
+        "session.context",
+        &json!({"session_id": "cli-session", "text": "The previous response was interrupted. Continue from where you left off without repeating completed content."}),
+    );
+    assert_eq!(synthetic["ok"], json!(true));
+    assert_eq!(synthetic["task_id"], first["task_id"]);
+    assert_eq!(synthetic["context"].as_str().unwrap(), body);
     assert!(project
         .join(".opencode-gear")
         .join("orchestration")
         .join("state.json")
         .is_file());
+}
+
+#[test]
+fn bridge_session_prompt_admission_drives_task_identity() {
+    let dir = TestDir::new();
+    let project = project(&dir);
+
+    // A genuine admission establishes the task identity.
+    let first = bridge(
+        &project,
+        dir.path(),
+        "session.prompt",
+        &json!({"session_id": "cli-session", "text": "fix the parser"}),
+    );
+    assert_eq!(first["ok"], json!(true));
+    assert_eq!(first["event"], json!("session.prompt"));
+    assert_eq!(first["changed"], json!(true));
+    let task_id = first["task_id"].as_str().unwrap().to_string();
+    assert!(task_id.starts_with("task-"), "{task_id}");
+
+    // Re-admitting the identical prompt is a no-op, never a reset.
+    let again = bridge(
+        &project,
+        dir.path(),
+        "session.prompt",
+        &json!({"session_id": "cli-session", "text": "fix the parser"}),
+    );
+    assert_eq!(again["ok"], json!(true));
+    assert_eq!(again["changed"], json!(false));
+    assert_eq!(again["task_id"], json!(task_id));
+
+    // A genuinely new admitted prompt is a task boundary.
+    let reset = bridge(
+        &project,
+        dir.path(),
+        "session.prompt",
+        &json!({"session_id": "cli-session", "text": "rewrite the lexer"}),
+    );
+    assert_eq!(reset["ok"], json!(true));
+    assert_eq!(reset["changed"], json!(true));
+    assert_ne!(reset["task_id"], json!(task_id));
+
+    // The baseline served after the reset names the new task.
+    let context = bridge(
+        &project,
+        dir.path(),
+        "session.context",
+        &json!({"session_id": "cli-session", "agent": "ocg-lead-low"}),
+    );
+    assert_eq!(context["ok"], json!(true));
+    assert_eq!(context["task_id"], reset["task_id"]);
+    let body = context["context"].as_str().unwrap();
+    assert!(body.contains("rewrite the lexer"), "{body}");
+    assert!(!body.contains("fix the parser"), "{body}");
+
+    // An empty or whitespace-only admission is rejected and changes nothing.
+    let empty = bridge(
+        &project,
+        dir.path(),
+        "session.prompt",
+        &json!({"session_id": "cli-session", "text": "   "}),
+    );
+    assert_eq!(empty["ok"], json!(false));
+    let after = bridge(
+        &project,
+        dir.path(),
+        "session.context",
+        &json!({"session_id": "cli-session", "agent": "ocg-lead-low"}),
+    );
+    assert_eq!(after["task_id"], reset["task_id"]);
 }
 
 #[test]

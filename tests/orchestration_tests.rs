@@ -487,9 +487,11 @@ fn v2_plugin_contract_uses_local_discovery_and_subagent_tool() {
     assert!(source.contains("event.tool !== \"subagent\""));
     assert!(source.contains("ctx.tool.hook(\"execute.before\""));
     // The repository baseline is injected at model dispatch through the
-    // session `context` hook; the admitted prompt is never an OCG surface.
+    // session `context` hook; prompt admission is reported through a strictly
+    // read-only `session.prompt` hook that never mutates the admitted prompt.
     assert!(source.contains("ctx.session.hook(\"context\""));
-    assert!(!source.contains("ctx.session.hook(\"prompt\""));
+    assert!(source.contains("ctx.session.hook(\"prompt\""));
+    assert!(source.contains("bridge(\"session.prompt\""));
     assert!(source.contains("event.system.push({ type: \"text\""));
     // The V2 runtime may be Node, so the bridge is spawned via
     // `node:child_process` with an exact argv and no shell.
@@ -1714,6 +1716,10 @@ fn lead_context_snapshot_suppresses_trivial_third_turn() {
 
 // ---- V2 model-dispatch baseline (session.context) regressions -------------
 
+/// A `session.context` model dispatch. The payload's `text` models whatever
+/// conversation content the adapter could see (a real user turn, a tool
+/// continuation, or a runtime-generated synthetic user-role message); the
+/// bridge must ignore it — dispatch-time text is never a task signal.
 fn dispatch_context(bridge: &BridgeContext<'_>, session: &str, text: &str) -> serde_json::Value {
     bridge.dispatch(
         "session.context",
@@ -1721,10 +1727,29 @@ fn dispatch_context(bridge: &BridgeContext<'_>, session: &str, text: &str) -> se
     )
 }
 
+/// A genuine user-prompt admission. This is the only surface that establishes
+/// or resets the session's task identity.
+fn admit_task(bridge: &BridgeContext<'_>, session: &str, text: &str) -> serde_json::Value {
+    bridge.dispatch(
+        "session.prompt",
+        &json!({"session_id": session, "text": text}),
+    )
+}
+
+/// The exact continuation text OpenCode v2.0.11 admits as a synthetic
+/// user-role message when a response was interrupted
+/// (`packages/core/src/session/runner/llm.ts`). It bypasses prompt admission
+/// and reaches the model — and the `session.context` hook — as `role: "user"`.
+const SYNTHETIC_CONTINUATION: &str =
+    "The previous response was interrupted. Continue from where you left off without repeating completed content.";
+
 /// The V2 model-dispatch invariant: nothing is persisted into the conversation
 /// history, so every outgoing root-Lead dispatch receives exactly one full
 /// baseline — the first turn, a tool-driven continuation and a later user turn
 /// alike. `cached` reports reused computation, never suppressed inclusion.
+///
+/// Regression coverage for the v0.3.2 blocker: a trailing synthetic
+/// user-role continuation must leave the admitted task untouched.
 #[test]
 fn model_context_supplies_the_full_baseline_on_every_dispatch() {
     let dir = tempfile::tempdir().unwrap();
@@ -1734,6 +1759,14 @@ fn model_context_supplies_the_full_baseline_on_every_dispatch() {
     let controller = lead_controller(dir.path(), &git, &clock);
     let runner = FakeCaptureRunner::new();
     let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+
+    // The task enters through prompt admission, never through dispatch
+    // content.
+    let admitted = admit_task(&bridge, "lead-1", TASK);
+    assert_eq!(admitted["ok"], json!(true));
+    assert_eq!(admitted["event"], json!("session.prompt"));
+    assert_eq!(admitted["changed"], json!(true));
+    assert_eq!(admitted["task_id"], json!(Controller::task_id(TASK)));
 
     // First dispatch: fresh render, full baseline.
     let first = dispatch_context(&bridge, "lead-1", TASK);
@@ -1756,28 +1789,28 @@ fn model_context_supplies_the_full_baseline_on_every_dispatch() {
     assert_eq!(second["snapshot_id"], json!(snapshot_id));
     assert_eq!(second["bytes"], json!(bytes));
 
-    // A later user turn with an unchanged repository: still the full
-    // baseline, keyed by the repository generation — never re-derived from
-    // the new task wording.
-    let third = dispatch_context(&bridge, "lead-1", "Reply with exactly: TURN3_OK");
+    // A synthetic interruption/resume continuation reaches the dispatch as a
+    // trailing user-role message with *different* text. It is not an
+    // admission: the baseline is served unchanged and the running task is not
+    // reset.
+    let third = dispatch_context(&bridge, "lead-1", SYNTHETIC_CONTINUATION);
     assert_eq!(third["cached"], json!(true));
     assert_eq!(third["context"].as_str().unwrap(), body);
     assert_eq!(third["snapshot_id"], json!(snapshot_id));
-    // The task reset still happened: the new wording owns the session task.
+    assert_eq!(third["task_id"], json!(Controller::task_id(TASK)));
     let session = controller
         .load_state()
         .state
         .session("lead-1")
         .cloned()
         .unwrap();
-    assert_eq!(
-        session.task_id,
-        Controller::task_id("Reply with exactly: TURN3_OK")
-    );
+    assert_eq!(session.task_id, Controller::task_id(TASK));
+    assert_eq!(session.task.as_deref(), Some(TASK));
 }
 
 /// A tool-continuation dispatch must not clobber the worker orchestration
-/// state mid-turn, and a later task reset must carry the baseline over.
+/// state mid-turn, and a later genuine admission resets the task while
+/// carrying the repository baseline over.
 #[test]
 fn model_context_never_clobbers_worker_state_mid_turn() {
     let dir = tempfile::tempdir().unwrap();
@@ -1788,7 +1821,9 @@ fn model_context_never_clobbers_worker_state_mid_turn() {
     let runner = FakeCaptureRunner::new();
     let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
 
-    // Turn start: the first dispatch establishes the task and the baseline.
+    // Turn start: admission establishes the task, the first dispatch renders
+    // the baseline.
+    admit_task(&bridge, "lead-1", TASK);
     let first = dispatch_context(&bridge, "lead-1", TASK);
     assert_eq!(first["cached"], json!(false));
     let body = first["context"].as_str().unwrap().to_string();
@@ -1826,12 +1861,11 @@ fn model_context_never_clobbers_worker_state_mid_turn() {
     assert_eq!(after.destination, Some(Role::Explore));
     assert_eq!(after.task_id, Controller::task_id(TASK));
 
-    // The next user turn (a new task) resets task-scoped state but reuses the
-    // repository baseline body verbatim: the baseline is session/repository
-    // scoped, not task scoped.
-    let next = dispatch_context(&bridge, "lead-1", "a different task entirely");
-    assert_eq!(next["cached"], json!(true));
-    assert_eq!(next["context"].as_str().unwrap(), body);
+    // The next user turn is a genuine admission: it resets task-scoped state
+    // but reuses the repository baseline body verbatim, because the baseline
+    // is session/repository scoped, not task scoped.
+    let next = admit_task(&bridge, "lead-1", "a different task entirely");
+    assert_eq!(next["changed"], json!(true));
     let reset = controller
         .load_state()
         .state
@@ -1845,6 +1879,152 @@ fn model_context_never_clobbers_worker_state_mid_turn() {
     assert_eq!(reset.source, Role::Lead);
     assert!(reset.findings.is_empty());
     assert_eq!(reset.attempts, Attempts::default());
+
+    // The first dispatch of the new task serves the carried-over baseline.
+    let dispatch = dispatch_context(&bridge, "lead-1", "a different task entirely");
+    assert_eq!(dispatch["cached"], json!(true));
+    assert_eq!(dispatch["context"].as_str().unwrap(), body);
+}
+
+/// Regression for the v0.3.2 release blocker: dispatch-time conversation
+/// content — including OpenCode's synthetic interruption/resume user-role
+/// message — must leave every piece of task-scoped orchestration state
+/// untouched. Only a genuine prompt admission may reset it.
+#[test]
+fn session_context_dispatch_never_resets_task_state() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let git = FakeGitHost::new();
+    let clock = FixedClock::new(1_000);
+    let controller = lead_controller(dir.path(), &git, &clock);
+    let runner = failing_runner();
+    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+
+    // Admit the task and build up non-trivial task-scoped state: findings, a
+    // checkpoint, a consumed build attempt, phase and destination.
+    admit_task(&bridge, "lead-1", TASK);
+    dispatch_context(&bridge, "lead-1", TASK);
+    controller
+        .prepare_handoff("lead-1", Role::Explore, "explore the parser")
+        .unwrap();
+    controller
+        .consume_explore_result("lead-1", &explore_json())
+        .unwrap();
+    controller
+        .prepare_handoff("lead-1", Role::Build, "implement the fix")
+        .unwrap();
+    controller.after_build("lead-1", &runner, None).unwrap();
+
+    let before = controller
+        .load_state()
+        .state
+        .session("lead-1")
+        .cloned()
+        .unwrap();
+    assert!(!before.findings.is_empty());
+    assert!(!before.checkpoints.is_empty());
+    assert_eq!(before.attempts.build, 1);
+    assert_eq!(before.task_id, Controller::task_id(TASK));
+
+    // A dispatch carrying the synthetic continuation text (and one carrying a
+    // differently phrased would-be task) changes nothing at all.
+    let synthetic = dispatch_context(&bridge, "lead-1", SYNTHETIC_CONTINUATION);
+    assert_eq!(synthetic["ok"], json!(true));
+    let different = dispatch_context(&bridge, "lead-1", "a completely different task");
+    assert_eq!(different["ok"], json!(true));
+
+    let after = controller
+        .load_state()
+        .state
+        .session("lead-1")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "dispatch content must never reset task state"
+    );
+}
+
+/// The mirror image of the dispatch invariant: a genuinely admitted new
+/// prompt *is* a task boundary. It resets findings, attempts, checkpoints,
+/// phase and destination — but keeps the repository-scoped baseline.
+#[test]
+fn session_prompt_admission_resets_task_state() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let git = FakeGitHost::new();
+    let clock = FixedClock::new(1_000);
+    let controller = lead_controller(dir.path(), &git, &clock);
+    let runner = failing_runner();
+    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+
+    // Admit the first task and accumulate task-scoped state plus a retained
+    // repository baseline.
+    admit_task(&bridge, "lead-1", "first task");
+    let baseline = dispatch_context(&bridge, "lead-1", "first task");
+    assert_eq!(baseline["cached"], json!(false));
+    let body = baseline["context"].as_str().unwrap().to_string();
+    controller
+        .prepare_handoff("lead-1", Role::Explore, "explore")
+        .unwrap();
+    controller
+        .consume_explore_result("lead-1", &explore_json())
+        .unwrap();
+    controller
+        .prepare_handoff("lead-1", Role::Build, "build it")
+        .unwrap();
+    controller.after_build("lead-1", &runner, None).unwrap();
+    let before = controller
+        .load_state()
+        .state
+        .session("lead-1")
+        .cloned()
+        .unwrap();
+    assert!(!before.findings.is_empty());
+    assert!(!before.checkpoints.is_empty());
+    assert_eq!(before.attempts.build, 1);
+
+    // Re-admitting the same prompt is not a reset.
+    let repeat = admit_task(&bridge, "lead-1", "first task");
+    assert_eq!(repeat["changed"], json!(false));
+    let unchanged = controller
+        .load_state()
+        .state
+        .session("lead-1")
+        .cloned()
+        .unwrap();
+    assert_eq!(unchanged, before);
+
+    // A genuinely new admitted prompt resets task-scoped state.
+    let next = admit_task(&bridge, "lead-1", "second task");
+    assert_eq!(next["ok"], json!(true));
+    assert_eq!(next["changed"], json!(true));
+    assert_eq!(next["task_id"], json!(Controller::task_id("second task")));
+    let reset = controller
+        .load_state()
+        .state
+        .session("lead-1")
+        .cloned()
+        .unwrap();
+    assert_eq!(reset.task_id, Controller::task_id("second task"));
+    assert_eq!(reset.task.as_deref(), Some("second task"));
+    assert!(reset.findings.is_empty());
+    assert!(reset.checkpoints.is_empty());
+    assert_eq!(reset.attempts, Attempts::default());
+    assert_eq!(reset.phase, OrchestrationPhase::Idle);
+    assert_eq!(reset.source, Role::Lead);
+    assert_eq!(reset.destination, Some(Role::Lead));
+
+    // The repository baseline identity and body carry over the reset: the
+    // next dispatch reuses the retained rendering for the unchanged
+    // repository generation.
+    assert_eq!(
+        reset.repository_generation_id, before.repository_generation_id,
+        "the repository baseline must survive a task reset"
+    );
+    let dispatch = dispatch_context(&bridge, "lead-1", "second task");
+    assert_eq!(dispatch["cached"], json!(true));
+    assert_eq!(dispatch["context"].as_str().unwrap(), body);
 }
 
 /// A material repository change refreshes the baseline exactly once; the
@@ -1859,10 +2039,12 @@ fn model_context_refreshes_once_after_a_repository_change() {
     let runner = FakeCaptureRunner::new();
     let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
 
+    admit_task(&bridge, "lead-1", TASK);
     let first = dispatch_context(&bridge, "lead-1", TASK);
     assert_eq!(first["cached"], json!(false));
     let first_id = first["snapshot_id"].as_str().unwrap().to_string();
     let first_body = first["context"].as_str().unwrap().to_string();
+    assert!(first_body.contains(TASK));
 
     // Edit the selected file so the repository generation materially changes.
     fs::write(
@@ -1880,11 +2062,13 @@ fn model_context_refreshes_once_after_a_repository_change() {
     assert!(!second_body.is_empty());
     assert_ne!(second_body, first_body);
 
-    // The dispatch after that reuses the refreshed baseline.
+    // The dispatch after that reuses the refreshed baseline, and the running
+    // task survived the refresh.
     let third = dispatch_context(&bridge, "lead-1", TASK);
     assert_eq!(third["cached"], json!(true));
     assert_eq!(third["context"].as_str().unwrap(), second_body);
     assert_eq!(third["snapshot_id"], json!(second_id));
+    assert_eq!(third["task_id"], json!(Controller::task_id(TASK)));
 }
 
 /// The baseline is session scoped: a distinct root Lead session receives its
@@ -1899,11 +2083,13 @@ fn model_context_is_session_scoped() {
     let runner = FakeCaptureRunner::new();
     let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
 
+    admit_task(&bridge, "lead-1", TASK);
     let first = dispatch_context(&bridge, "lead-1", TASK);
     assert_eq!(first["cached"], json!(false));
 
     // A distinct session gets its own baseline (freshly rendered for that
     // session; the identity is legitimately the same repository generation).
+    admit_task(&bridge, "lead-2", TASK);
     let other = dispatch_context(&bridge, "lead-2", TASK);
     assert_eq!(other["ok"], json!(true));
     assert_eq!(other["cached"], json!(false));
@@ -1928,10 +2114,16 @@ fn model_context_without_a_user_message_keeps_the_running_task() {
     let runner = FakeCaptureRunner::new();
     let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
 
+    // The running task exists only because it was genuinely admitted; the
+    // first dispatch renders the baseline for it.
+    admit_task(&bridge, "lead-1", TASK);
     let first = dispatch_context(&bridge, "lead-1", TASK);
     assert_eq!(first["cached"], json!(false));
     let body = first["context"].as_str().unwrap().to_string();
+    assert!(body.contains(TASK));
 
+    // A dispatch with no text at all (a bare continuation) keeps the running
+    // task and reuses the retained baseline.
     let empty = dispatch_context(&bridge, "lead-1", "");
     assert_eq!(empty["ok"], json!(true));
     assert_eq!(empty["cached"], json!(true));

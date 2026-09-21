@@ -7,6 +7,7 @@
 //!
 //! ```text
 //! chat.message      -> prepare_lead_context   (V1 persisted dynamic context suffix)
+//! session.prompt    -> admit_user_task        (V2 genuine prompt admission: task identity)
 //! session.context   -> prepare_model_context  (V2 model-dispatch repository baseline)
 //! task before       -> prepare_handoff        (typed role projection)
 //! task after        -> consume_explore_result (bounded findings + checkpoint)
@@ -123,6 +124,17 @@ impl RenderedBaseline {
             },
         }
     }
+}
+
+/// The result of admitting a genuinely submitted user prompt.
+#[derive(Debug, Clone)]
+pub struct TaskAdmission {
+    pub session_id: String,
+    pub task_id: String,
+    /// Whether this admission changed the session's task identity. `false`
+    /// means the running task was re-admitted (or merely backfilled) and all
+    /// task-scoped state was preserved.
+    pub changed: bool,
 }
 
 /// A role hand-off projected for a delegation.
@@ -400,8 +412,8 @@ impl<'a> Controller<'a> {
     /// `chat.message`: prepare bounded, deterministic dynamic context for the
     /// Lead on an ordinary user message (the V1 persisted-prompt path).
     ///
-    /// With [`Self::prepare_model_context`] (the V2 model-dispatch path) this
-    /// is one of the two places the overall task is defined or reset. When the
+    /// With [`Self::admit_user_task`] (the V2 prompt-admission path) this is
+    /// one of the two places the overall task is defined or reset. When the
     /// user message hashes to a different task id, prior findings, retry
     /// counters and checkpoint references are cleared; a repeated message keeps
     /// the running session. Delegated subagent prompts never reset it.
@@ -478,6 +490,68 @@ impl<'a> Controller<'a> {
         })
     }
 
+    /// `session.prompt` (OpenCode V2 prompt admission): register a genuinely
+    /// admitted user prompt as the session's current task.
+    ///
+    /// OpenCode runs prompt admission (`SessionPrompt.prepare`, the source of
+    /// the `session.prompt` hook) only for a real user prompt. Synthetic
+    /// user-role messages the runtime generates itself — interruption/resume
+    /// continuations and similar — are admitted through `Session.synthetic`
+    /// and never pass through prompt admission. Admission is therefore the
+    /// *only* authoritative task boundary; model dispatch
+    /// ([`Self::prepare_model_context`]) never performs this bookkeeping.
+    ///
+    /// A re-admitted prompt whose task id matches the running session leaves
+    /// every piece of task-scoped state (findings, retry budgets, checkpoint
+    /// references, phase, destination) exactly as the worker orchestration
+    /// path left it. A genuinely new prompt resets task-scoped state but
+    /// carries the repository baseline identity and retained body over: the
+    /// baseline is keyed by the task-independent repository generation, never
+    /// by task wording.
+    pub fn admit_user_task(&self, session_id: &str, message: &str) -> Result<TaskAdmission> {
+        let now = self.now();
+        let session_key = state::safe_id(session_id);
+        let task_id = Self::task_id(message);
+        let mut loaded = state::load(&self.root);
+        let existing = loaded.state.session(&session_key).cloned();
+        match existing {
+            Some(session) if session.task_id == task_id => {
+                // The running task was re-admitted. Nothing resets; only the
+                // stored task text may need backfilling (e.g. the session was
+                // first observed by a pre-admission model dispatch).
+                if session.task.is_none() {
+                    let mut session = session;
+                    session.task = Some(Self::stored_task_text(message));
+                    loaded.state.upsert(session, now);
+                    let _ = state::save(&self.root, &loaded.state);
+                }
+                Ok(TaskAdmission {
+                    session_id: session_key,
+                    task_id,
+                    changed: false,
+                })
+            }
+            previous => {
+                let generation_id = previous
+                    .as_ref()
+                    .and_then(|session| session.repository_generation_id.clone());
+                let baseline = previous.and_then(|session| session.repository_baseline);
+                let mut fresh = SessionState::new(&session_key, &task_id, now);
+                fresh.task = Some(Self::stored_task_text(message));
+                fresh.repository_generation_id = generation_id;
+                fresh.repository_baseline = baseline;
+                fresh.destination = Some(Role::Lead);
+                loaded.state.upsert(fresh, now);
+                let _ = state::save(&self.root, &loaded.state);
+                Ok(TaskAdmission {
+                    session_id: session_key,
+                    task_id,
+                    changed: true,
+                })
+            }
+        }
+    }
+
     /// `session.context` (OpenCode V2): provide the current session repository
     /// baseline for one root-Lead model dispatch.
     ///
@@ -490,51 +564,26 @@ impl<'a> Controller<'a> {
     /// retained body is reused verbatim and never re-derived from new task
     /// wording; only a material generation change re-renders it.
     ///
-    /// Task bookkeeping matches the V1 path: a changed user message resets
-    /// task-scoped state (findings, retry budgets, checkpoint references). A
-    /// repeated dispatch for the same task — including tool-loop continuations —
-    /// leaves the running session exactly as the worker orchestration path left
-    /// it: the current role, phase and budgets are never clobbered mid-turn.
-    pub fn prepare_model_context(&self, session_id: &str, message: &str) -> Result<LeadContext> {
+    /// Task identity is *not* decided here; it is owned by prompt admission
+    /// ([`Self::admit_user_task`]). A dispatch-time user-role message may be a
+    /// tool-loop continuation or a runtime-generated synthetic (an
+    /// interruption/resume continuation reaches the model as `role: "user"`),
+    /// so it is never a trustworthy task signal: this path serves the baseline
+    /// from whatever session state admission established and never resets
+    /// findings, retry budgets, checkpoint references, phase or destination.
+    /// A dispatch ahead of any admission (no task yet) is served from a
+    /// task-less session, fail-soft.
+    pub fn prepare_model_context(&self, session_id: &str) -> Result<LeadContext> {
         let now = self.now();
         let session_key = state::safe_id(session_id);
-        let has_task = !message.trim().is_empty();
-        let task_id = Self::task_id(message);
         let mut loaded = state::load(&self.root);
         let existing = loaded.state.session(&session_key).cloned();
-        let mut dirty = false;
-        let mut session = if !has_task {
-            // A dispatch without an extractable user message carries no task
-            // signal: it never resets task state and is served from whatever
-            // session exists.
-            existing.unwrap_or_else(|| SessionState::new(&session_key, "", now))
-        } else {
-            match existing {
-                Some(session) if session.task_id == task_id => session,
-                previous => {
-                    // A new user task resets task-scoped state (findings,
-                    // retries, checkpoints), but the repository baseline is
-                    // session-scoped and task-independent: its identity and
-                    // retained body carry over so an unchanged repository
-                    // generation is never re-rendered from new task wording.
-                    let generation_id = previous
-                        .as_ref()
-                        .and_then(|session| session.repository_generation_id.clone());
-                    let baseline = previous.and_then(|session| session.repository_baseline);
-                    let mut fresh = SessionState::new(&session_key, &task_id, now);
-                    fresh.task = Some(Self::stored_task_text(message));
-                    fresh.repository_generation_id = generation_id;
-                    fresh.repository_baseline = baseline;
-                    fresh.destination = Some(Role::Lead);
-                    dirty = true;
-                    fresh
-                }
-            }
-        };
-        if has_task && session.task.is_none() {
-            session.task = Some(Self::stored_task_text(message));
-            dirty = true;
-        }
+        // A dispatch without a prior admission has no task; serve it from a
+        // task-less session so the baseline is still delivered.
+        let mut session = existing.unwrap_or_else(|| SessionState::new(&session_key, "", now));
+        // The task text used for rendering comes from admission state, never
+        // from dispatch-time conversation content.
+        let task = session.task.clone().unwrap_or_default();
 
         // Ensure the OCG gitignore exists before computing the repository
         // generation. `.gitignore` is an indexed file: a later append by the
@@ -556,11 +605,6 @@ impl<'a> Controller<'a> {
             if session.repository_generation_id.as_deref() == Some(identity)
                 && !stored.body.is_empty()
             {
-                if dirty {
-                    session.updated_at = now;
-                    loaded.state.upsert(session.clone(), now);
-                    let _ = state::save(&self.root, &loaded.state);
-                }
                 let bytes = stored.body.len();
                 return Ok(LeadContext {
                     session_id: session_key,
@@ -589,7 +633,7 @@ impl<'a> Controller<'a> {
         // No retained body for the current generation (first dispatch, a
         // material repository change, or no reliable generation signal):
         // render the baseline exactly as the V1 path would and retain it.
-        let baseline = self.render_session_baseline(&session, message, generation.as_deref());
+        let baseline = self.render_session_baseline(&session, &task, generation.as_deref());
         session.repository_generation_id = Some(baseline.identity.clone());
         session.repository_baseline = Some(state::RepositoryBaseline {
             body: baseline.dynamic_context.clone(),

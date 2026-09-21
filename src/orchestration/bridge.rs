@@ -62,6 +62,7 @@ impl<'a> BridgeContext<'a> {
         let started = Instant::now();
         let outcome = match event {
             "chat.message" | "chat-message" => self.chat_message(payload),
+            "session.prompt" => self.session_prompt(payload),
             "session.context" => self.session_context(payload),
             "tool.execute.before" | "tool.execute.before/task" | "task-before" => {
                 self.tool_before(payload)
@@ -127,6 +128,48 @@ impl<'a> BridgeContext<'a> {
         }
     }
 
+    /// `session.prompt` (OpenCode V2 prompt admission): a genuinely admitted
+    /// user prompt. This is the *only* bridge event that may establish or
+    /// reset the session's task identity. Runtime-generated synthetic
+    /// user-role messages (interruption/resume continuations and similar)
+    /// never pass through OpenCode's prompt admission, so they never reach
+    /// this handler and can never reset task-scoped state.
+    fn session_prompt(&self, payload: &Value) -> BridgeOutcome {
+        let session_id = session_id(payload);
+        let text = payload
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if text.trim().is_empty() {
+            return BridgeOutcome {
+                value: json!({"ok": false, "error": "empty session.prompt payload"}),
+                metrics: OrchestrationMetrics::default(),
+                outcome: Outcome::Unknown,
+                role: Some(Role::Lead.as_str().to_string()),
+                session_id: Some(session_id),
+                task_type: "orchestration".to_string(),
+            };
+        }
+        match self.controller.admit_user_task(&session_id, &text) {
+            Ok(admission) => BridgeOutcome {
+                value: json!({
+                    "ok": true,
+                    "event": "session.prompt",
+                    "session_id": admission.session_id,
+                    "task_id": admission.task_id,
+                    "changed": admission.changed,
+                }),
+                metrics: OrchestrationMetrics::default(),
+                outcome: Outcome::Success,
+                role: Some(Role::Lead.as_str().to_string()),
+                session_id: Some(admission.session_id),
+                task_type: "orchestration".to_string(),
+            },
+            Err(error) => self.error_outcome(error.to_string(), Some(Role::Lead), Some(session_id)),
+        }
+    }
+
     /// `session.context` (OpenCode V2 model dispatch): supply the current
     /// session repository baseline for one root-Lead request. Unlike the V1
     /// `chat.message` path, the full baseline is returned on *every* dispatch —
@@ -134,17 +177,14 @@ impl<'a> BridgeContext<'a> {
     /// which is never persisted, so nothing accumulates in the conversation
     /// history. `cached` only reports that baseline computation was reused; it
     /// never suppresses inclusion.
+    ///
+    /// Dispatch-time conversation content is never a task signal here: task
+    /// identity is owned by `session.prompt` admission. A tool-driven
+    /// continuation or a synthetic user-role message must not reset
+    /// task-scoped state, so a `text` field in the payload is ignored.
     fn session_context(&self, payload: &Value) -> BridgeOutcome {
         let session_id = session_id(payload);
-        // `text` is the latest user message text when the adapter could
-        // extract one; it drives task-reset bookkeeping only. An absent or
-        // empty text is not an error here: the dispatch must still be served.
-        let text = payload
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        match self.controller.prepare_model_context(&session_id, &text) {
+        match self.controller.prepare_model_context(&session_id) {
             Ok(context) => BridgeOutcome {
                 value: json!({
                     "ok": true,
