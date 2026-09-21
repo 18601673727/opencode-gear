@@ -343,11 +343,18 @@ impl<'a> Controller<'a> {
         let session_key = state::safe_id(session_id);
         let task_id = Self::task_id(message);
         let mut loaded = state::load(&self.root);
-        let mut session = match loaded.state.session(&session_key).cloned() {
+        let existing = loaded.state.session(&session_key).cloned();
+        let mut session = match existing {
             Some(session) if session.task_id == task_id => session,
-            _ => {
+            previous => {
+                // A new task resets task-scoped state (findings, retries,
+                // checkpoints), but the repository snapshot identity is
+                // per-session: an unchanged snapshot must not be re-injected
+                // just because the user phrased a follow-up differently.
+                let last_snapshot_id = previous.and_then(|session| session.last_snapshot_id);
                 let mut fresh = SessionState::new(&session_key, &task_id, now);
                 fresh.task = Some(Self::stored_task_text(message));
+                fresh.last_snapshot_id = last_snapshot_id;
                 fresh
             }
         };

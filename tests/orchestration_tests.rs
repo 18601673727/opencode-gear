@@ -1556,3 +1556,28 @@ fn worker_handoff_is_not_suppressed_by_lead_snapshot_deduplication() {
     assert_eq!(other_lead["cached"], json!(false));
     assert!(!other_lead["context"].as_str().unwrap().is_empty());
 }
+
+/// A differently phrased follow-up is a new task id but the same effective
+/// repository snapshot, so the per-session identity is preserved across the
+/// task reset and the snapshot is not re-appended.
+#[test]
+fn lead_context_snapshot_dedup_survives_a_new_task_message() {
+    let dir = tempfile::tempdir().unwrap();
+    // An empty repository keeps the rendered snapshot body stable across
+    // messages, isolating the per-session identity from task-aware ranking.
+    let git = FakeGitHost::new();
+    let clock = FixedClock::new(1_000);
+    let controller = lead_controller(dir.path(), &git, &clock);
+    let runner = FakeCaptureRunner::new();
+    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+
+    let first = dispatch_chat(&bridge, "lead-1", "first task");
+    assert_eq!(first["cached"], json!(false));
+    let first_id = first["snapshot_id"].as_str().unwrap().to_string();
+
+    let second = dispatch_chat(&bridge, "lead-1", "a differently phrased follow-up task");
+    assert_ne!(second["task_id"], first["task_id"]);
+    assert_eq!(second["cached"], json!(true));
+    assert_eq!(second["context"], json!(""));
+    assert_eq!(second["snapshot_id"], json!(first_id));
+}
