@@ -7,7 +7,7 @@ use common::{write_yaml, TestDir};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
 
 fn base_command(cwd: &Path, work: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ocg"));
@@ -31,13 +31,6 @@ fn base_command(cwd: &Path, work: &Path) -> Command {
         .env_remove("OPENCODE_GEAR_API_BASE")
         .env_remove("OPENCODE_GEAR_CACHE_DIR");
     command
-}
-
-fn run(cwd: &Path, work: &Path, args: &[&str]) -> Output {
-    base_command(cwd, work)
-        .args(args)
-        .output()
-        .expect("run ocg")
 }
 
 fn bridge(cwd: &Path, work: &Path, event: &str, payload: &Value) -> Value {
@@ -69,6 +62,25 @@ fn project(dir: &TestDir) -> std::path::PathBuf {
     project
 }
 
+/// A fake `opencode` reporting a fixed version, so runtime-facing config
+/// output resolves a deterministic runtime family regardless of whatever
+/// OpenCode the host happens to have installed.
+#[cfg(unix)]
+fn fake_runtime(dir: &TestDir, name: &str, version: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join(name);
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo {version}; exit 0; fi\nexit 0\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+#[cfg(unix)]
 #[test]
 fn enabled_build_injects_plugin_and_preserves_user_plugins() {
     let dir = TestDir::new();
@@ -77,7 +89,14 @@ fn enabled_build_injects_plugin_and_preserves_user_plugins() {
         &project.join(".opencode-gear.yaml"),
         &json!({"opencode": {"plugin": ["my-user-plugin"]}}),
     );
-    let output = run(&project, dir.path(), &["build", "--pretty"]);
+    // The V1 contract: the generated local adapter is injected as a file://
+    // entry in the singular `plugin` array.
+    let runtime = fake_runtime(&dir, "fake-opencode-v1", "1.18.31");
+    let output = base_command(&project, dir.path())
+        .env("OPENCODE_GEAR_OPENCODE", &runtime)
+        .args(["build", "--pretty"])
+        .output()
+        .expect("run ocg");
     assert!(
         output.status.success(),
         "{}",
@@ -95,12 +114,15 @@ fn enabled_build_injects_plugin_and_preserves_user_plugins() {
         .any(|name| name.ends_with("ocg-orchestration.js") && name.starts_with("file://")));
 }
 
+#[cfg(unix)]
 #[test]
 fn disabled_orchestration_emits_no_plugin() {
     let dir = TestDir::new();
     let project = project(&dir);
+    let runtime = fake_runtime(&dir, "fake-opencode-v1", "1.18.31");
     let output = base_command(&project, dir.path())
         .env("OPENCODE_GEAR_ORCHESTRATION", "0")
+        .env("OPENCODE_GEAR_OPENCODE", &runtime)
         .args(["build"])
         .output()
         .unwrap();

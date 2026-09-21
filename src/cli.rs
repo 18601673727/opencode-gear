@@ -583,7 +583,12 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
     );
 
     if cli.dry_run {
-        let resolved = build::build_opencode_config(&effective, &level).map_err(Failure::Gear)?;
+        // Runtime-facing output: a dry-run must print the same contract a real
+        // launch would use, so the runtime family is resolved exactly like
+        // launch/doctor/models resolve it.
+        let adapter = config_output_adapter(&project_root, &effective, &env)?;
+        let resolved =
+            build::build_opencode_config_for(&effective, &level, adapter).map_err(Failure::Gear)?;
         print_config(&resolved, cli.pretty)?;
         return Ok(0);
     }
@@ -650,6 +655,9 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
                 }
                 return Ok(1);
             }
+            // Static contract check: validation is deliberately runtime-free
+            // and exercises the deterministic v1 builder. It never probes a
+            // runtime, so `validate` stays fast, offline and reproducible.
             build::build_opencode_config(&effective, &level).map_err(Failure::Gear)?;
             println!("configuration is valid");
             Ok(0)
@@ -660,8 +668,11 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
         }
         Command::Init => init_command(&invocation_dir),
         Command::Build => {
-            let resolved =
-                build::build_opencode_config(&effective, &level).map_err(Failure::Gear)?;
+            // Runtime-facing output, like `--dry-run`: follow the detected
+            // runtime family rather than hard-coding the v1 contract.
+            let adapter = config_output_adapter(&project_root, &effective, &env)?;
+            let resolved = build::build_opencode_config_for(&effective, &level, adapter)
+                .map_err(Failure::Gear)?;
             print_config(&resolved, cli.pretty)?;
             Ok(0)
         }
@@ -1118,6 +1129,38 @@ fn resolve_adapter(version: Option<&Version>) -> crate::error::Result<&'static d
 /// not spawn `scutil`.
 fn resolve_proxy(disable: bool) -> ProxySelection {
     crate::proxy::resolve(disable, &crate::proxy::SystemProxyEnv, &SystemStaticProxy)
+}
+
+/// Resolve the runtime family for the config-output commands (`--dry-run` and
+/// `build`).
+///
+/// Those commands print the very config a real launch would use, so they must
+/// agree with launch/doctor/models on the runtime family. Resolution is
+/// read-only: it never installs, upgrades or touches the network (unlike
+/// doctor, no proxy env is applied — with `NoHttp` nothing can reach a socket,
+/// and `resolve_for_report` only probes a local binary). A broken
+/// explicit runtime override is authoritative and fails, exactly like a launch.
+/// A genuinely absent runtime keeps the historical v1 contract so the
+/// deterministic v1 output is not regressed on machines without OpenCode.
+fn config_output_adapter(
+    project_root: &Path,
+    effective: &config::Effective,
+    env: &Env,
+) -> std::result::Result<&'static dyn RuntimeAdapter, Failure> {
+    let clock = SystemClock;
+    let process = SystemProcessHost;
+    let manager = runtime_manager(project_root, effective, env, &NoHttp, &clock, &process)
+        .map_err(Failure::Gear)?;
+    let report = manager.resolve_for_report();
+    for warning in &report.warnings {
+        eprintln!("ocg: warning: {warning}");
+    }
+    if report.version.is_none() {
+        if let Some(error) = &report.error {
+            return Err(Failure::Gear(GearError::config(error.clone())));
+        }
+    }
+    resolve_adapter(report.version.as_ref()).map_err(Failure::Gear)
 }
 
 /// Materialize the generated plugin and export the exact bridge environment.

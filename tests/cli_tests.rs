@@ -172,6 +172,162 @@ fn consumer_routing_is_independent_of_throttle() {
     );
 }
 
+/// Runtime-facing config output (`--dry-run`, `build`) must follow the
+/// detected runtime family, agreeing with a real launch: V1 emits the V1
+/// contract (a `file://` local plugin entry and `task` delegation keys), V2
+/// emits the V2 contract (local discovery via OPENCODE_CONFIG_DIR, no
+/// `file://` entry, `subagent` delegation keys).
+#[cfg(unix)]
+#[test]
+fn dry_run_and_build_follow_the_detected_runtime_family() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TestDir::new();
+    let project = dir.project();
+    let project_arg = project.to_string_lossy().into_owned();
+
+    for (version, is_v2) in [("1.18.31", false), ("2.0.11", true)] {
+        let script = dir.join(&format!("fake-opencode-{version}"));
+        fs::write(
+            &script,
+            format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo {version}; exit 0; fi\nexit 0\n"),
+        )
+        .expect("write script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        for args in [
+            vec!["--project", project_arg.as_str(), "--dry-run"],
+            vec!["--project", project_arg.as_str(), "build"],
+        ] {
+            let output = base_command(dir.path(), dir.path())
+                .env("OPENCODE_GEAR_OPENCODE", &script)
+                .args(&args)
+                .output()
+                .expect("run ocg");
+            assert!(
+                output.status.success(),
+                "{version} {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let config = stdout_json(&output);
+
+            let plugins: Vec<String> = config
+                .get("plugin")
+                .and_then(Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|value| value.as_str().unwrap_or_default().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let has_local_uri = plugins.iter().any(|entry| {
+                entry.starts_with("file://") && entry.ends_with("ocg-orchestration.js")
+            });
+            let lead_permission = &config["agent"]["lead-low"]["permission"];
+
+            if is_v2 {
+                // The V2 runtime discovers the local adapter through
+                // OPENCODE_CONFIG_DIR/plugins; a V1-style file:// entry in the
+                // package plugin array is the confirmed dry-run defect.
+                assert!(
+                    !has_local_uri,
+                    "{version} {args:?}: V2 output must not emit the V1 file:// plugin contract: {plugins:?}"
+                );
+                assert!(
+                    lead_permission.get("subagent").is_some(),
+                    "{version} {args:?}"
+                );
+                assert!(lead_permission.get("task").is_none(), "{version} {args:?}");
+            } else {
+                assert!(
+                    has_local_uri,
+                    "{version} {args:?}: V1 output must inject the file:// plugin: {plugins:?}"
+                );
+                assert!(
+                    plugins
+                        .iter()
+                        .any(|entry| entry.contains("/orchestration/plugin/")),
+                    "{version} {args:?}: the V1 URI must point at the V1 plugin dir: {plugins:?}"
+                );
+                assert!(lead_permission.get("task").is_some(), "{version} {args:?}");
+                assert!(
+                    lead_permission.get("subagent").is_none(),
+                    "{version} {args:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A broken explicit runtime override is authoritative for config output too:
+/// `--dry-run` and `build` must fail exactly like a launch instead of silently
+/// falling back to another family.
+#[cfg(unix)]
+#[test]
+fn dry_run_and_build_fail_on_a_broken_explicit_runtime() {
+    let dir = TestDir::new();
+    for args in [["--dry-run"].as_slice(), ["build"].as_slice()] {
+        let output = base_command(dir.path(), dir.path())
+            .env("OPENCODE_GEAR_OPENCODE", "/definitely/not/here/opencode")
+            .args(args)
+            .output()
+            .expect("run ocg");
+        assert!(!output.status.success(), "{args:?} must fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("explicit"),
+            "{args:?}: the broken override must be reported: {stderr}"
+        );
+    }
+}
+
+/// With no runtime anywhere, config output keeps the deterministic historical
+/// v1 contract (a real launch would bootstrap, but dry-run/build are
+/// read-only) and says so on stderr.
+#[cfg(unix)]
+#[test]
+fn dry_run_without_any_runtime_keeps_the_v1_contract_with_a_warning() {
+    let dir = TestDir::new();
+    let empty_bin = dir.join("empty-bin");
+    fs::create_dir_all(&empty_bin).expect("create empty bin");
+
+    let output = base_command(dir.path(), dir.path())
+        .env("PATH", &empty_bin)
+        .arg("--dry-run")
+        .output()
+        .expect("run ocg");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not determine the OpenCode version"),
+        "the v1 fallback must be announced: {stderr}"
+    );
+    let config = stdout_json(&output);
+    let plugins: Vec<String> = config["plugin"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|value| value.as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        plugins
+            .iter()
+            .any(|entry| entry.starts_with("file://") && entry.ends_with("ocg-orchestration.js")),
+        "the deterministic v1 contract must inject the file:// plugin: {plugins:?}"
+    );
+    assert!(config["agent"]["lead-low"]["permission"]
+        .get("task")
+        .is_some());
+}
+
 #[test]
 fn report_subcommands() {
     let dir = TestDir::new();
@@ -511,7 +667,11 @@ fn dry_run_effective_config_matches_the_runtime_bridge_contract() {
             String::from_utf8_lossy(&launch.stderr)
         );
 
+        // Pin the same runtime for the dry-run so both sides resolve the same
+        // runtime family: the contract under test is "dry-run output equals
+        // what the launch hands the runtime", not host-runtime detection.
         let dry = base_command(dir.path(), dir.path())
+            .env("OPENCODE_GEAR_OPENCODE_BIN", &script)
             .args(["--project", &project_arg, "--throttle", level, "--dry-run"])
             .output()
             .expect("dry-run");

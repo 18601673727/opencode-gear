@@ -495,6 +495,132 @@ fn v2_plugin_contract_uses_local_discovery_and_subagent_tool() {
     assert!(!source.contains("enforceLeadContract"));
 }
 
+/// Every file under a directory, recursively.
+fn files_under(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut result = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                result.push(path);
+            }
+        }
+    }
+    result.sort();
+    result
+}
+
+/// The exact VM-observed failure: a V1 plugin artifact exists, then a V2
+/// launch/config materialization occurs, and OpenCode 2 discovers the stale V1
+/// adapter through a shared config root. The V2 config dir is dedicated, so the
+/// runtime-visible plugin namespace must contain only a valid V2 plugin, and
+/// legacy generated artifacts from earlier layouts must be migrated away.
+#[test]
+fn v2_materialization_never_exposes_v1_or_legacy_artifacts_to_the_runtime() {
+    use opencode_gear::orchestration::plugin;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let state = opencode_gear::orchestration::state::state_dir(root);
+
+    // A V1 launch materialized the V1 adapter at its own path.
+    plugin::materialize(root).unwrap();
+    // Legacy generated artifacts from earlier 0.3.0 builds: one sharing the V1
+    // state root (holding V1 bytes — the observed collision) and one from a
+    // double-applied orchestration state path.
+    let legacy_shared = state.join("plugins");
+    let legacy_nested = state.join("orchestration").join("plugins");
+    fs::create_dir_all(&legacy_shared).unwrap();
+    fs::create_dir_all(&legacy_nested).unwrap();
+    fs::write(
+        legacy_shared.join("ocg-orchestration.js"),
+        plugin::plugin_source(),
+    )
+    .unwrap();
+    fs::write(
+        legacy_nested.join("ocg-orchestration.js"),
+        plugin::v2_plugin_source(),
+    )
+    .unwrap();
+
+    // A V2 launch/config materialization occurs.
+    let path = plugin::materialize_v2_with(root, plugin::v2_plugin_source()).unwrap();
+    assert_eq!(path, plugin::v2_plugin_path(root));
+
+    // The runtime-visible plugin namespace (everything OpenCode 2 can discover
+    // under OPENCODE_CONFIG_DIR) contains exactly one file: the valid V2
+    // adapter. No V1 artifact, no legacy artifact.
+    let config_dir = plugin::v2_config_dir(root);
+    assert_eq!(
+        path.parent().unwrap().parent().unwrap(),
+        config_dir,
+        "the adapter must live at <config dir>/plugins/"
+    );
+    let discovered = files_under(&config_dir);
+    assert_eq!(discovered, vec![path.clone()], "V2 discovered namespace");
+    let source = fs::read_to_string(&path).unwrap();
+    assert_eq!(source, plugin::v2_plugin_source());
+    assert!(source.contains("export default {"));
+    assert!(source.contains("id: \"opencode-gear-orchestration\""));
+    assert!(!source.contains("export const server"));
+
+    // The V1 config root is not inside (or equal to) the V2 config root, so a
+    // V2 runtime can never reach the V1 adapter through local discovery.
+    assert!(!config_dir.join("plugin").exists());
+    assert_ne!(config_dir, state);
+
+    // Legacy generated artifacts are migrated away, directories included.
+    assert!(!state.join("plugins").exists());
+    assert!(!state.join("orchestration").exists());
+
+    // The V1 artifact is untouched and still satisfies a V1 launch.
+    assert_eq!(
+        fs::read_to_string(plugin::plugin_path(root)).unwrap(),
+        plugin::plugin_source()
+    );
+}
+
+/// Legacy cleanup is scoped to OCG-generated files: a user-owned file at a
+/// legacy location is never deleted, and its directory is never pruned.
+#[test]
+fn v2_legacy_migration_preserves_user_owned_files() {
+    use opencode_gear::orchestration::plugin;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let state = opencode_gear::orchestration::state::state_dir(root);
+    let legacy_shared = state.join("plugins");
+    fs::create_dir_all(&legacy_shared).unwrap();
+    let user_file = legacy_shared.join("ocg-orchestration.js");
+    fs::write(
+        &user_file,
+        "// hand-written by the user\nexport default {};\n",
+    )
+    .unwrap();
+    let sibling = legacy_shared.join("user-notes.txt");
+    fs::write(&sibling, "keep me\n").unwrap();
+
+    plugin::materialize_v2_with(root, plugin::v2_plugin_source()).unwrap();
+
+    assert!(user_file.is_file(), "user-owned file must survive");
+    assert_eq!(
+        fs::read_to_string(&user_file).unwrap(),
+        "// hand-written by the user\nexport default {};\n"
+    );
+    assert!(sibling.is_file());
+    // The dedicated V2 config root is unaffected by the legacy directory.
+    assert_eq!(
+        files_under(&plugin::v2_config_dir(root)),
+        vec![plugin::v2_plugin_path(root)]
+    );
+}
+
 #[test]
 fn secret_shaped_task_never_enters_handoff_or_telemetry() {
     let dir = tempfile::tempdir().unwrap();

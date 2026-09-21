@@ -168,7 +168,11 @@ runtime/common contract
 - **V2 config and plugins are owned together.** The 2.0.11 singular `provider`,
   `agent`, and package `plugin` surfaces, plus `enabled_providers` and
   `small_model`, are preserved. The generated local adapter is discovered from
-  `OPENCODE_CONFIG_DIR/plugins`, rather than injected as a file URI. A missing
+  `OPENCODE_CONFIG_DIR/plugins`, rather than injected as a file URI. The config
+  dir is a dedicated `.opencode-gear/orchestration/v2-config` root, isolated
+  from the V1 `plugin/` state, so a V2 runtime can never discover a stale V1
+  adapter; legacy generated artifacts from earlier layouts are migrated away
+  on materialization. A missing
   variant is provider-default, never a serialized `"provider-default"`; an
   overlay changing a model clears an inherited variant while an unchanged model
   retains it.

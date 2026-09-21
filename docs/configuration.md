@@ -505,8 +505,12 @@ ocg upgrade  (self-update Gear, then maintain OpenCode)
 ```
 
 `build` (and `--dry-run`) prints the merged OpenCode config consumed through
-`OPENCODE_CONFIG_CONTENT`. `validate` exits non-zero on any configuration
-error and prints every problem it finds.
+`OPENCODE_CONFIG_CONTENT`. Both follow the detected runtime family, so their
+output matches what a real launch on that runtime would use (read-only
+resolution; an absent runtime keeps the deterministic v1 contract). `validate`
+exits non-zero on any configuration
+error and prints every problem it finds; it is a static check and exercises the
+runtime-independent v1 builder without probing any runtime.
 
 ## Observability
 
