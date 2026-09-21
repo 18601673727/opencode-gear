@@ -67,6 +67,11 @@ pub struct ContextIndex {
     /// True when the map/index is incomplete because of the repository cap.
     #[serde(default)]
     pub truncated: bool,
+    /// A deterministic identity of the indexed repository content. It changes
+    /// only when the indexed files, the repo root, the engine or the schema
+    /// changes, never because the current task wording changed.
+    #[serde(default)]
+    pub generation_id: String,
 }
 
 impl ContextIndex {
@@ -180,6 +185,9 @@ pub struct IndexReport {
     pub metrics: IndexMetrics,
     pub changed_paths: Vec<String>,
     pub written: bool,
+    /// A deterministic identity of the indexed repository content that produced
+    /// this report. Independent of the current task or ranking.
+    pub generation_id: String,
 }
 
 /// `<project>/.opencode-gear/index`.
@@ -337,6 +345,13 @@ pub fn update(
     metrics.truncated = map.truncated;
 
     let repo_id_value = repo_id(root, &map.git);
+    let generation_id_value = generation_id(
+        &repo_id_value,
+        crate::context::freshness::ENGINE_VERSION,
+        crate::context::freshness::SCHEMA_VERSION,
+        map.truncated,
+        &files,
+    );
     // Metrics describe *this* update, not the indexed content, so they must not
     // make an otherwise identical index look changed.
     let same_as_previous = previous
@@ -354,6 +369,8 @@ pub fn update(
         now
     };
 
+    let written = !same_as_previous;
+
     let index = ContextIndex {
         schema_version: crate::context::freshness::SCHEMA_VERSION,
         engine_version: crate::context::freshness::ENGINE_VERSION.to_string(),
@@ -363,8 +380,8 @@ pub fn update(
         files,
         metrics: metrics.clone(),
         truncated: map.truncated,
+        generation_id: generation_id_value.clone(),
     };
-    let written = !same_as_previous;
     if written {
         save(root, &index)?;
     }
@@ -374,8 +391,53 @@ pub fn update(
             metrics,
             changed_paths,
             written,
+            generation_id: generation_id_value,
         },
     ))
+}
+
+/// A deterministic identity for the indexed repository content.
+///
+/// It is independent of the current task, the ranked projection or any
+/// per-turn state. It changes only when the repo root, the engine/schema
+/// version, the truncated flag or the indexed file contents change.
+pub fn generation_id(
+    repo_id: &str,
+    engine_version: &str,
+    schema_version: u32,
+    truncated: bool,
+    files: &[IndexFile],
+) -> String {
+    let mut material = String::new();
+    material.push_str(repo_id);
+    material.push('|');
+    material.push_str(engine_version);
+    material.push('|');
+    material.push_str(&schema_version.to_string());
+    material.push('|');
+    material.push_str(if truncated { "1" } else { "0" });
+    for file in files {
+        material.push('|');
+        material.push_str(&file.path);
+        material.push(',');
+        material.push_str(&file.fingerprint);
+        material.push(',');
+        material.push_str(&file.size.to_string());
+        material.push(',');
+        material.push_str(if file.supported { "1" } else { "0" });
+        material.push(',');
+        material.push_str(if file.excluded { "1" } else { "0" });
+        material.push(',');
+        material.push_str(if file.binary { "1" } else { "0" });
+        material.push(',');
+        material.push_str(if file.huge { "1" } else { "0" });
+        material.push(',');
+        material.push_str(&file.symbols.len().to_string());
+    }
+    format!(
+        "sha256:{}",
+        crate::runtime::hash::sha256_hex(material.as_bytes())
+    )
 }
 
 /// A stable repository identity: the canonical root path plus, when known, the
@@ -482,6 +544,7 @@ mod tests {
             files: vec![],
             metrics: Default::default(),
             truncated: false,
+            generation_id: String::new(),
         };
         index.files.push(IndexFile {
             path: "src/a.rs".to_string(),

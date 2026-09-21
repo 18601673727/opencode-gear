@@ -755,6 +755,7 @@ mod tests {
                 .collect(),
             metrics: Default::default(),
             truncated: false,
+            generation_id: String::new(),
         }
     }
 

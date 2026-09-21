@@ -52,9 +52,11 @@ pub const EXPLORE_RESPONSE_CONTRACT: &str = "\nExplore response contract (adviso
 
 /// The dynamic context prepared for an ordinary user message.
 ///
-/// `snapshot_id` is a deterministic identity of the *repository* snapshot
-/// (everything in `dynamic_context` except the current user message). It is
-/// what the bridge uses to deduplicate across turns; the metadata fields are
+/// `snapshot_id` is the deterministic identity of the *session repository
+/// baseline*. It is derived from indexed repository content (repo root,
+/// engine/schema version and file fingerprints), not from the current task or
+/// ranked projection. The bridge uses it to decide whether the full baseline
+/// has already been injected in this session. The metadata fields are
 /// conservative estimates for presentation only, never provider billing.
 #[derive(Debug, Clone)]
 pub struct LeadContext {
@@ -74,6 +76,49 @@ pub struct LeadContext {
     pub symbol_count: usize,
     pub goal: Option<String>,
     pub metrics: OrchestrationMetrics,
+    /// Whether the full repository baseline was suppressed because it was
+    /// already injected in this session for the current repository generation.
+    pub cached: bool,
+}
+
+/// The rendered session repository baseline for one turn.
+///
+/// `identity` is what the session deduplicates on: the task-independent
+/// repository generation when a reliable signal exists, otherwise the
+/// projection identity of the rendered body (a safe degrade that still
+/// deduplicates identical renderings).
+struct RenderedBaseline {
+    dynamic_context: String,
+    identity: String,
+    bytes: usize,
+    file_count: usize,
+    symbol_count: usize,
+    goal: Option<String>,
+    rich_bytes: usize,
+    metrics: OrchestrationMetrics,
+}
+
+impl RenderedBaseline {
+    /// The baseline is suppressed because its identity was already injected in
+    /// this session: no context, no presentation metadata, no accounting.
+    fn cached(identity: String) -> Self {
+        Self {
+            dynamic_context: String::new(),
+            identity,
+            bytes: 0,
+            file_count: 0,
+            symbol_count: 0,
+            goal: None,
+            rich_bytes: 0,
+            metrics: OrchestrationMetrics {
+                phase: Some(OrchestrationPhase::Idle.as_str().to_string()),
+                source: Some(Role::Lead.as_str().to_string()),
+                destination: Some(Role::Lead.as_str().to_string()),
+                model_dynamic_context_bytes: 0,
+                ..OrchestrationMetrics::default()
+            },
+        }
+    }
 }
 
 /// A role hand-off projected for a delegation.
@@ -217,6 +262,23 @@ impl<'a> Controller<'a> {
         self.config.enabled && self.context.enabled
     }
 
+    /// The deterministic identity of the current indexed repository content.
+    ///
+    /// It is independent of the current task, ranked files or symbols. It
+    /// changes only when the repo root, engine/schema version, truncation state
+    /// or indexed file contents change. Returns `None` when context is disabled
+    /// or when the generation signal cannot be produced, in which case the
+    /// caller should fall back to the projection-identity path.
+    fn repository_generation_id(&self) -> Result<Option<String>> {
+        if !self.context_enabled() {
+            return Ok(None);
+        }
+        match self.engine().prepare() {
+            Ok(prepared) => Ok(Some(prepared.index_report.generation_id)),
+            Err(_) => Ok(None),
+        }
+    }
+
     /// A stable, non-reversible task id. Raw task text is never part of it.
     pub fn task_id(task: &str) -> String {
         crate::telemetry::Event::hashed_task_id(&format!("orchestration|{task}"))
@@ -348,13 +410,13 @@ impl<'a> Controller<'a> {
             Some(session) if session.task_id == task_id => session,
             previous => {
                 // A new task resets task-scoped state (findings, retries,
-                // checkpoints), but the repository snapshot identity is
-                // per-session: an unchanged snapshot must not be re-injected
-                // just because the user phrased a follow-up differently.
-                let last_snapshot_id = previous.and_then(|session| session.last_snapshot_id);
+                // checkpoints), but the repository baseline identity is session-
+                // scoped and derived from indexed content, not the task wording.
+                let generation_id =
+                    previous.and_then(|session| session.repository_generation_id.clone());
                 let mut fresh = SessionState::new(&session_key, &task_id, now);
                 fresh.task = Some(Self::stored_task_text(message));
-                fresh.last_snapshot_id = last_snapshot_id;
+                fresh.repository_generation_id = generation_id;
                 fresh
             }
         };
@@ -367,39 +429,94 @@ impl<'a> Controller<'a> {
             session.task = Some(Self::stored_task_text(message));
         }
 
+        // Ensure the OCG gitignore exists before computing the repository
+        // generation. `.gitignore` is an indexed file: a later append by the
+        // index or cache writers would otherwise look like a repository change
+        // and trigger an unnecessary baseline refresh.
+        crate::runtime::install::ensure_gitignore(&self.root)?;
+
+        // The session repository baseline is keyed by the repository
+        // generation, a task-independent identity of the indexed content. A
+        // task or ranking change therefore never re-appends the baseline;
+        // only a real repository generation change does.
+        let generation = self.repository_generation_id()?;
+        let (baseline, cached) = match generation.as_deref() {
+            Some(id) if session.repository_generation_id.as_deref() == Some(id) => {
+                (RenderedBaseline::cached(id.to_string()), true)
+            }
+            _ => (
+                self.render_session_baseline(&session, message, generation.as_deref()),
+                false,
+            ),
+        };
+
+        if !cached {
+            session.repository_generation_id = Some(baseline.identity.clone());
+            session.last_rich_bytes = baseline.rich_bytes;
+        }
+        session.updated_at = now;
+        loaded.state.upsert(session.clone(), now);
+        let _ = state::save(&self.root, &loaded.state);
+
+        Ok(LeadContext {
+            session_id: session_key,
+            task_id,
+            estimated_tokens: baseline.bytes / 4,
+            bytes: baseline.bytes,
+            dynamic_context: baseline.dynamic_context,
+            snapshot_id: baseline.identity,
+            file_count: baseline.file_count,
+            symbol_count: baseline.symbol_count,
+            goal: baseline.goal,
+            metrics: baseline.metrics,
+            cached,
+        })
+    }
+
+    /// Render the full session repository baseline for `message`.
+    ///
+    /// `generation` is the task-independent repository identity when a reliable
+    /// signal exists. Without one (context disabled or preparation failed) the
+    /// identity falls back to the projection identity of the rendered body:
+    /// identical renderings still deduplicate, while a different task may
+    /// re-inject, which is the safe degrade when no generation signal exists.
+    fn render_session_baseline(
+        &self,
+        session: &SessionState,
+        message: &str,
+        generation: Option<&str>,
+    ) -> RenderedBaseline {
         let (plan, warnings) = self.plan(message, Some("lead"));
-        let input = self.build_input(&session, plan.as_ref(), message);
+        let input = self.build_input(session, plan.as_ref(), message);
         let (input, omitted) = projection::sanitize(&input);
         let file_count = input.files.len();
         let symbol_count = input.symbols.len();
-        // The repository snapshot excludes the current user message so the same
-        // effective repository context yields the same identity across turns.
-        // `render_lead_snapshot` renders everything except the `task:` line.
+        let rich_bytes = input.rich_bytes();
+        // The repository snapshot excludes the current user message so the
+        // same effective repository context yields the same projection body;
+        // the baseline identity is the repository generation, which is
+        // independent of the task.
         let mut snapshot = self.render_lead_snapshot(&input);
         snapshot.push_str(&render_warnings(&warnings));
         snapshot.push_str(&render_warnings(&omitted));
         snapshot.push_str(&self.render_source_slices(&input.slices));
-        let snapshot_id = snapshot_identity(&snapshot);
+        let identity = generation
+            .map(str::to_string)
+            .unwrap_or_else(|| snapshot_identity(&snapshot));
         let mut dynamic = self.render_lead_header(&input);
         dynamic.push_str(&snapshot);
         let bytes = dynamic.len();
-        let estimated_tokens = bytes / 4;
-
-        session.last_rich_bytes = input.rich_bytes();
-        session.updated_at = now;
-        loaded.state.upsert(session.clone(), now);
-        let _ = state::save(&self.root, &loaded.state);
 
         let metrics = OrchestrationMetrics {
             phase: Some(OrchestrationPhase::Idle.as_str().to_string()),
             source: Some(Role::Lead.as_str().to_string()),
             destination: Some(Role::Lead.as_str().to_string()),
-            rich_capsule_bytes: input.rich_bytes() as u64,
+            rich_capsule_bytes: rich_bytes as u64,
             handoff_capsule_bytes: 0,
             selected_source_bytes: input.selected_source_bytes() as u64,
             diff_context_bytes: input.diff_context_bytes() as u64,
             verification_context_bytes: input.verification_context_bytes() as u64,
-            model_dynamic_context_bytes: dynamic.len() as u64,
+            model_dynamic_context_bytes: bytes as u64,
             cache_hits: usize::from(
                 plan.as_ref()
                     .map(|outcome| outcome.from_cache)
@@ -411,18 +528,17 @@ impl<'a> Controller<'a> {
                 .unwrap_or(0),
             ..OrchestrationMetrics::default()
         };
-        Ok(LeadContext {
-            session_id: session_key,
-            task_id,
+
+        RenderedBaseline {
             dynamic_context: dynamic,
-            snapshot_id,
-            estimated_tokens,
+            identity,
             bytes,
             file_count,
             symbol_count,
             goal: input.goal,
+            rich_bytes,
             metrics,
-        })
+        }
     }
 
     /// `tool.execute.before` for `task`: project the typed role hand-off.

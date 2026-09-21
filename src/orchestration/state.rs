@@ -103,12 +103,15 @@ pub struct SessionState {
     /// The most recent bounded, real diff rendering. Reused by Debug hand-offs
     /// so they carry a relevant diff without re-planning.
     pub last_diff_context: String,
-    /// The identity of the last repository context snapshot injected into this
-    /// session. The bridge compares the freshly prepared identity against it so
-    /// an unchanged snapshot is not appended again on a later turn. `None`
-    /// means nothing has been injected yet.
+    /// The identity of the session repository baseline. It is derived from the
+    /// indexed repository content (repo root, engine/schema version and file
+    /// fingerprints), not from the current task or ranked projection. A fresh
+    /// Lead session starts with `None`; after the first baseline injection it
+    /// holds the generation that was injected. A later turn only appends another
+    /// full repository snapshot when this generation differs, which happens only
+    /// when the indexed repository content materially changes.
     #[serde(default)]
-    pub last_snapshot_id: Option<String>,
+    pub repository_generation_id: Option<String>,
     pub updated_at: i64,
 }
 
@@ -136,7 +139,7 @@ impl Default for SessionState {
             attempts: Attempts::default(),
             last_rich_bytes: 0,
             last_diff_context: String::new(),
-            last_snapshot_id: None,
+            repository_generation_id: None,
             updated_at: 0,
         }
     }

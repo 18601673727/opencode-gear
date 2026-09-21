@@ -12,9 +12,8 @@
 //! It is safe for tests to drive with fake payloads and a fake capture runner;
 //! no model or network is involved.
 
-use crate::orchestration::controller::{BuildDecision, Controller, HandoffOutcome, LeadContext};
+use crate::orchestration::controller::{BuildDecision, Controller, HandoffOutcome};
 use crate::orchestration::handoff::Role;
-use crate::orchestration::state::{self, SessionState};
 use crate::process::CaptureRunner;
 use crate::telemetry::{self, Event, OrchestrationMetrics, Outcome, TelemetryConfig};
 use serde_json::{json, Value};
@@ -98,63 +97,30 @@ impl<'a> BridgeContext<'a> {
             };
         }
         match self.controller.prepare_lead_context(&session_id, &text) {
-            Ok(context) => {
-                let cached = self.snapshot_is_cached(&context);
-                BridgeOutcome {
-                    value: json!({
-                        "ok": true,
-                        "event": "chat.message",
-                        "session_id": context.session_id,
-                        "task_id": context.task_id,
-                        // An unchanged repository snapshot is not appended again.
-                        // The plugin treats an empty context as a no-op.
-                        "context": if cached { String::new() } else { context.dynamic_context },
-                        "snapshot_id": context.snapshot_id,
-                        "cached": cached,
-                        "estimated_tokens": context.estimated_tokens,
-                        "bytes": context.bytes,
-                        "file_count": context.file_count,
-                        "symbol_count": context.symbol_count,
-                    }),
-                    metrics: context.metrics,
-                    outcome: Outcome::Success,
-                    role: Some(Role::Lead.as_str().to_string()),
-                    session_id: Some(context.session_id),
-                    task_type: "orchestration".to_string(),
-                }
-            }
+            Ok(context) => BridgeOutcome {
+                value: json!({
+                    "ok": true,
+                    "event": "chat.message",
+                    "session_id": context.session_id,
+                    "task_id": context.task_id,
+                    // An unchanged repository baseline is not appended again.
+                    // The plugin treats an empty context as a no-op.
+                    "context": if context.cached { String::new() } else { context.dynamic_context },
+                    "snapshot_id": context.snapshot_id,
+                    "cached": context.cached,
+                    "estimated_tokens": context.estimated_tokens,
+                    "bytes": context.bytes,
+                    "file_count": context.file_count,
+                    "symbol_count": context.symbol_count,
+                }),
+                metrics: context.metrics,
+                outcome: Outcome::Success,
+                role: Some(Role::Lead.as_str().to_string()),
+                session_id: Some(context.session_id),
+                task_type: "orchestration".to_string(),
+            },
             Err(error) => self.error_outcome(error.to_string(), Some(Role::Lead), Some(session_id)),
         }
-    }
-
-    /// Per-session snapshot deduplication.
-    ///
-    /// Returns `true` when the freshly prepared snapshot identity is already the
-    /// session baseline, so the caller sends no context. Otherwise it records
-    /// the new identity before returning `false`. The identity is persisted in
-    /// the session state, so deduplication survives a plugin or process reload.
-    fn snapshot_is_cached(&self, context: &LeadContext) -> bool {
-        let mut loaded = self.controller.load_state();
-        if loaded
-            .state
-            .session(&context.session_id)
-            .and_then(|session| session.last_snapshot_id.as_deref())
-            == Some(context.snapshot_id.as_str())
-        {
-            return true;
-        }
-        let now = self.controller.now_unix();
-        let mut session = loaded
-            .state
-            .session(&context.session_id)
-            .cloned()
-            .unwrap_or_else(|| SessionState::new(&context.session_id, &context.task_id, now));
-        session.last_snapshot_id = Some(context.snapshot_id.clone());
-        loaded.state.upsert(session, now);
-        if let Err(error) = state::save(self.controller.root(), &loaded.state) {
-            eprintln!("ocg: warning: context snapshot state was not saved: {error}");
-        }
-        false
     }
 
     fn tool_before(&self, payload: &Value) -> BridgeOutcome {

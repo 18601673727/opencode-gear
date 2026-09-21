@@ -1453,14 +1453,17 @@ fn lead_context_snapshot_is_injected_once_and_deduplicated_per_session() {
     );
     assert!(first["file_count"].as_u64().unwrap() > 0);
     assert!(first["symbol_count"].as_u64().unwrap() > 0);
-    // The identity is persisted on the session.
+    // The baseline generation is persisted on the session.
     let session = controller
         .load_state()
         .state
         .session("lead-1")
         .cloned()
         .unwrap();
-    assert_eq!(session.last_snapshot_id.as_deref(), Some(first_id.as_str()));
+    assert_eq!(
+        session.repository_generation_id.as_deref(),
+        Some(first_id.as_str())
+    );
 
     // B. The second prompt with an unchanged repository returns no context.
     let second = dispatch_chat(&bridge, "lead-1", TASK);
@@ -1580,4 +1583,127 @@ fn lead_context_snapshot_dedup_survives_a_new_task_message() {
     assert_eq!(second["cached"], json!(true));
     assert_eq!(second["context"], json!(""));
     assert_eq!(second["snapshot_id"], json!(first_id));
+}
+
+/// A materially different task in the same session must not append another full
+/// repository baseline. Task-aware ranking may differ, but the session baseline
+/// is scoped to the indexed repository generation, not the task wording.
+#[test]
+fn lead_context_snapshot_suppresses_different_task() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let git = FakeGitHost::new();
+    let clock = FixedClock::new(1_000);
+    let controller = lead_controller(dir.path(), &git, &clock);
+    let runner = FakeCaptureRunner::new();
+    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+
+    let first = dispatch_chat(&bridge, "lead-1", "update module_1 parser");
+    assert_eq!(first["cached"], json!(false));
+    assert!(!first["context"].as_str().unwrap().is_empty());
+    let first_id = first["snapshot_id"].as_str().unwrap().to_string();
+
+    let second = dispatch_chat(&bridge, "lead-1", "refactor module_2 helper");
+    assert_ne!(second["task_id"], first["task_id"]);
+    assert_eq!(second["cached"], json!(true));
+    assert_eq!(second["context"], json!(""));
+    assert_eq!(second["snapshot_id"], json!(first_id));
+}
+
+/// Returning to a previously seen task/context still does not append another
+/// full repository baseline (A -> B -> A).
+#[test]
+fn lead_context_snapshot_suppresses_a_b_a() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let git = FakeGitHost::new();
+    let clock = FixedClock::new(1_000);
+    let controller = lead_controller(dir.path(), &git, &clock);
+    let runner = FakeCaptureRunner::new();
+    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+
+    let a = dispatch_chat(&bridge, "lead-1", "update module_1 parser");
+    assert_eq!(a["cached"], json!(false));
+    let baseline = a["snapshot_id"].as_str().unwrap().to_string();
+
+    let b = dispatch_chat(&bridge, "lead-1", "refactor module_2 helper");
+    assert_eq!(b["cached"], json!(true));
+    assert_eq!(b["context"], json!(""));
+
+    let a2 = dispatch_chat(&bridge, "lead-1", "update module_1 parser");
+    assert_eq!(a2["cached"], json!(true));
+    assert_eq!(a2["context"], json!(""));
+    assert_eq!(a2["snapshot_id"], json!(baseline));
+}
+
+/// Four different task-aware projections must produce exactly one persistent
+/// full repository baseline (A -> B -> C -> D).
+#[test]
+fn lead_context_snapshot_suppresses_a_b_c_d() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let git = FakeGitHost::new();
+    let clock = FixedClock::new(1_000);
+    let controller = lead_controller(dir.path(), &git, &clock);
+    let runner = FakeCaptureRunner::new();
+    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+
+    let tasks = [
+        "update module_1 parser",
+        "refactor module_2 helper",
+        "document module_3 logic",
+        "test module_4 behavior",
+    ];
+    let mut baseline: Option<String> = None;
+    for (index, task) in tasks.iter().enumerate() {
+        let result = dispatch_chat(&bridge, "lead-1", task);
+        if index == 0 {
+            assert_eq!(result["cached"], json!(false));
+            assert!(!result["context"].as_str().unwrap().is_empty());
+            baseline = Some(result["snapshot_id"].as_str().unwrap().to_string());
+        } else {
+            assert_eq!(
+                result["cached"],
+                json!(true),
+                "task {task} should reuse baseline"
+            );
+            assert_eq!(result["context"], json!(""));
+            assert_eq!(result["snapshot_id"], json!(baseline.as_ref().unwrap()));
+        }
+    }
+}
+
+/// A trivial third-turn message must not append another full repository
+/// baseline. This is the exact live failure shape that motivated the fix.
+#[test]
+fn lead_context_snapshot_suppresses_trivial_third_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let git = FakeGitHost::new();
+    let clock = FixedClock::new(1_000);
+    let controller = lead_controller(dir.path(), &git, &clock);
+    let runner = FakeCaptureRunner::new();
+    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+
+    let first = dispatch_chat(
+        &bridge,
+        "lead-1",
+        "Use the ocg-explore subagent exactly once.",
+    );
+    assert_eq!(first["cached"], json!(false));
+    assert!(!first["context"].as_str().unwrap().is_empty());
+    let baseline = first["snapshot_id"].as_str().unwrap().to_string();
+
+    let second = dispatch_chat(
+        &bridge,
+        "lead-1",
+        "After the subagent returns, reply with PROJECT=fixture",
+    );
+    assert_eq!(second["cached"], json!(true));
+    assert_eq!(second["context"], json!(""));
+
+    let third = dispatch_chat(&bridge, "lead-1", "Reply with exactly: TURN3_OK");
+    assert_eq!(third["cached"], json!(true));
+    assert_eq!(third["context"], json!(""));
+    assert_eq!(third["snapshot_id"], json!(baseline));
 }
