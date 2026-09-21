@@ -283,19 +283,24 @@ JavaScript (transport only)
   generated config but without loading the local plugin. A definitely missing
   active Lead model blocks launch; probe failure is distinguished from absence
   and remains nonfatal. Doctor reports every Execution Tier and worker route.
-- **No duplicate Lead context.** Only `chat.message` is scoped to the Lead
-  session (the request agent starts with `lead-`); worker subagent sessions
-  and requests with no identifiable agent skip it, while
-  `tool.execute.before/after` remain active everywhere.
-- **One snapshot per session.** The injected repository context carries a
-  deterministic `snapshot_id` (SHA-256 of the rendered repository snapshot,
-  excluding the current user message) plus estimate-only metadata
+- **No duplicate Lead context.** Only the Lead-context hook (`chat.message` on
+  v1, `session.context` on v2) is scoped to the Lead session (the request
+  agent starts with `lead-`); worker subagent sessions and requests with no
+  identifiable agent skip it, while `tool.execute.before/after` remain active
+  everywhere.
+- **One baseline per repository generation.** The repository context carries a
+  deterministic `snapshot_id` (the task-independent repository generation:
+  SHA-256 over the indexed content) plus estimate-only metadata
   (`estimated_tokens` = bytes / 4, `bytes`, `file_count`, `symbol_count`). The
-  bridge records the last injected identity on the session in
-  `.opencode-gear/orchestration/state.json` and returns an empty `context` with
-  `cached: true` when the identity is unchanged, so an unchanged repository
-  snapshot is never appended twice. The adapter treats an empty `context` as a
-  no-op, and a bridge failure is still swallowed.
+  bridge records the injected identity on the session in
+  `.opencode-gear/orchestration/state.json`. On the v1 persisted-prompt path
+  (`chat.message`) an unchanged identity returns an empty `context` with
+  `cached: true`, so an unchanged repository snapshot is never appended twice
+  to the persisted history. On the v2 model-dispatch path (`session.context`)
+  nothing is persisted, so every root-Lead dispatch receives the full baseline
+  again: an unchanged identity reuses the retained rendering (`cached: true`
+  reports the reuse, never an empty context), and only a material repository
+  change re-renders it. A bridge failure is still swallowed.
 - **Typed hand-offs.** The rich `ProjectionInput` (a `TaskCapsule` plus
   selected source slices, a bounded diff summary and an optional verification
   block) is projected into a compact `ModelHandoffCapsule` for exactly one
@@ -329,11 +334,17 @@ JavaScript (transport only)
   the dynamic context; runtime permission enforcement remains OpenCode's job.
 
 > **Refresh policy.** OCG injects the full repository context snapshot on the
-> first Lead prompt of a session. If the effective repository snapshot is
+> first Lead prompt of a session. On OpenCode v1 the snapshot is persisted into
+> the conversation history, so if the effective repository snapshot is
 > unchanged, later prompts in the same session receive no additional repository
-> context. When the snapshot materially changes (for example file edits, new
-> findings or new verification state), the new snapshot is injected on the next
-> prompt and becomes the new session baseline.
+> context. On OpenCode v2 the snapshot is injected at model dispatch into the
+> ephemeral per-request system context, so every root-Lead model call — first
+> turn, later turns and tool-driven continuations alike — receives exactly one
+> current baseline; an unchanged repository reuses the retained rendering
+> rather than re-deriving it from new task wording. On both runtimes, when the
+> snapshot materially changes (for example file edits, new findings or new
+> verification state), the new snapshot is supplied at the next injection point
+> and becomes the new session baseline.
 
 State lives under `.opencode-gear/orchestration/` and the adapter under
 `.opencode-gear/orchestration/plugin/`; both are ignored local state.

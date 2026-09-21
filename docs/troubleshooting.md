@@ -367,8 +367,9 @@ rather than a failed session.
 That is the fail-soft contract. The adapter never surfaces an error into
 OpenCode. Common causes: the `ocg` bridge executable is not on
 `OPENCODE_GEAR_OCG`/`PATH`, the payload was empty, or orchestration is disabled.
-Run `ocg __bridge chat.message --project <dir>` with a JSON payload to test the
-Rust side directly; no model is involved.
+Run `ocg __bridge chat.message --project <dir>` (v1) or
+`ocg __bridge session.context --project <dir>` (v2) with a JSON payload to test
+the Rust side directly; no model is involved.
 
 ## A task keeps recommending Debug
 

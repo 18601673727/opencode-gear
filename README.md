@@ -923,7 +923,8 @@ ocg launch
   └─ exports OPENCODE_GEAR_OCG + OPENCODE_GEAR_PROJECT to OpenCode
 
 OpenCode hook                adapter action (no policy)      Rust bridge
-  chat.message               append delimited suffix   ──▶  prepare_lead_context
+  chat.message (v1)          append delimited suffix   ──▶  prepare_lead_context
+  session.context (v2)       push baseline to system   ──▶  prepare_model_context
   tool.execute.before(task)  append hand-off to prompt ──▶  prepare_handoff
   tool.execute.after(explore) append bounded summary  ──▶  consume_explore_result
   tool.execute.after(build)  append verification note ──▶  after_build
@@ -932,15 +933,19 @@ OpenCode hook                adapter action (no policy)      Rust bridge
 The bridge is a hidden `ocg __bridge <event>` command. The adapter spawns it
 with a direct argv and JSON on stdin (never a shell), and swallows any bridge
 failure so it can never break a session. A stable delimiter
-(`<<<OCG:DYNAMIC_CONTEXT v1>>> … <<<OCG:END>>>`) is appended after the original
-prompt, so the user/agent prompt always stays first.
+(`<<<OCG:DYNAMIC_CONTEXT v1>>> … <<<OCG:END>>>`) wraps the repository baseline.
+On OpenCode v1 it is appended after the original prompt, so the user/agent
+prompt always stays first. On OpenCode v2 it is pushed onto the outgoing model
+request's **system context** at every root-Lead model dispatch — an ephemeral
+injection that is never persisted into the user message or the session
+history, so the baseline cannot accumulate across turns.
 
 Explore and ExploreDeep hand-offs also append a compact, advisory response
 contract asking for one JSON object (`goal`, `constraints`, `findings`,
 `files`, `symbols`). It is not a prompt rewrite, and the deterministic fallback
 parser still works if a model ignores it.
 
-The `chat.message` hook only injects dynamic context into the **Lead** session
+The Lead-context hooks only inject dynamic context into the **Lead** session
 (the request agent starts with `lead-`); worker subagent sessions do not
 receive a duplicate Lead context, and a request whose agent cannot be
 established is left untouched. The task before/after hooks stay active in every

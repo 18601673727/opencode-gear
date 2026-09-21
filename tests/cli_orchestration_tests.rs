@@ -210,6 +210,34 @@ fn bridge_chat_message_prepares_context_and_state() {
 }
 
 #[test]
+fn bridge_session_context_supplies_the_baseline_on_every_dispatch() {
+    let dir = TestDir::new();
+    let project = project(&dir);
+    let payload = json!({"session_id": "cli-session", "text": "fix the parser"});
+    let first = bridge(&project, dir.path(), "session.context", &payload);
+    assert_eq!(first["ok"], json!(true));
+    assert_eq!(first["event"], json!("session.context"));
+    assert_eq!(first["cached"], json!(false));
+    let body = first["context"].as_str().unwrap();
+    assert!(body.contains("fix the parser"));
+
+    // The V2 model-dispatch path never suppresses the baseline: a repeated
+    // dispatch reuses the computation but still returns the full body.
+    let second = bridge(&project, dir.path(), "session.context", &payload);
+    assert_eq!(second["ok"], json!(true));
+    assert_eq!(second["cached"], json!(true));
+    assert_eq!(second["context"].as_str().unwrap(), body);
+    assert_eq!(second["snapshot_id"], first["snapshot_id"]);
+    assert_eq!(second["bytes"], first["bytes"]);
+    assert!(second["bytes"].as_u64().unwrap() > 0);
+    assert!(project
+        .join(".opencode-gear")
+        .join("orchestration")
+        .join("state.json")
+        .is_file());
+}
+
+#[test]
 fn bridge_is_disabled_and_empty_when_orchestration_is_off() {
     let dir = TestDir::new();
     let project = project(&dir);

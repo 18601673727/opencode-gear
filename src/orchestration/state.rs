@@ -72,6 +72,26 @@ pub struct Attempts {
     pub debug: usize,
 }
 
+/// The retained session repository baseline for the OpenCode V2
+/// model-dispatch path.
+///
+/// The V2 adapter injects the baseline into the outgoing model request's
+/// system context, which is never persisted, so every root-Lead dispatch must
+/// receive the full body again. The baseline *body* is retained here, keyed by
+/// `repository_generation_id`: an unchanged generation reuses the stored body
+/// verbatim (baseline computation is task-independent), while a material
+/// repository generation change re-renders and replaces it. The V1
+/// persisted-prompt path never reads this field.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RepositoryBaseline {
+    /// The rendered baseline body exactly as supplied to the model.
+    pub body: String,
+    /// Number of relevant files in the prepared input when rendered.
+    pub file_count: usize,
+    /// Number of relevant symbols in the prepared input when rendered.
+    pub symbol_count: usize,
+}
+
 /// One task session's bounded state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -112,6 +132,11 @@ pub struct SessionState {
     /// when the indexed repository content materially changes.
     #[serde(default)]
     pub repository_generation_id: Option<String>,
+    /// The retained baseline body for `repository_generation_id`, used by the
+    /// V2 model-dispatch path so an unchanged generation is reused without
+    /// re-rendering while still being supplied to every outgoing request.
+    #[serde(default)]
+    pub repository_baseline: Option<RepositoryBaseline>,
     pub updated_at: i64,
 }
 
@@ -140,6 +165,7 @@ impl Default for SessionState {
             last_rich_bytes: 0,
             last_diff_context: String::new(),
             repository_generation_id: None,
+            repository_baseline: None,
             updated_at: 0,
         }
     }

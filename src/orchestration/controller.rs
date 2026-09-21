@@ -6,7 +6,8 @@
 //! freshness, retry budgets, checkpointing and telemetry all live here.
 //!
 //! ```text
-//! chat.message      -> prepare_lead_context   (dynamic context suffix)
+//! chat.message      -> prepare_lead_context   (V1 persisted dynamic context suffix)
+//! session.context   -> prepare_model_context  (V2 model-dispatch repository baseline)
 //! task before       -> prepare_handoff        (typed role projection)
 //! task after        -> consume_explore_result (bounded findings + checkpoint)
 //!                   -> after_build            (verification + retry/debug policy)
@@ -76,8 +77,11 @@ pub struct LeadContext {
     pub symbol_count: usize,
     pub goal: Option<String>,
     pub metrics: OrchestrationMetrics,
-    /// Whether the full repository baseline was suppressed because it was
-    /// already injected in this session for the current repository generation.
+    /// Whether the baseline body was reused from the session store rather than
+    /// freshly rendered. The V1 persisted-prompt path suppresses re-injection
+    /// when this is set (the baseline already lives in the persisted history);
+    /// the V2 model-dispatch path ignores it for inclusion and still returns
+    /// the full body, because nothing is persisted there.
     pub cached: bool,
 }
 
@@ -394,9 +398,10 @@ impl<'a> Controller<'a> {
     }
 
     /// `chat.message`: prepare bounded, deterministic dynamic context for the
-    /// Lead on an ordinary user message.
+    /// Lead on an ordinary user message (the V1 persisted-prompt path).
     ///
-    /// This is the *only* place the overall task is defined or reset. When the
+    /// With [`Self::prepare_model_context`] (the V2 model-dispatch path) this
+    /// is one of the two places the overall task is defined or reset. When the
     /// user message hashes to a different task id, prior findings, retry
     /// counters and checkpoint references are cleared; a repeated message keeps
     /// the running session. Delegated subagent prompts never reset it.
@@ -470,6 +475,144 @@ impl<'a> Controller<'a> {
             goal: baseline.goal,
             metrics: baseline.metrics,
             cached,
+        })
+    }
+
+    /// `session.context` (OpenCode V2): provide the current session repository
+    /// baseline for one root-Lead model dispatch.
+    ///
+    /// The V2 adapter injects the baseline into the outgoing request's system
+    /// context, which is never persisted, so — unlike the V1 persisted-prompt
+    /// path — the baseline is *always* returned: the first dispatch, a repeated
+    /// dispatch, a tool-driven continuation and the next user turn each receive
+    /// exactly one copy. Baseline *computation* stays session/repository scoped
+    /// and task-independent: when the repository generation is unchanged the
+    /// retained body is reused verbatim and never re-derived from new task
+    /// wording; only a material generation change re-renders it.
+    ///
+    /// Task bookkeeping matches the V1 path: a changed user message resets
+    /// task-scoped state (findings, retry budgets, checkpoint references). A
+    /// repeated dispatch for the same task — including tool-loop continuations —
+    /// leaves the running session exactly as the worker orchestration path left
+    /// it: the current role, phase and budgets are never clobbered mid-turn.
+    pub fn prepare_model_context(&self, session_id: &str, message: &str) -> Result<LeadContext> {
+        let now = self.now();
+        let session_key = state::safe_id(session_id);
+        let has_task = !message.trim().is_empty();
+        let task_id = Self::task_id(message);
+        let mut loaded = state::load(&self.root);
+        let existing = loaded.state.session(&session_key).cloned();
+        let mut dirty = false;
+        let mut session = if !has_task {
+            // A dispatch without an extractable user message carries no task
+            // signal: it never resets task state and is served from whatever
+            // session exists.
+            existing.unwrap_or_else(|| SessionState::new(&session_key, "", now))
+        } else {
+            match existing {
+                Some(session) if session.task_id == task_id => session,
+                previous => {
+                    // A new user task resets task-scoped state (findings,
+                    // retries, checkpoints), but the repository baseline is
+                    // session-scoped and task-independent: its identity and
+                    // retained body carry over so an unchanged repository
+                    // generation is never re-rendered from new task wording.
+                    let generation_id = previous
+                        .as_ref()
+                        .and_then(|session| session.repository_generation_id.clone());
+                    let baseline = previous.and_then(|session| session.repository_baseline);
+                    let mut fresh = SessionState::new(&session_key, &task_id, now);
+                    fresh.task = Some(Self::stored_task_text(message));
+                    fresh.repository_generation_id = generation_id;
+                    fresh.repository_baseline = baseline;
+                    fresh.destination = Some(Role::Lead);
+                    dirty = true;
+                    fresh
+                }
+            }
+        };
+        if has_task && session.task.is_none() {
+            session.task = Some(Self::stored_task_text(message));
+            dirty = true;
+        }
+
+        // Ensure the OCG gitignore exists before computing the repository
+        // generation. `.gitignore` is an indexed file: a later append by the
+        // index or cache writers would otherwise look like a repository change
+        // and trigger an unnecessary baseline refresh.
+        crate::runtime::install::ensure_gitignore(&self.root)?;
+
+        // The session repository baseline is keyed by the repository
+        // generation, a task-independent identity of the indexed content.
+        // Baseline *reuse* is separate from baseline *inclusion*: an unchanged
+        // generation reuses the retained body (no re-render), but the body is
+        // still returned for this dispatch, because the V2 adapter injects it
+        // into an ephemeral per-request system context rather than persisted
+        // history.
+        let generation = self.repository_generation_id()?;
+        if let (Some(identity), Some(stored)) =
+            (generation.as_deref(), session.repository_baseline.clone())
+        {
+            if session.repository_generation_id.as_deref() == Some(identity)
+                && !stored.body.is_empty()
+            {
+                if dirty {
+                    session.updated_at = now;
+                    loaded.state.upsert(session.clone(), now);
+                    let _ = state::save(&self.root, &loaded.state);
+                }
+                let bytes = stored.body.len();
+                return Ok(LeadContext {
+                    session_id: session_key,
+                    task_id: session.task_id.clone(),
+                    dynamic_context: stored.body,
+                    snapshot_id: identity.to_string(),
+                    estimated_tokens: bytes / 4,
+                    bytes,
+                    file_count: stored.file_count,
+                    symbol_count: stored.symbol_count,
+                    goal: session.goal.clone(),
+                    metrics: OrchestrationMetrics {
+                        phase: Some(OrchestrationPhase::Idle.as_str().to_string()),
+                        source: Some(Role::Lead.as_str().to_string()),
+                        destination: Some(Role::Lead.as_str().to_string()),
+                        // The reused body is still supplied to the model on
+                        // this dispatch, so the bytes are counted, not zeroed.
+                        model_dynamic_context_bytes: bytes as u64,
+                        ..OrchestrationMetrics::default()
+                    },
+                    cached: true,
+                });
+            }
+        }
+
+        // No retained body for the current generation (first dispatch, a
+        // material repository change, or no reliable generation signal):
+        // render the baseline exactly as the V1 path would and retain it.
+        let baseline = self.render_session_baseline(&session, message, generation.as_deref());
+        session.repository_generation_id = Some(baseline.identity.clone());
+        session.repository_baseline = Some(state::RepositoryBaseline {
+            body: baseline.dynamic_context.clone(),
+            file_count: baseline.file_count,
+            symbol_count: baseline.symbol_count,
+        });
+        session.last_rich_bytes = baseline.rich_bytes;
+        session.updated_at = now;
+        loaded.state.upsert(session.clone(), now);
+        let _ = state::save(&self.root, &loaded.state);
+
+        Ok(LeadContext {
+            session_id: session_key,
+            task_id: session.task_id.clone(),
+            dynamic_context: baseline.dynamic_context,
+            snapshot_id: baseline.identity,
+            estimated_tokens: baseline.bytes / 4,
+            bytes: baseline.bytes,
+            file_count: baseline.file_count,
+            symbol_count: baseline.symbol_count,
+            goal: baseline.goal,
+            metrics: baseline.metrics,
+            cached: false,
         })
     }
 

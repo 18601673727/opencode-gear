@@ -62,6 +62,7 @@ impl<'a> BridgeContext<'a> {
         let started = Instant::now();
         let outcome = match event {
             "chat.message" | "chat-message" => self.chat_message(payload),
+            "session.context" => self.session_context(payload),
             "tool.execute.before" | "tool.execute.before/task" | "task-before" => {
                 self.tool_before(payload)
             }
@@ -103,9 +104,54 @@ impl<'a> BridgeContext<'a> {
                     "event": "chat.message",
                     "session_id": context.session_id,
                     "task_id": context.task_id,
-                    // An unchanged repository baseline is not appended again.
-                    // The plugin treats an empty context as a no-op.
+                    // V1 persisted-prompt path: an unchanged repository
+                    // baseline already lives in the persisted history, so it
+                    // is not appended again. The plugin treats an empty
+                    // context as a no-op. (The V2 `session.context` path above
+                    // always returns the full baseline instead.)
                     "context": if context.cached { String::new() } else { context.dynamic_context },
+                    "snapshot_id": context.snapshot_id,
+                    "cached": context.cached,
+                    "estimated_tokens": context.estimated_tokens,
+                    "bytes": context.bytes,
+                    "file_count": context.file_count,
+                    "symbol_count": context.symbol_count,
+                }),
+                metrics: context.metrics,
+                outcome: Outcome::Success,
+                role: Some(Role::Lead.as_str().to_string()),
+                session_id: Some(context.session_id),
+                task_type: "orchestration".to_string(),
+            },
+            Err(error) => self.error_outcome(error.to_string(), Some(Role::Lead), Some(session_id)),
+        }
+    }
+
+    /// `session.context` (OpenCode V2 model dispatch): supply the current
+    /// session repository baseline for one root-Lead request. Unlike the V1
+    /// `chat.message` path, the full baseline is returned on *every* dispatch —
+    /// the adapter injects it into the outgoing request's system context,
+    /// which is never persisted, so nothing accumulates in the conversation
+    /// history. `cached` only reports that baseline computation was reused; it
+    /// never suppresses inclusion.
+    fn session_context(&self, payload: &Value) -> BridgeOutcome {
+        let session_id = session_id(payload);
+        // `text` is the latest user message text when the adapter could
+        // extract one; it drives task-reset bookkeeping only. An absent or
+        // empty text is not an error here: the dispatch must still be served.
+        let text = payload
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        match self.controller.prepare_model_context(&session_id, &text) {
+            Ok(context) => BridgeOutcome {
+                value: json!({
+                    "ok": true,
+                    "event": "session.context",
+                    "session_id": context.session_id,
+                    "task_id": context.task_id,
+                    "context": context.dynamic_context,
                     "snapshot_id": context.snapshot_id,
                     "cached": context.cached,
                     "estimated_tokens": context.estimated_tokens,

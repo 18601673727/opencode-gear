@@ -28,5 +28,6 @@ pub use handoff::{
     Transition,
 };
 pub use state::{
-    Attempts, OrchestrationPhase, OrchestrationState, SessionState, STATE_SCHEMA_VERSION,
+    Attempts, OrchestrationPhase, OrchestrationState, RepositoryBaseline, SessionState,
+    STATE_SCHEMA_VERSION,
 };

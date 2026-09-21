@@ -11,7 +11,7 @@ use opencode_gear::orchestration::bridge::BridgeContext;
 use opencode_gear::orchestration::config::OrchestrationConfig;
 use opencode_gear::orchestration::controller::{BuildDecision, Controller};
 use opencode_gear::orchestration::handoff::{Role, Severity};
-use opencode_gear::orchestration::state::OrchestrationPhase;
+use opencode_gear::orchestration::state::{Attempts, OrchestrationPhase};
 use opencode_gear::process::{CapturedOutput, FakeCaptureRunner, FakeGitHost};
 use opencode_gear::telemetry::{TelemetryConfig, TelemetryStats, TelemetryStore};
 use opencode_gear::verification::config::VerificationConfig;
@@ -486,7 +486,11 @@ fn v2_plugin_contract_uses_local_discovery_and_subagent_tool() {
     let source = plugin::v2_plugin_source();
     assert!(source.contains("event.tool !== \"subagent\""));
     assert!(source.contains("ctx.tool.hook(\"execute.before\""));
-    assert!(source.contains("ctx.session.hook(\"prompt\""));
+    // The repository baseline is injected at model dispatch through the
+    // session `context` hook; the admitted prompt is never an OCG surface.
+    assert!(source.contains("ctx.session.hook(\"context\""));
+    assert!(!source.contains("ctx.session.hook(\"prompt\""));
+    assert!(source.contains("event.system.push({ type: \"text\""));
     // The V2 runtime may be Node, so the bridge is spawned via
     // `node:child_process` with an exact argv and no shell.
     assert!(source.contains("import { spawn } from \"node:child_process\""));
@@ -1706,4 +1710,238 @@ fn lead_context_snapshot_suppresses_trivial_third_turn() {
     assert_eq!(third["cached"], json!(true));
     assert_eq!(third["context"], json!(""));
     assert_eq!(third["snapshot_id"], json!(baseline));
+}
+
+// ---- V2 model-dispatch baseline (session.context) regressions -------------
+
+fn dispatch_context(bridge: &BridgeContext<'_>, session: &str, text: &str) -> serde_json::Value {
+    bridge.dispatch(
+        "session.context",
+        &json!({"session_id": session, "text": text}),
+    )
+}
+
+/// The V2 model-dispatch invariant: nothing is persisted into the conversation
+/// history, so every outgoing root-Lead dispatch receives exactly one full
+/// baseline — the first turn, a tool-driven continuation and a later user turn
+/// alike. `cached` reports reused computation, never suppressed inclusion.
+#[test]
+fn model_context_supplies_the_full_baseline_on_every_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let git = FakeGitHost::new();
+    let clock = FixedClock::new(1_000);
+    let controller = lead_controller(dir.path(), &git, &clock);
+    let runner = FakeCaptureRunner::new();
+    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+
+    // First dispatch: fresh render, full baseline.
+    let first = dispatch_context(&bridge, "lead-1", TASK);
+    assert_eq!(first["ok"], json!(true));
+    assert_eq!(first["cached"], json!(false));
+    let body = first["context"].as_str().unwrap().to_string();
+    assert!(body.contains(TASK));
+    let snapshot_id = first["snapshot_id"].as_str().unwrap().to_string();
+    assert!(snapshot_id.starts_with("sha256:"), "{snapshot_id}");
+    let bytes = first["bytes"].as_u64().unwrap();
+    assert!(bytes > 0);
+    assert_eq!(bytes as usize, body.len());
+
+    // Repeated dispatch (tool-driven continuation, same user message): the
+    // computation is reused, but the full body is still supplied.
+    let second = dispatch_context(&bridge, "lead-1", TASK);
+    assert_eq!(second["ok"], json!(true));
+    assert_eq!(second["cached"], json!(true));
+    assert_eq!(second["context"].as_str().unwrap(), body);
+    assert_eq!(second["snapshot_id"], json!(snapshot_id));
+    assert_eq!(second["bytes"], json!(bytes));
+
+    // A later user turn with an unchanged repository: still the full
+    // baseline, keyed by the repository generation — never re-derived from
+    // the new task wording.
+    let third = dispatch_context(&bridge, "lead-1", "Reply with exactly: TURN3_OK");
+    assert_eq!(third["cached"], json!(true));
+    assert_eq!(third["context"].as_str().unwrap(), body);
+    assert_eq!(third["snapshot_id"], json!(snapshot_id));
+    // The task reset still happened: the new wording owns the session task.
+    let session = controller
+        .load_state()
+        .state
+        .session("lead-1")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        session.task_id,
+        Controller::task_id("Reply with exactly: TURN3_OK")
+    );
+}
+
+/// A tool-continuation dispatch must not clobber the worker orchestration
+/// state mid-turn, and a later task reset must carry the baseline over.
+#[test]
+fn model_context_never_clobbers_worker_state_mid_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let git = FakeGitHost::new();
+    let clock = FixedClock::new(1_000);
+    let controller = lead_controller(dir.path(), &git, &clock);
+    let runner = FakeCaptureRunner::new();
+    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+
+    // Turn start: the first dispatch establishes the task and the baseline.
+    let first = dispatch_context(&bridge, "lead-1", TASK);
+    assert_eq!(first["cached"], json!(false));
+    let body = first["context"].as_str().unwrap().to_string();
+
+    // The Lead delegates to Explore: the session is now owned by the worker.
+    controller
+        .prepare_handoff("lead-1", Role::Explore, "explore the parser call paths")
+        .unwrap();
+    let owned = controller
+        .load_state()
+        .state
+        .session("lead-1")
+        .cloned()
+        .unwrap();
+    assert_eq!(owned.source, Role::Explore);
+    assert_eq!(owned.phase, OrchestrationPhase::Explore);
+
+    // A tool-driven continuation dispatch (same user message) supplies the
+    // baseline again without resetting the worker-owned session state.
+    let continuation = dispatch_context(&bridge, "lead-1", TASK);
+    assert_eq!(continuation["cached"], json!(true));
+    assert_eq!(continuation["context"].as_str().unwrap(), body);
+    let after = controller
+        .load_state()
+        .state
+        .session("lead-1")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        after.source,
+        Role::Explore,
+        "a context dispatch must not clobber the worker source"
+    );
+    assert_eq!(after.phase, OrchestrationPhase::Explore);
+    assert_eq!(after.destination, Some(Role::Explore));
+    assert_eq!(after.task_id, Controller::task_id(TASK));
+
+    // The next user turn (a new task) resets task-scoped state but reuses the
+    // repository baseline body verbatim: the baseline is session/repository
+    // scoped, not task scoped.
+    let next = dispatch_context(&bridge, "lead-1", "a different task entirely");
+    assert_eq!(next["cached"], json!(true));
+    assert_eq!(next["context"].as_str().unwrap(), body);
+    let reset = controller
+        .load_state()
+        .state
+        .session("lead-1")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        reset.task_id,
+        Controller::task_id("a different task entirely")
+    );
+    assert_eq!(reset.source, Role::Lead);
+    assert!(reset.findings.is_empty());
+    assert_eq!(reset.attempts, Attempts::default());
+}
+
+/// A material repository change refreshes the baseline exactly once; the
+/// following dispatch reuses the refreshed body.
+#[test]
+fn model_context_refreshes_once_after_a_repository_change() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let git = FakeGitHost::new();
+    let clock = FixedClock::new(1_000);
+    let controller = lead_controller(dir.path(), &git, &clock);
+    let runner = FakeCaptureRunner::new();
+    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+
+    let first = dispatch_context(&bridge, "lead-1", TASK);
+    assert_eq!(first["cached"], json!(false));
+    let first_id = first["snapshot_id"].as_str().unwrap().to_string();
+    let first_body = first["context"].as_str().unwrap().to_string();
+
+    // Edit the selected file so the repository generation materially changes.
+    fs::write(
+        dir.path().join("src/module_1.rs"),
+        "pub fn parse_1(value: u32) -> u32 {\n    value + 2\n}\n// changed\n",
+    )
+    .unwrap();
+
+    // The next dispatch re-renders exactly once.
+    let second = dispatch_context(&bridge, "lead-1", TASK);
+    assert_eq!(second["cached"], json!(false));
+    let second_id = second["snapshot_id"].as_str().unwrap().to_string();
+    assert_ne!(second_id, first_id, "changed repository must refresh");
+    let second_body = second["context"].as_str().unwrap().to_string();
+    assert!(!second_body.is_empty());
+    assert_ne!(second_body, first_body);
+
+    // The dispatch after that reuses the refreshed baseline.
+    let third = dispatch_context(&bridge, "lead-1", TASK);
+    assert_eq!(third["cached"], json!(true));
+    assert_eq!(third["context"].as_str().unwrap(), second_body);
+    assert_eq!(third["snapshot_id"], json!(second_id));
+}
+
+/// The baseline is session scoped: a distinct root Lead session receives its
+/// own baseline even when another session already holds the same generation.
+#[test]
+fn model_context_is_session_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let git = FakeGitHost::new();
+    let clock = FixedClock::new(1_000);
+    let controller = lead_controller(dir.path(), &git, &clock);
+    let runner = FakeCaptureRunner::new();
+    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+
+    let first = dispatch_context(&bridge, "lead-1", TASK);
+    assert_eq!(first["cached"], json!(false));
+
+    // A distinct session gets its own baseline (freshly rendered for that
+    // session; the identity is legitimately the same repository generation).
+    let other = dispatch_context(&bridge, "lead-2", TASK);
+    assert_eq!(other["ok"], json!(true));
+    assert_eq!(other["cached"], json!(false));
+    assert!(!other["context"].as_str().unwrap().is_empty());
+    assert_eq!(other["snapshot_id"], first["snapshot_id"]);
+
+    // Each session then reuses its own retained body.
+    let again = dispatch_context(&bridge, "lead-2", TASK);
+    assert_eq!(again["cached"], json!(true));
+    assert_eq!(again["context"], other["context"]);
+}
+
+/// A dispatch without an extractable user message carries no task signal: it
+/// must never reset the running task, and it still receives the baseline.
+#[test]
+fn model_context_without_a_user_message_keeps_the_running_task() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let git = FakeGitHost::new();
+    let clock = FixedClock::new(1_000);
+    let controller = lead_controller(dir.path(), &git, &clock);
+    let runner = FakeCaptureRunner::new();
+    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+
+    let first = dispatch_context(&bridge, "lead-1", TASK);
+    assert_eq!(first["cached"], json!(false));
+    let body = first["context"].as_str().unwrap().to_string();
+
+    let empty = dispatch_context(&bridge, "lead-1", "");
+    assert_eq!(empty["ok"], json!(true));
+    assert_eq!(empty["cached"], json!(true));
+    assert_eq!(empty["context"].as_str().unwrap(), body);
+    let session = controller
+        .load_state()
+        .state
+        .session("lead-1")
+        .cloned()
+        .unwrap();
+    assert_eq!(session.task_id, Controller::task_id(TASK));
+    assert_eq!(session.task.as_deref(), Some(TASK));
 }

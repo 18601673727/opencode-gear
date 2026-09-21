@@ -423,15 +423,20 @@ and verification integration. See
 [verification.md](verification.md) for the retry/Debug contract.
 
 The bridge injects the full repository context snapshot on the first Lead
-prompt of a session and records a deterministic `snapshot_id` per session. If
-the effective repository snapshot is unchanged, later prompts in the same
-session receive an empty `context` with `cached: true`, so the snapshot is not
-duplicated across turns; a materially changed snapshot is injected again and
-becomes the new baseline. The response also carries estimate-only metadata
+prompt of a session and records a deterministic `snapshot_id` per session. On
+OpenCode v1 the snapshot is persisted into the conversation history, so if the
+effective repository snapshot is unchanged, later prompts in the same session
+receive an empty `context` with `cached: true` and the snapshot is not
+duplicated across turns. On OpenCode v2 the snapshot is pushed onto the
+outgoing request's system context at every root-Lead model dispatch and never
+persisted, so every dispatch receives the full baseline; `cached: true` then
+reports that the retained rendering was reused, and only a material repository
+change re-renders it. The response also carries estimate-only metadata
 (`estimated_tokens` = bytes / 4, `bytes`, `file_count`, `symbol_count`);
-estimated tokens are never presented as exact provider billing tokens. Default
-collapsed TUI rendering of that metadata is blocked by the current OpenCode
-presentation API, so OCG emits a plain, compact line and leaves it visible.
+estimated tokens are never presented as exact provider billing tokens. On the
+v1 adapter the metadata is rendered as a plain, compact line in the appended
+context block; the v2 adapter injects the baseline without a presentation
+header.
 
 ## Environment variables
 
