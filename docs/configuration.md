@@ -438,6 +438,34 @@ v1 adapter the metadata is rendered as a plain, compact line in the appended
 context block; the v2 adapter injects the baseline without a presentation
 header.
 
+## Reports policy
+
+The optional top-level `reports` object controls local artifacts written from
+a running session. It is deliberately tiny — there is no report subsystem:
+
+```yaml
+reports:
+  latestLeadOutput:
+    enabled: true
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `latestLeadOutput.enabled` | `true` | Persist the raw user-visible text of the latest completed root Lead response to `<project>/.opencode-gear/reports/latest-lead-output.md`. |
+
+The file is written byte-verbatim: no headers, timestamps, ids, metadata,
+summaries or front matter. Only a *completed* root Lead assistant message is
+written; streaming partials, errored/interrupted responses, worker sessions
+(`ocg-*`) and non-OCG agents are never written, and an interrupted response
+never replaces the last completed output. The replacement is atomic (temp file
++ rename) and every failure is soft — a broken report cannot break a session.
+
+The capture is implemented by the generated OpenCode 2 adapter, so it is
+active exactly when that adapter is (orchestration enabled, the default) and
+the switch is on. OpenCode 1 has no equivalent event stream: there the switch
+is inert and no file is produced. `.opencode-gear/` is already ignored, so the
+artifact is never committed by accident.
+
 ## Environment variables
 
 `OPENCODE_GEAR_*` is canonical; the legacy `OC_GEAR_*` names are accepted as

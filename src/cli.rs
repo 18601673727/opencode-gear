@@ -1238,6 +1238,18 @@ fn runtime_plugin_env(
         OsString::from("OPENCODE_GEAR_ORCHESTRATION_ENABLED"),
         OsString::from("1"),
     ));
+    // The raw latest-Lead-output capture rides on the generated plugin. Export
+    // the resolved switch so the adapter can stay inert without a bridge spawn
+    // when it is disabled; the bridge re-checks the same policy.
+    let reports = crate::reports::ReportsConfig::from_config(&effective.data)?;
+    env.push((
+        OsString::from("OPENCODE_GEAR_REPORTS_LATEST_LEAD_OUTPUT"),
+        OsString::from(if reports.latest_lead_output.enabled {
+            "1"
+        } else {
+            "0"
+        }),
+    ));
     if adapter.major() == compat::Major::V2 {
         env.push((
             OsString::from("OPENCODE_CONFIG_DIR"),
@@ -2989,8 +3001,13 @@ fn bridge_payload(
     let runner = SystemCaptureRunner;
     let (telemetry_config, warnings) = telemetry_for(effective, env);
     print_telemetry_warnings(&warnings);
+    let reports = match crate::reports::ReportsConfig::from_config(&effective.data) {
+        Ok(config) => config,
+        Err(error) => return json!({"ok": false, "error": error.to_string()}),
+    };
     let bridge =
-        crate::orchestration::bridge::BridgeContext::new(&controller, &runner, telemetry_config);
+        crate::orchestration::bridge::BridgeContext::new(&controller, &runner, telemetry_config)
+            .with_reports(reports);
     bridge.dispatch(event, &payload)
 }
 
@@ -3204,4 +3221,52 @@ fn throttle_command(
         .map_err(Failure::Gear)?;
     println!("default throttle set to {level} in {}", path.display());
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn effective_for(cwd: &Path) -> config::Effective {
+        let defaults = crate::defaults::load_defaults(&crate::defaults::GearSource::Embedded)
+            .expect("embedded defaults");
+        config::build_effective(
+            defaults,
+            None,
+            cwd,
+            &cwd.join("no-user.yaml"),
+            &cwd.join(".opencode-gear.yaml"),
+            None,
+        )
+        .expect("effective")
+    }
+
+    fn env_value(env: &[(OsString, OsString)], key: &str) -> Option<String> {
+        env.iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn the_plugin_environment_carries_the_latest_lead_output_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut effective = effective_for(dir.path());
+        let adapter = crate::runtime::compat::v2_adapter();
+
+        let env = runtime_plugin_env(&effective, dir.path(), "high", adapter).unwrap();
+        assert_eq!(
+            env_value(&env, "OPENCODE_GEAR_REPORTS_LATEST_LEAD_OUTPUT").as_deref(),
+            Some("1"),
+            "the capture is enabled by default"
+        );
+
+        // Disabling the switch is exported exactly; the adapter then registers
+        // no event subscription at all.
+        effective.data["reports"]["latestLeadOutput"]["enabled"] = Value::Bool(false);
+        let env = runtime_plugin_env(&effective, dir.path(), "high", adapter).unwrap();
+        assert_eq!(
+            env_value(&env, "OPENCODE_GEAR_REPORTS_LATEST_LEAD_OUTPUT").as_deref(),
+            Some("0")
+        );
+    }
 }

@@ -15,6 +15,7 @@
 use crate::orchestration::controller::{BuildDecision, Controller, HandoffOutcome};
 use crate::orchestration::handoff::Role;
 use crate::process::CaptureRunner;
+use crate::reports::ReportsConfig;
 use crate::telemetry::{self, Event, OrchestrationMetrics, Outcome, TelemetryConfig};
 use serde_json::{json, Value};
 use std::time::Instant;
@@ -35,6 +36,7 @@ pub struct BridgeContext<'a> {
     pub controller: &'a Controller<'a>,
     pub runner: &'a dyn CaptureRunner,
     pub telemetry: TelemetryConfig,
+    pub reports: ReportsConfig,
 }
 
 impl<'a> BridgeContext<'a> {
@@ -47,7 +49,14 @@ impl<'a> BridgeContext<'a> {
             controller,
             runner,
             telemetry,
+            reports: ReportsConfig::default(),
         }
+    }
+
+    /// Apply the report policy for this bridge.
+    pub fn with_reports(mut self, reports: ReportsConfig) -> Self {
+        self.reports = reports;
+        self
     }
 
     /// Dispatch one event. Never fails: a bad payload or a controller error is
@@ -68,6 +77,7 @@ impl<'a> BridgeContext<'a> {
                 self.tool_before(payload)
             }
             "tool.execute.after" | "task-after" => self.tool_after(payload),
+            "lead.output" | "lead-output" => self.lead_output(payload),
             other => BridgeOutcome {
                 value: json!({"ok": false, "error": format!("unknown bridge event: {other}")}),
                 metrics: OrchestrationMetrics::default(),
@@ -349,6 +359,64 @@ impl<'a> BridgeContext<'a> {
         }
     }
 
+    /// `lead.output` (OpenCode V2 event stream): persist the raw user-visible
+    /// text of one *completed* root Lead assistant message.
+    ///
+    /// The adapter decides completion and only ever reports OCG Lead agents, but
+    /// the bridge re-checks both: a worker (`ocg-*`), an unknown agent and an
+    /// empty payload are refused, so no other session can overwrite the file.
+    /// The write itself is atomic and every failure is soft — a broken report
+    /// must never break a session.
+    fn lead_output(&self, payload: &Value) -> BridgeOutcome {
+        let session_id = session_id(payload);
+        let agent = payload.get("agent").and_then(Value::as_str).unwrap_or("");
+        let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
+        let reject = |message: &str, outcome: Outcome| BridgeOutcome {
+            value: json!({"ok": false, "error": message}),
+            metrics: OrchestrationMetrics::default(),
+            outcome,
+            role: None,
+            session_id: Some(session_id.clone()),
+            task_type: "report".to_string(),
+        };
+        if !self.reports.latest_lead_output.enabled {
+            return BridgeOutcome {
+                value: json!({"ok": false, "disabled": true, "context": ""}),
+                metrics: OrchestrationMetrics::default(),
+                outcome: Outcome::Unknown,
+                role: None,
+                session_id: Some(session_id),
+                task_type: "report".to_string(),
+            };
+        }
+        if !agent.starts_with("lead-") {
+            return reject(
+                "lead.output is only accepted from a root Lead agent",
+                Outcome::Unknown,
+            );
+        }
+        if text.trim().is_empty() {
+            return reject("empty lead.output payload", Outcome::Unknown);
+        }
+        match crate::reports::write_latest_lead_output(self.controller.root(), text) {
+            Ok(path) => BridgeOutcome {
+                value: json!({
+                    "ok": true,
+                    "event": "lead.output",
+                    "session_id": session_id,
+                    "bytes": text.len(),
+                    "path": path.to_string_lossy(),
+                }),
+                metrics: OrchestrationMetrics::default(),
+                outcome: Outcome::Success,
+                role: Some(Role::Lead.as_str().to_string()),
+                session_id: Some(session_id),
+                task_type: "report".to_string(),
+            },
+            Err(error) => reject(&safe_error(&error.to_string()), Outcome::Failure),
+        }
+    }
+
     fn error_outcome(
         &self,
         message: String,
@@ -606,5 +674,112 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("fix the parser"));
+    }
+
+    fn bridge_with_reports<'a>(
+        controller: &'a Controller<'a>,
+        runner: &'a FakeCaptureRunner,
+        reports: ReportsConfig,
+    ) -> BridgeContext<'a> {
+        BridgeContext::new(controller, runner, TelemetryConfig::disabled()).with_reports(reports)
+    }
+
+    #[test]
+    fn lead_output_persists_the_raw_text_byte_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = FakeGitHost::new();
+        let clock = FixedClock::new(1);
+        let controller = controller(dir.path(), &git, &clock, VerificationConfig::default());
+        let runner = FakeCaptureRunner::new();
+        let bridge = bridge_with_reports(&controller, &runner, ReportsConfig::default());
+        let text = "# Final answer\n\n- one\n- two\n\n```rust\nfn done() {}\n```\n";
+        let value = bridge.dispatch(
+            "lead.output",
+            &json!({"session_id": "s", "message_id": "m", "agent": "lead-high", "text": text}),
+        );
+        assert_eq!(value["ok"], json!(true), "{value}");
+        let path = crate::reports::latest_lead_output_path(dir.path());
+        assert_eq!(value["path"], json!(path.to_string_lossy()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn lead_output_refuses_worker_and_non_ocg_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = FakeGitHost::new();
+        let clock = FixedClock::new(1);
+        let controller = controller(dir.path(), &git, &clock, VerificationConfig::default());
+        let runner = FakeCaptureRunner::new();
+        let bridge = bridge_with_reports(&controller, &runner, ReportsConfig::default());
+        for agent in ["ocg-build", "ocg-verify", "build", ""] {
+            let value = bridge.dispatch(
+                "lead.output",
+                &json!({"session_id": "s", "agent": agent, "text": "worker text\n"}),
+            );
+            assert_eq!(value["ok"], json!(false), "agent {agent}");
+        }
+        assert!(
+            !crate::reports::latest_lead_output_path(dir.path()).exists(),
+            "a worker must never create the report"
+        );
+    }
+
+    #[test]
+    fn lead_output_refuses_an_empty_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = FakeGitHost::new();
+        let clock = FixedClock::new(1);
+        let controller = controller(dir.path(), &git, &clock, VerificationConfig::default());
+        let runner = FakeCaptureRunner::new();
+        let bridge = bridge_with_reports(&controller, &runner, ReportsConfig::default());
+        let value = bridge.dispatch(
+            "lead.output",
+            &json!({"session_id": "s", "agent": "lead-low", "text": "   \n"}),
+        );
+        assert_eq!(value["ok"], json!(false), "{value}");
+        assert!(!crate::reports::latest_lead_output_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn lead_output_is_inert_when_the_switch_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = FakeGitHost::new();
+        let clock = FixedClock::new(1);
+        let controller = controller(dir.path(), &git, &clock, VerificationConfig::default());
+        let runner = FakeCaptureRunner::new();
+        let reports = ReportsConfig::from_config(&json!({
+            "reports": {"latestLeadOutput": {"enabled": false}}
+        }))
+        .unwrap();
+        let bridge = bridge_with_reports(&controller, &runner, reports);
+        let value = bridge.dispatch(
+            "lead.output",
+            &json!({"session_id": "s", "agent": "lead-high", "text": "hidden\n"}),
+        );
+        assert_eq!(value["ok"], json!(false));
+        assert_eq!(value["disabled"], json!(true));
+        assert!(!crate::reports::latest_lead_output_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn lead_output_reports_a_write_failure_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file where the reports directory must be makes the write fail.
+        std::fs::create_dir_all(dir.path().join(".opencode-gear")).unwrap();
+        std::fs::write(dir.path().join(".opencode-gear/reports"), "blocked").unwrap();
+        let git = FakeGitHost::new();
+        let clock = FixedClock::new(1);
+        let controller = controller(dir.path(), &git, &clock, VerificationConfig::default());
+        let runner = FakeCaptureRunner::new();
+        let bridge = bridge_with_reports(&controller, &runner, ReportsConfig::default());
+        let value = bridge.dispatch(
+            "lead.output",
+            &json!({"session_id": "s", "agent": "lead-high", "text": "cannot land\n"}),
+        );
+        assert_eq!(value["ok"], json!(false), "{value}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".opencode-gear/reports")).unwrap(),
+            "blocked"
+        );
     }
 }

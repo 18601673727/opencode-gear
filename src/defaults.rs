@@ -145,6 +145,7 @@ pub fn load_defaults(source: &GearSource) -> Result<Value> {
         "capabilities": default_capabilities(),
         "telemetry": default_telemetry(),
         "orchestration": default_orchestration(),
+        "reports": default_reports(),
     }))
 }
 
@@ -198,6 +199,15 @@ pub fn default_telemetry() -> Value {
 pub fn default_orchestration() -> Value {
     serde_json::to_value(crate::orchestration::OrchestrationConfig::default())
         .unwrap_or_else(|_| json!({}))
+}
+
+/// The built-in report policy.
+///
+/// Kept in code so a disk gear home keeps working without a new required file.
+/// Enabled by default: the only artifact is the raw latest root Lead output
+/// under the already-ignored project state directory.
+pub fn default_reports() -> Value {
+    serde_json::to_value(crate::reports::ReportsConfig::default()).unwrap_or_else(|_| json!({}))
 }
 
 fn require_key(value: &Value, key: &str, label: &str) -> Result<()> {

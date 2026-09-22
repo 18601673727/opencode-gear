@@ -572,6 +572,44 @@ Key facts:
 - `--yes` is required for the scriptable forms; interactive mode asks for a
   confirmation instead. `ocg config` never touches provider credentials.
 
+## Latest Lead output
+
+While a project is running with the generated orchestration plugin (OpenCode
+2, enabled by default), Gear persists the raw final text of the latest
+*completed* root Lead response:
+
+```text
+<project>/.opencode-gear/reports/latest-lead-output.md
+```
+
+The file contains only the Lead's user-visible text — no headers, timestamps,
+ids, metadata, summaries, wrapper prose or YAML front matter. Multiple
+user-visible text parts are written in order, separated by a blank line. The
+path is fixed and lives under the already-ignored `.opencode-gear/` state
+directory, so it is never committed by accident.
+
+What is written, precisely:
+
+- only a completed root Lead assistant message (a streaming partial never
+  overwrites the file);
+- an interrupted or errored response never replaces the last completed output;
+  a resumed turn that completes does;
+- worker sessions (`ocg-*`) and non-OCG agents can never overwrite it;
+- the replacement is atomic, so a failed write cannot truncate the previous
+  report, and a report failure never breaks the coding session.
+
+The switch is `reports.latestLeadOutput.enabled` (default `true`):
+
+```yaml
+reports:
+  latestLeadOutput:
+    enabled: false
+```
+
+The capture rides on the generated plugin, so it is active exactly when the
+plugin is (orchestration enabled). OpenCode 1 has no equivalent event stream:
+on V1 the switch is inert and no file is produced.
+
 ## Configuration and overrides
 
 An override file is a partial copy of the gear registries. Everything is
