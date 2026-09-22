@@ -129,16 +129,60 @@ pub fn build_effective(
     project_path: &Path,
     home_dir: Option<PathBuf>,
 ) -> Result<Effective> {
+    let user = if user_path.is_file() {
+        reject_stale_json(user_path, "user")?;
+        Some(read_yaml_object(user_path)?)
+    } else {
+        reject_stale_json(user_path, "user")?;
+        None
+    };
+    let project = if project_path.is_file() {
+        reject_stale_json(project_path, "project")?;
+        Some(read_yaml_object(project_path)?)
+    } else {
+        reject_stale_json(project_path, "project")?;
+        None
+    };
+    build_effective_with_overlays(
+        defaults,
+        gear_home,
+        cwd,
+        user.as_ref(),
+        user_path,
+        project.as_ref(),
+        project_path,
+        home_dir,
+    )
+}
+
+/// Deep-merge in-memory user/project overlays onto the defaults.
+///
+/// `ocg config` builds a candidate configuration before persisting it; this
+/// variant takes the overlays as values so the exact same merging,
+/// normalization and layer bookkeeping run without touching any file. A
+/// missing layer is `None`, exactly like a missing file.
+#[allow(clippy::too_many_arguments)]
+pub fn build_effective_with_overlays(
+    defaults: Value,
+    gear_home: Option<PathBuf>,
+    cwd: &Path,
+    user: Option<&Value>,
+    user_path: &Path,
+    project: Option<&Value>,
+    project_path: &Path,
+    home_dir: Option<PathBuf>,
+) -> Result<Effective> {
     let mut data = defaults;
     let mut applied = Vec::new();
-    let layers: [(&'static str, &Path); 2] = [("user", user_path), ("project", project_path)];
-    for (name, path) in layers {
-        reject_stale_json(path, name)?;
-        if path.is_file() {
-            let overlay = read_yaml_object(path)?;
+    let layers: [(&'static str, Option<&Value>, &Path); 2] = [
+        ("user", user, user_path),
+        ("project", project, project_path),
+    ];
+    for (name, overlay, path) in layers {
+        if let Some(overlay) = overlay {
             let prior = data.clone();
-            data = deep_merge(&data, &overlay);
-            normalize_model_variant_overrides(&prior, &mut data, &overlay);
+            data = deep_merge(&data, overlay);
+            normalize_model_variant_overrides(&prior, &mut data, overlay);
             applied.push((name, path.to_path_buf()));
         }
     }

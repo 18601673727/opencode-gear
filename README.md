@@ -524,6 +524,54 @@ because another provider also offers it:
 Model ids live in `config/models.yaml`; role assignments live in
 `config/routing.yaml`; throttle levels live in `config/throttle.yaml`.
 
+## Configuring the Lead and providers
+
+`ocg config` switches the Lead and registers custom providers without editing
+YAML by hand. All forms write a *semantic* override: unrelated keys in the
+target file are preserved. The file is replaced atomically (temp file +
+rename), and the candidate configuration is validated with Gear's own static
+validation before anything is written — an invalid candidate leaves the file
+untouched.
+
+```bash
+ocg config                                  # interactive numbered menu
+ocg config lead                             # show the effective Lead table
+ocg config lead high \
+  --model openai/gpt-6-astra --variant xhigh \
+  --scope user --yes                        # switch one throttle level
+ocg config lead high --model command-code/gpt-5.6-sol --yes
+#                                           # provider/model auto-creates a
+#                                           # deterministic registry entry
+ocg config provider add-openai-compatible acme \
+  --base-url https://api.acme.dev/v1 \
+  --api-key-env ACME_API_KEY \
+  --model gpt-5.6-sol --model gpt-6-astra \
+  --scope user --yes
+```
+
+Key facts:
+
+- `--scope` selects the layer: `user`
+  (`~/.config/opencode-gear/config.yaml`, the default) or `project`
+  (`<project>/.opencode-gear.yaml`). The report names the file and says so
+  explicitly when a higher-precedence project config still overrides the
+  change.
+- `--model` accepts an existing registry key (`sol`, `kimi-k3`, ...) or
+  `provider/model`. With `provider/model`, an existing registry entry is
+  reused; otherwise a deterministic key (`provider-model`) plus the
+  `models.providers` declaration is created. Variants are never invented: an
+  omitted `--variant` runs the model at the provider default.
+- `ocg config provider add-openai-compatible` writes the npm provider block
+  (`@ai-sdk/openai-compatible`) and its models into the target layer. The API
+  key is only ever referenced as `{env:VAR}`; a raw key is rejected and never
+  stored or printed.
+- After a Lead change the resolved model is checked against the running
+  OpenCode model catalogue (`opencode models`). If the catalogue proves the
+  model is not exposed, the change is rejected. If the catalogue cannot be
+  read at all, the change is written and the report says it was not verified.
+- `--yes` is required for the scriptable forms; interactive mode asks for a
+  confirmation instead. `ocg config` never touches provider credentials.
+
 ## Configuration and overrides
 
 An override file is a partial copy of the gear registries. Everything is
@@ -658,6 +706,10 @@ run <args...>       launch `opencode run`
 models [args...]    run `opencode models`
 status              throttle, routing and config layers
 routing             worker role -> model table
+config              configure the Lead, providers and models (interactive menu)
+config lead [level] show, or switch, the Lead model for a throttle level
+config provider add-openai-compatible <name>
+                    register an OpenAI-compatible provider (key via {env:VAR})
 throttle [level]    print, or persist, the default throttle level
 validate            validate the merged configuration
 layers              show config layers and trace state

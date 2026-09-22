@@ -130,6 +130,7 @@ pub enum Command {
     Models(Vec<OsString>),
     Status,
     Routing,
+    Config(Vec<OsString>),
     Throttle(Option<String>),
     Validate,
     Layers,
@@ -315,11 +316,15 @@ where
         }
         if text.starts_with('-') && text != "-" {
             // Only commands that actually accept subcommand options may collect
-            // an unknown option. `checkpoint save --phase ...` does; every
-            // legacy command (validate, status, doctor, version, routing,
-            // layers, build, upgrade, cache, context, verify, ...) keeps the
-            // strict usage error it always had.
-            if command_token.as_deref() == Some("checkpoint") {
+            // an unknown option. `checkpoint save --phase ...` and
+            // `config lead high --model ... --yes` do; every legacy command
+            // (validate, status, doctor, version, routing, layers, build,
+            // upgrade, cache, context, verify, ...) keeps the strict usage
+            // error it always had.
+            if matches!(
+                command_token.as_deref(),
+                Some("checkpoint") | Some("config")
+            ) {
                 rest.push(args[index].clone());
                 index += 1;
                 continue;
@@ -355,7 +360,8 @@ where
         Some("run") => Command::Run(rest),
         Some("models") => Command::Models(rest),
         Some("status") => Command::Status,
-        Some("routing") | Some("routes") | Some("config") => Command::Routing,
+        Some("routing") | Some("routes") => Command::Routing,
+        Some("config") => Command::Config(rest),
         Some("throttle") => Command::Throttle(
             rest.first()
                 .map(|value| value.to_string_lossy().into_owned()),
@@ -411,6 +417,10 @@ Commands:
   models [args...]      run `opencode models` with the gear config
   status                show throttle, routing and config layers
   routing               show the worker role -> model table
+  config                configure the Lead, providers and models (interactive menu)
+  config lead [level]   show, or switch, the Lead model for a throttle level
+  config provider add-openai-compatible <name>
+                        register an OpenAI-compatible provider (key via {env:VAR})
   throttle [level]      print, or persist, the default throttle level
   validate              validate the merged configuration
   layers                show configuration layers and trace state
@@ -548,6 +558,10 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
         None => (GearSource::Embedded, None),
     };
     let defaults = load_defaults(&gear_source).map_err(Failure::Gear)?;
+    // `ocg config` builds a candidate configuration from the same defaults and
+    // the same resolved layer paths, so keep them available for that command.
+    let config_defaults = defaults.clone();
+    let config_gear_home = gear_home.clone();
     let user_path = config::user_config_path(
         cli.user_config.as_deref(),
         env.user_config.as_deref(),
@@ -562,7 +576,7 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
     );
     let effective = config::build_effective(
         defaults,
-        gear_home,
+        gear_home.clone(),
         &project_root,
         &user_path,
         &project_path,
@@ -646,6 +660,19 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
             println!("{text}");
             Ok(0)
         }
+        Command::Config(args) => config_command(
+            args,
+            config_defaults,
+            config_gear_home,
+            &invocation_dir,
+            &project_root,
+            &user_path,
+            &project_path,
+            &effective,
+            &level,
+            &env,
+            cli.disable_proxy,
+        ),
         Command::Validate => {
             let errors = validate::validate(&effective);
             if !errors.is_empty() {
@@ -2999,6 +3026,94 @@ fn read_stdin_json(max_bytes: usize) -> (Value, bool) {
         Ok(value) => (value, false),
         Err(_) => (Value::Null, false),
     }
+}
+
+/// `ocg config`: guided, safe Lead/provider configuration.
+///
+/// The command owns the interactive surface and the runtime probe; everything
+/// else (candidate building, validation, atomic write, reporting) lives in
+/// [`crate::config_command`].
+#[allow(clippy::too_many_arguments)]
+fn config_command(
+    args: &[OsString],
+    defaults: Value,
+    gear_home: Option<PathBuf>,
+    invocation_dir: &Path,
+    project_root: &Path,
+    user_path: &Path,
+    project_path: &Path,
+    effective: &config::Effective,
+    level: &str,
+    env: &Env,
+    disable_proxy: bool,
+) -> std::result::Result<i32, Failure> {
+    let request = crate::config_command::parse_request(args).map_err(Failure::Gear)?;
+    let context = crate::config_command::Context {
+        defaults,
+        gear_home,
+        project_root: project_root.to_path_buf(),
+        invocation_dir: invocation_dir.to_path_buf(),
+        user_path: user_path.to_path_buf(),
+        project_path: project_path.to_path_buf(),
+        env,
+        level: level.to_string(),
+        current: effective.clone(),
+    };
+    let probe = |candidate: &config::Effective, probe_level: &str| {
+        probe_candidate_config(
+            candidate,
+            probe_level,
+            project_root,
+            invocation_dir,
+            env,
+            disable_proxy,
+        )
+    };
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    let code = crate::config_command::execute(&request, &context, &probe, &mut input, &mut output)
+        .map_err(Failure::Gear)?;
+    Ok(code)
+}
+
+/// Probe the runtime catalogue for a candidate configuration.
+///
+/// Returns `None` when no probe can be attempted at all (no resolvable runtime
+/// or adapter); the caller then reports the change as runtime-unverified
+/// instead of pretending the model was checked. The probe uses OpenCode's
+/// supported `models` output and never reads credential stores.
+fn probe_candidate_config(
+    effective: &config::Effective,
+    level: &str,
+    project_root: &Path,
+    invocation_dir: &Path,
+    env: &Env,
+    disable_proxy: bool,
+) -> Option<ModelPreflight> {
+    let clock = SystemClock;
+    let process = SystemProcessHost;
+    let manager = runtime_manager(project_root, effective, env, &NoHttp, &clock, &process).ok()?;
+    let report = manager.resolve_for_report();
+    let program = report.path.clone()?;
+    let adapter = resolve_adapter(report.version.as_ref()).ok()?;
+    let mut resolved = build::build_opencode_config_for(effective, level, adapter).ok()?;
+    // The generated plugin is not materialized for a configuration check, so
+    // probe with the exact config minus OCG's not-yet-existing plugin file.
+    crate::orchestration::plugin::remove_ocg_plugin_for(&mut resolved, adapter.plugin_key());
+    let content = serde_json::to_string(&resolved).ok()?;
+    let proxy = resolve_proxy(disable_proxy);
+    let proxy_env = proxy.child_env();
+    crate::preflight::probe(
+        &effective.data,
+        &process,
+        &program,
+        invocation_dir,
+        &content,
+        &proxy_env,
+    )
+    .ok()
 }
 
 fn throttle_command(
