@@ -28,15 +28,17 @@
 use crate::error::{GearError, Result};
 use crate::proxy::ChildProxyEnv;
 use crate::runtime::compat::v2_client::{wait_ready, ServiceRegistration, V2SessionClient};
+use std::collections::VecDeque;
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// How long to wait for the startup handshake (both lines) before giving up.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(15);
+const STARTUP_STDERR_LIMIT: usize = 8192;
 
 /// The bounded readiness budget used by production launches.
 ///
@@ -141,7 +143,7 @@ impl OwnedV2Server {
             .env_remove("OPENCODE_CONFIG")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         for (key, value) in extra_env {
             command.env(key, value);
         }
@@ -161,6 +163,11 @@ impl OwnedV2Server {
                 "the private OpenCode V2 server did not provide startup output",
             ));
         };
+        let stderr = child.stderr.take();
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
+        if let Some(stderr) = stderr {
+            spawn_stderr_tail(stderr, Arc::clone(&stderr_tail));
+        }
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
@@ -181,13 +188,14 @@ impl OwnedV2Server {
         }
         let (Some(url), Some(password)) = (url, password) else {
             let exit = child.try_wait().ok().flatten();
+            let detail = stderr_detail(&stderr_tail);
             terminate(&mut child);
             return Err(GearError::config(match exit {
                 Some(status) => format!(
-                    "the private OpenCode V2 server exited before reporting its loopback URL and password ({status}); it cannot serve this invocation"
+                    "the private OpenCode V2 server exited before reporting its loopback URL and password ({status}){detail}; it cannot serve this invocation"
                 ),
                 None => format!(
-                    "the private OpenCode V2 server did not report its loopback URL and password within {:?}",
+                    "the private OpenCode V2 server did not report its loopback URL and password within {:?}{detail}",
                     budget.handshake_deadline
                 ),
             }));
@@ -265,6 +273,58 @@ fn terminate(child: &mut Child) {
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+fn spawn_stderr_tail(stderr: impl Read + Send + 'static, tail: Arc<Mutex<VecDeque<u8>>>) {
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut buffer = [0u8; 1024];
+        loop {
+            let count = match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => count,
+            };
+            let Ok(mut tail) = tail.lock() else { break };
+            tail.extend(&buffer[..count]);
+            while tail.len() > STARTUP_STDERR_LIMIT {
+                tail.pop_front();
+            }
+        }
+    });
+}
+
+fn stderr_detail(tail: &Arc<Mutex<VecDeque<u8>>>) -> String {
+    let Ok(mut tail) = tail.lock() else {
+        return String::new();
+    };
+    if tail.is_empty() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(tail.make_contiguous())
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!("; child stderr: {}", sanitize_startup_stderr(&text))
+    }
+}
+
+fn sanitize_startup_stderr(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if line.to_ascii_lowercase().contains("password")
+                || line.to_ascii_lowercase().contains("api_key")
+                || line.to_ascii_lowercase().contains("apikey")
+                || line.to_ascii_lowercase().contains("secret")
+            {
+                "[redacted startup diagnostic]"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\\n")
 }
 
 /// Apply one server startup line to the handshake state. Pure so the parsing
