@@ -165,6 +165,18 @@ runtime/common contract
   state back and fails on a mismatch. The OpenCode client is pointed at that
   same private server and the child is terminated and reaped when it exits;
   Gear never restarts or reconfigures the user's shared service.
+- **Runtime ownership and readiness are explicit.** A V2 launch only ever uses
+  the server it started for that invocation; its identity
+  (`ocg-managed-invocation <endpoint> (pid N)`) is reported, never an ambient
+  service. Startup reads the handshake and then waits for a real authenticated
+  API response, bounded by a fixed budget, so a bound-but-unready or dead
+  process fails distinctly instead of hanging.
+- **Configured / Resolved / Effective are never conflated.** The effective state
+  comes from a live session read-back, but the OpenCode 2 session API accepts
+  any provider/model id, so that read-back proves *intent*; the catalogue probe
+  proves *availability*. Gear records both and reports a missing provider, a
+  missing model, an unrun probe, an unobserved runtime and a contradiction as
+  distinct outcomes.
 - **V2 config and plugins are owned together.** The 2.0.11 singular `provider`,
   `agent`, and package `plugin` surfaces, plus `enabled_providers` and
   `small_model`, are preserved. The generated local adapter is discovered from

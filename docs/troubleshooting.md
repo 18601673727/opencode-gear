@@ -143,6 +143,55 @@ or an unavailable probe. A coding launch blocks only when the active Lead model
 is definitely absent; it does not pretend that another model is an equivalent
 fallback.
 
+For the full picture, including whether a *live* runtime actually holds the
+resolved Lead, run:
+
+```bash
+ocg status --effective
+ocg doctor --effective
+```
+
+The `model` line separates the three failure classes: a missing provider, a
+model absent under an available provider, and a catalogue probe that could not
+run at all (`not checked`, a warning, never a claim that the model is missing).
+The `effective` line then reports what the live session actually holds.
+
+## The resolved runtime never becomes ready
+
+OCG starts its own runtime and waits for a real API response, not just a
+listening port or the startup handshake. If the runtime never answers an
+authenticated request within the bounded budget (up to 15 s to handshake, then
+150 API attempts 100 ms apart, first probe immediate), the command fails with an
+explicit readiness error rather than hanging or polling forever.
+
+- A runtime that dies during startup is reported as such, not as "slow".
+- A runtime that answers but rejects the credentials is reported separately from
+  one that is merely not ready yet.
+- A launch never attaches to an ambient `opencode serve` service, so a stuck
+  background daemon cannot masquerade as this invocation's runtime.
+- The server is terminated when the invocation ends; a leftover loopback server
+  from a crashed run is not reused by a later launch.
+
+## The effective runtime state is "not observed" or "NOT VERIFIED"
+
+These are honest, distinct outcomes, not configuration failures:
+
+- **not observed** — no session-level runtime could be activated: a v1 runtime
+  (no session-scoped Lead), no resolvable runtime, or `--no-activate`. Any
+  change is written; the runtime state simply was not read back.
+- **NOT VERIFIED** — a runtime was reached but activation or read-back failed.
+  Read the reason after the line; the atomic file write is still the commit
+  point, so re-run the switch or `ocg doctor --effective` once the runtime is
+  healthy.
+- **contradiction** — the live session reported a *different*
+  agent/provider/model/variant than the configuration requests. Check for a
+  higher-precedence layer (`ocg layers`) and re-run.
+
+OCG never upgrades an unobserved state to "verified". The OpenCode 2 session API
+accepts any provider/model id without validating it, so a session read-back
+proves *intent* while the catalogue probe proves *availability*; both are
+reported separately and never conflated.
+
 ## Sticky model or reasoning state overrides the selected throttle
 
 On ordinary `ocg` / `ocg run` launches, the generated plugin enforces the
@@ -239,9 +288,11 @@ Lead to delegate explicitly, for example:
 ocg run 'Call the task tool once with subagent_type "ocg-build" and prompt "reply OK".'
 ```
 
-You can confirm which model actually ran by checking the OpenCode log or the
-session store for the `providerID` / `modelID` / `variant` of the assistant
-message.
+You can confirm which model actually ran without reading the store by hand: a
+coding launch prints the owned runtime, session and effective Lead, and
+`ocg status --effective` re-derives the same Configured/Resolved/Effective state
+on demand. The OpenCode log or session store still carries the raw `providerID` /
+`modelID` / `variant` of the assistant message if you want the byte-level record.
 
 ## I want to pin the whole project to different models
 

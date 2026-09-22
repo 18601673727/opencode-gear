@@ -165,6 +165,51 @@ pub struct V2Response {
     pub body: String,
 }
 
+/// The result of one readiness observation. See
+/// [`V2SessionClient::readiness`] for the exact mapping from HTTP to state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum V2Readiness {
+    /// The runtime answered the capability probe successfully.
+    Ready,
+    /// The runtime is not serving the API yet (or not yet reachable).
+    Starting,
+    /// The runtime answered but cannot serve OCG: retrying cannot help.
+    Unusable(String),
+}
+
+/// Poll `probe` until it reports [`V2Readiness::Ready`].
+///
+/// `pause` runs only *between* attempts, so a runtime that is already ready is
+/// never delayed by a fixed sleep. `attempts` bounds the wait, so this can
+/// neither poll forever nor accept a runtime that never becomes ready. The
+/// first [`V2Readiness::Unusable`] observation fails immediately: a rejected
+/// credential or a wrong route is not a startup race.
+pub fn wait_ready<F, P>(mut probe: F, mut pause: P, attempts: u32) -> Result<()>
+where
+    F: FnMut() -> V2Readiness,
+    P: FnMut(),
+{
+    let attempts = attempts.max(1);
+    for attempt in 0..attempts {
+        match probe() {
+            V2Readiness::Ready => return Ok(()),
+            V2Readiness::Unusable(reason) => {
+                return Err(GearError::config(format!(
+                    "the OpenCode V2 runtime is reachable but cannot serve OCG: {reason}"
+                )))
+            }
+            V2Readiness::Starting => {
+                if attempt + 1 < attempts {
+                    pause();
+                }
+            }
+        }
+    }
+    Err(GearError::config(format!(
+        "the OpenCode V2 runtime did not become ready after {attempts} bounded readiness probe(s)"
+    )))
+}
+
 /// The transport seam. Production binds [`ReqwestV2Transport`]; tests bind a
 /// deterministic in-memory fake, exactly like the other runtime boundaries.
 pub trait V2Transport: Send + Sync {
@@ -267,6 +312,42 @@ impl V2SessionClient {
 
     fn endpoint(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
+    }
+
+    /// Probe whether this runtime is actually ready to serve OCG's session
+    /// capability.
+    ///
+    /// A bound socket is not readiness: the process may have printed its
+    /// startup lines, bound a port, and still not be serving the API (or may
+    /// have died). This performs a real authenticated request against the
+    /// runtime's own config route, which is the cheapest evidence that the API
+    /// is up and that it accepted the credentials OCG registered. It never
+    /// sleeps and never retries: callers bound the wait through [`wait_ready`].
+    ///
+    /// - `2xx` -> [`V2Readiness::Ready`]
+    /// - a connection/transport failure or `5xx` -> [`V2Readiness::Starting`]
+    ///   (the port may simply not be bound yet)
+    /// - `401`/`403` or any other `4xx` -> [`V2Readiness::Unusable`], because
+    ///   retrying cannot repair a rejected credential or a wrong route
+    pub fn readiness(&self) -> V2Readiness {
+        let url = self.endpoint("/api/config");
+        match self.transport.send(V2Request {
+            method: "GET",
+            url,
+            body: None,
+        }) {
+            Ok(response) => match response.status {
+                status if (200..300).contains(&status) => V2Readiness::Ready,
+                401 | 403 => V2Readiness::Unusable(
+                    "the runtime rejected OCG's local service credentials".to_string(),
+                ),
+                status if (500..600).contains(&status) => V2Readiness::Starting,
+                status => V2Readiness::Unusable(format!(
+                    "the runtime API answered the readiness probe with HTTP {status}"
+                )),
+            },
+            Err(_) => V2Readiness::Starting,
+        }
     }
 
     /// Send one request, mapping transport failure, non-success status and
@@ -856,5 +937,109 @@ mod tests {
     fn component_encoding_is_strict() {
         assert_eq!(encode_component("/work/app a"), "%2Fwork%2Fapp%20a");
         assert_eq!(encode_component("ses_abc-123"), "ses_abc-123");
+    }
+
+    #[test]
+    fn readiness_reports_ready_only_for_a_two_hundred_api_response() {
+        let ready = FakeTransport::with(vec![status(200, "{}")]);
+        assert_eq!(client(&ready).readiness(), V2Readiness::Ready);
+        assert_eq!(ready.requests()[0].url, format!("{BASE}/api/config"));
+
+        // A bound-but-not-serving runtime, a crashed connection and a 5xx while
+        // the server is still warming up are all "starting", never "ready".
+        let not_listening = FakeTransport::with(vec![Err(GearError::config("connection refused"))]);
+        assert_eq!(client(&not_listening).readiness(), V2Readiness::Starting);
+        let warming = FakeTransport::with(vec![status(503, "")]);
+        assert_eq!(client(&warming).readiness(), V2Readiness::Starting);
+    }
+
+    #[test]
+    fn readiness_fails_fast_when_the_credentials_are_rejected() {
+        let unauthorized = FakeTransport::with(vec![status(401, "")]);
+        assert!(matches!(
+            client(&unauthorized).readiness(),
+            V2Readiness::Unusable(reason) if reason.contains("credentials")
+        ));
+        let wrong_route = FakeTransport::with(vec![status(404, "")]);
+        assert!(matches!(
+            client(&wrong_route).readiness(),
+            V2Readiness::Unusable(reason) if reason.contains("HTTP 404")
+        ));
+    }
+
+    #[test]
+    fn wait_ready_never_sleeps_when_the_runtime_is_already_ready() {
+        let mut pauses = 0;
+        let mut probes = 0;
+        wait_ready(
+            || {
+                probes += 1;
+                V2Readiness::Ready
+            },
+            || pauses += 1,
+            50,
+        )
+        .unwrap();
+        assert_eq!(probes, 1);
+        assert_eq!(pauses, 0, "an already-ready runtime must not be delayed");
+    }
+
+    #[test]
+    fn wait_ready_is_bounded_and_reports_the_exhausted_budget() {
+        let mut probes = 0;
+        let error = wait_ready(
+            || {
+                probes += 1;
+                V2Readiness::Starting
+            },
+            || {},
+            3,
+        )
+        .unwrap_err();
+        assert_eq!(probes, 3, "polling must stop at the attempt bound");
+        assert!(
+            error.to_string().contains("did not become ready"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn wait_ready_succeeds_after_a_startup_race_and_stops_probing() {
+        let mut state = vec![
+            V2Readiness::Starting,
+            V2Readiness::Starting,
+            V2Readiness::Ready,
+            V2Readiness::Ready,
+        ];
+        let mut probes = 0;
+        wait_ready(
+            || {
+                probes += 1;
+                state.remove(0)
+            },
+            || {},
+            100,
+        )
+        .unwrap();
+        assert_eq!(probes, 3, "the loop must stop at the first Ready");
+    }
+
+    #[test]
+    fn wait_ready_surfaces_an_unusable_runtime_without_polling() {
+        let mut probes = 0;
+        let error = wait_ready(
+            || {
+                probes += 1;
+                V2Readiness::Unusable("rejected".to_string())
+            },
+            || panic!("an unusable runtime must not be retried"),
+            50,
+        )
+        .unwrap_err();
+        assert_eq!(probes, 1);
+        assert!(
+            error.to_string().contains("reachable but cannot serve"),
+            "{error}"
+        );
     }
 }

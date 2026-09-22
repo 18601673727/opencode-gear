@@ -25,7 +25,8 @@ use crate::process::{
 use crate::project;
 use crate::proxy::{ProxyScheme, ProxySelection, ProxySource};
 use crate::report;
-use crate::runtime::compat::{self, LeadSelection, RuntimeAdapter};
+use crate::runtime::compat::{self, LeadSelection, RuntimeAdapter, SessionClient};
+use crate::runtime::effective as runtime_effective;
 use crate::runtime::policy::RuntimePolicy;
 use crate::runtime::{self, install::Layout};
 use crate::telemetry::{self, TelemetryConfig};
@@ -36,11 +37,7 @@ use crate::yaml;
 use semver::Version;
 use serde_json::{json, Value};
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command as ProcessCommand, Stdio};
-use std::sync::mpsc;
-use std::time::Duration;
 
 /// Printed by `version` and embedded in the help header.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -161,6 +158,9 @@ pub struct Cli {
     pub project_config: Option<PathBuf>,
     /// `--disable-proxy`: never use any proxy, ambient or system.
     pub disable_proxy: bool,
+    /// `--effective`: also resolve and observe the live runtime state
+    /// (Configured / Resolved / Effective) for `status` and `doctor`.
+    pub effective: bool,
     pub command: Command,
 }
 
@@ -198,6 +198,7 @@ where
     let mut project_config: Option<PathBuf> = None;
     let mut command_token: Option<String> = None;
     let mut disable_proxy = false;
+    let mut effective = false;
     let mut rest: Vec<OsString> = Vec::new();
     let mut event: Option<String> = None;
 
@@ -290,6 +291,11 @@ where
         }
         if text == "--pretty" {
             pretty = true;
+            index += 1;
+            continue;
+        }
+        if text == "--effective" {
+            effective = true;
             index += 1;
             continue;
         }
@@ -401,6 +407,7 @@ where
         user_config,
         project_config,
         disable_proxy,
+        effective,
         command,
     })
 }
@@ -419,6 +426,8 @@ Commands:
   routing               show the worker role -> model table
   config                configure the Lead, providers and models (interactive menu)
   config lead [level]   show, or switch, the Lead model for a throttle level
+  config lead <level> --model PROVIDER/MODEL [--variant V] [--scope user|project] [--yes] [--no-activate]
+                        switch the Lead, then activate and verify it on a private runtime
   config provider add-openai-compatible <name>
                         register an OpenAI-compatible provider (key via {env:VAR})
   throttle [level]      print, or persist, the default throttle level
@@ -447,6 +456,8 @@ Options:
   --dry-run             print the merged OpenCode config instead of launching
   --disable-proxy       never use a proxy (overrides env and system discovery)
   --pretty              pretty-print JSON output (build / --dry-run)
+  --effective           with status/doctor, also resolve the runtime and verify the
+                        live effective Lead (starts and terminates a private server)
   --user-config PATH    user override file
   --project-config PATH project override file
   -h, --help            show this help
@@ -652,6 +663,17 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
             validate::require_valid(&effective).map_err(Failure::Gear)?;
             let text = report::status_text(&effective, &level).map_err(Failure::Gear)?;
             println!("{text}");
+            if cli.effective {
+                print_runtime_state(
+                    &effective,
+                    &project_root,
+                    &invocation_dir,
+                    &level,
+                    &env,
+                    cli.disable_proxy,
+                    true,
+                )?;
+            }
             Ok(0)
         }
         Command::Routing => {
@@ -719,9 +741,15 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
             }
             Ok(0)
         }
-        Command::Doctor => {
-            doctor_command(&effective, &project_root, &level, &env, cli.disable_proxy)
-        }
+        Command::Doctor => doctor_command(
+            &effective,
+            &project_root,
+            &invocation_dir,
+            &level,
+            &env,
+            cli.disable_proxy,
+            cli.effective,
+        ),
         Command::Context(args) => {
             boundary.require(&invocation_dir).map_err(Failure::Gear)?;
             context_command(&effective, &project_root, args, &env, cli.pretty)
@@ -942,39 +970,45 @@ fn launch(
                     }
                 }
             }
-            // v2 selects the Lead on the session. Gear does not enumerate the
-            // whole catalogue on every launch; the Rust-resolved contract is
-            // exported for the session client, which verifies the effective
-            // Lead before Gear relies on it.
+            // v2 selects the Lead on the session. Gear starts its own
+            // invocation-scoped server, hands it the generated config, applies
+            // the Rust-resolved contract to a session, then reads the effective
+            // state back. The runtime identity and the verified effective Lead
+            // are reported so the invocation can never be mistaken for an
+            // ambient daemon using another configuration.
             compat::LeadSelectionMode::Session => {
                 let contract =
                     model::lead_contract(&effective.data, level).map_err(Failure::Gear)?;
                 let lead = LeadSelection::from_contract(&contract);
-                eprintln!(
-                    "ocg: session-level Lead: {} on {} (variant {})",
-                    lead.agent,
-                    lead.full_model_id(),
-                    lead.variant.as_deref().unwrap_or("provider-default")
-                );
-
-                // Run an invocation-scoped server. A V2 client otherwise uses
-                // the user's long-lived daemon, whose catalog cannot be made
-                // to match this generated config safely.
                 let plugin_env = if plugin_active {
                     runtime_plugin_env(effective, project_root, level, adapter)
                         .map_err(Failure::Gear)?
                 } else {
                     Vec::new()
                 };
-                let runtime =
-                    PrivateV2Runtime::start(&selection.path, &content, &plugin_env, &proxy_env)
-                        .map_err(Failure::Gear)?;
+                let runtime = compat::v2_server::OwnedV2Server::start(
+                    &selection.path,
+                    &content,
+                    &plugin_env,
+                    &proxy_env,
+                )
+                .map_err(Failure::Gear)?;
                 let mut client = compat::v2_client::V2SessionClient::connect(
                     runtime.registration(),
                     invocation_dir.to_string_lossy(),
                 )
                 .map_err(Failure::Gear)?;
-                compat::select_session_lead(&mut client, &lead).map_err(Failure::Gear)?;
+                let session =
+                    compat::select_session_lead(&mut client, &lead).map_err(Failure::Gear)?;
+                let observed = client
+                    .effective_lead(&session.session_id)
+                    .map_err(Failure::Gear)?;
+                eprintln!(
+                    "ocg: runtime {} | session {} | effective Lead {}",
+                    runtime.identity().describe(),
+                    session.session_id,
+                    crate::runtime::effective::render_effective(&observed)
+                );
                 v2_runtime = Some(runtime);
             }
         }
@@ -1031,105 +1065,9 @@ fn private_server_args(args: &[OsString], url: &str) -> Vec<OsString> {
     result
 }
 
-/// An invocation-scoped OpenCode 2 server. `opencode serve --port 0` chooses a
-/// loopback port and prints its ephemeral password; neither value is persisted
-/// in or read from the user's background-service registration.
-struct PrivateV2Runtime {
-    child: Child,
-    registration: compat::v2_client::ServiceRegistration,
-}
-
-impl PrivateV2Runtime {
-    fn start(
-        program: &Path,
-        config_content: &str,
-        extra_env: &[(OsString, OsString)],
-        proxy: &crate::proxy::ChildProxyEnv,
-    ) -> crate::error::Result<Self> {
-        let mut command = ProcessCommand::new(program);
-        command
-            .args(["serve", "--hostname", "127.0.0.1", "--port", "0"])
-            .env("OPENCODE_CONFIG_CONTENT", config_content)
-            .env_remove("OPENCODE_CONFIG")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        for (key, value) in extra_env {
-            command.env(key, value);
-        }
-        proxy.apply(&mut command);
-        let mut child = command.spawn().map_err(|error| {
-            GearError::io(
-                format!(
-                    "cannot start private OpenCode V2 server at {}",
-                    program.display()
-                ),
-                error,
-            )
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            GearError::config("private OpenCode V2 server did not provide startup output")
-        })?;
-        let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                // After startup the receiver is dropped, but keep draining so
-                // a chatty private server cannot block on its stdout pipe.
-                let _ = sender.send(line.unwrap_or_default());
-            }
-        });
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        let mut url = None;
-        let mut password = None;
-        while std::time::Instant::now() < deadline && (url.is_none() || password.is_none()) {
-            match receiver.recv_timeout(Duration::from_millis(100)) {
-                Ok(line) => {
-                    if let Some(value) = line.strip_prefix("server listening on ") {
-                        url = Some(value.trim().to_string());
-                    } else if let Some(value) = line.strip_prefix("server password ") {
-                        password = Some(value.trim().to_string());
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-        match (url, password) {
-            (Some(url), Some(password)) if !url.is_empty() && !password.is_empty() => Ok(Self {
-                child,
-                registration: compat::v2_client::ServiceRegistration::new(url, password),
-            }),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                Err(GearError::config(
-                    "private OpenCode V2 server did not report its loopback URL and password",
-                ))
-            }
-        }
-    }
-
-    fn registration(&self) -> &compat::v2_client::ServiceRegistration {
-        &self.registration
-    }
-
-    fn url(&self) -> &str {
-        self.registration.url()
-    }
-
-    fn password(&self) -> &str {
-        self.registration.password().expose()
-    }
-}
-
-impl Drop for PrivateV2Runtime {
-    fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
+// An invocation-scoped OpenCode 2 server is owned by
+// `compat::v2_server::OwnedV2Server`; launch only needs its URL and password to
+// hand the private server to the launched client.
 
 /// Resolve the compatibility adapter for a runtime selection.
 ///
@@ -1417,13 +1355,18 @@ fn proxy_env_present(name: &str) -> bool {
 }
 
 /// `ocg doctor`: read-only environment and runtime checks. Never installs,
-/// updates or writes the cache, and never prints secrets.
+/// updates or writes the cache, and never prints secrets. With `effective_state`
+/// it additionally starts a bounded, OCG-owned private runtime to verify the
+/// live effective Lead; that server is terminated before returning and no local
+/// state is written.
 fn doctor_command(
     effective: &config::Effective,
     project_root: &Path,
+    invocation_dir: &Path,
     level: &str,
     env: &Env,
     disable_proxy: bool,
+    effective_state: bool,
 ) -> std::result::Result<i32, Failure> {
     let mut doctor = Doctor::default();
     println!("OpenCode Gear doctor");
@@ -1694,6 +1637,10 @@ fn doctor_command(
     };
 
     println!("runtime models");
+    // Captured for the optional effective-state check below so the catalogue is
+    // probed at most once per doctor run.
+    let mut runtime_content: Option<String> = None;
+    let mut runtime_preflight: Option<ModelPreflight> = None;
     if !static_config_valid {
         doctor.line(
             "info",
@@ -1709,7 +1656,7 @@ fn doctor_command(
                 "cannot serialize the OpenCode config for runtime model checks: {error}"
             )))
         })?;
-        match crate::preflight::probe(
+        let preflight = crate::preflight::probe(
             &effective.data,
             &process,
             program,
@@ -1717,11 +1664,9 @@ fn doctor_command(
             &content,
             &proxy_env,
         )
-        .map_err(Failure::Gear)?
-        {
-            ModelPreflight::Unavailable { reason } => {
-                doctor.line("warn", "runtime models", &reason)
-            }
+        .map_err(Failure::Gear)?;
+        match &preflight {
+            ModelPreflight::Unavailable { reason } => doctor.line("warn", "runtime models", reason),
             ModelPreflight::Complete { checks } => {
                 for check in checks {
                     let variant = check
@@ -1760,11 +1705,59 @@ fn doctor_command(
                 }
             }
         }
+        runtime_content = Some(content);
+        runtime_preflight = Some(preflight);
     } else {
         doctor.line(
             "info",
             "runtime models",
             "not checked because no usable, supported OpenCode runtime is installed",
+        );
+    }
+
+    // Configured / Resolved / Effective. The effective state is only proven by
+    // talking to a real runtime, so it is opt-in: `ocg doctor --effective`
+    // starts a bounded, OCG-owned private server and terminates it again.
+    println!("runtime state");
+    if effective_state {
+        match build_runtime_state(
+            effective,
+            level,
+            report.path.as_deref(),
+            adapter,
+            runtime_content.as_deref(),
+            &proxy_env,
+            invocation_dir,
+            runtime_preflight.as_ref(),
+            true,
+        ) {
+            Ok(state) => {
+                let (status, detail) = configured_line(&state);
+                doctor.line(status, "configured", &detail);
+                if state.static_errors.is_empty() {
+                    doctor.line("ok", "resolved", "accepted by OCG validation");
+                } else {
+                    doctor.line("fail", "resolved", &state.static_errors.join("; "));
+                }
+                let (status, detail) = state.model.describe(
+                    &state.configured.full_model_id(),
+                    state.configured.variant.as_deref(),
+                );
+                doctor.line(status, "resolved model", &detail);
+                let (status, detail) = state.effective_line();
+                doctor.line(status, "effective", &detail);
+                if let Some(identity) = &state.identity {
+                    doctor.line("ok", "runtime endpoint", &identity.describe());
+                }
+            }
+            Err(Failure::Usage(message)) => doctor.line("fail", "runtime state", &message),
+            Err(Failure::Gear(error)) => doctor.line("fail", "runtime state", &error.to_string()),
+        }
+    } else {
+        doctor.line(
+            "info",
+            "runtime state",
+            "not checked (pass --effective to resolve the runtime and verify the live effective Lead)",
         );
     }
 
@@ -3086,12 +3079,29 @@ fn config_command(
             disable_proxy,
         )
     };
+    let activate = |candidate: &config::Effective, activate_level: &str| {
+        activate_candidate_config(
+            candidate,
+            activate_level,
+            project_root,
+            invocation_dir,
+            env,
+            disable_proxy,
+        )
+    };
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut input = stdin.lock();
     let mut output = stdout.lock();
-    let code = crate::config_command::execute(&request, &context, &probe, &mut input, &mut output)
-        .map_err(Failure::Gear)?;
+    let code = crate::config_command::execute(
+        &request,
+        &context,
+        &probe,
+        &activate,
+        &mut input,
+        &mut output,
+    )
+    .map_err(Failure::Gear)?;
     Ok(code)
 }
 
@@ -3131,6 +3141,313 @@ fn probe_candidate_config(
         &proxy_env,
     )
     .ok()
+}
+
+/// Activate a candidate configuration on an OCG-owned private runtime and read
+/// the effective Lead back.
+///
+/// This is the last stage of a switch: after the file is written, prove that the
+/// exact generated configuration is accepted by the runtime OCG would launch and
+/// that its session reports the resolved agent/provider/model/variant. When no
+/// session-level runtime can be resolved (a v1 runtime or none at all) the
+/// caller reports the change as written-but-not-observed rather than verified.
+fn activate_candidate_config(
+    effective: &config::Effective,
+    level: &str,
+    project_root: &Path,
+    invocation_dir: &Path,
+    env: &Env,
+    disable_proxy: bool,
+) -> crate::config_command::Activation {
+    use crate::config_command::Activation;
+
+    let clock = SystemClock;
+    let process = SystemProcessHost;
+    let Ok(manager) = runtime_manager(project_root, effective, env, &NoHttp, &clock, &process)
+    else {
+        return Activation::NotAvailable("no OpenCode runtime could be resolved".to_string());
+    };
+    let report = manager.resolve_for_report();
+    let Some(program) = report.path.clone() else {
+        return Activation::NotAvailable("no OpenCode runtime could be resolved".to_string());
+    };
+    let adapter = match report.version.as_ref() {
+        Some(version) => match compat::classify(version.clone()) {
+            Ok(detected) => compat::adapter_for(&detected),
+            Err(error) => return Activation::NotAvailable(error.to_string()),
+        },
+        None => compat::v1_adapter(),
+    };
+    if adapter.major() != compat::Major::V2 {
+        return Activation::NotAvailable(
+            "the resolved v1 (1.18.x) runtime has no session-level Lead to observe".to_string(),
+        );
+    }
+    let contract = match model::lead_contract(&effective.data, level) {
+        Ok(contract) => contract,
+        Err(error) => return Activation::Failed(error.to_string()),
+    };
+    let lead = LeadSelection::from_contract(&contract);
+    let mut resolved = match build::build_opencode_config_for(effective, level, adapter) {
+        Ok(config) => config,
+        Err(error) => return Activation::Failed(error.to_string()),
+    };
+    // The generated plugin is not materialized for a check; removing it keeps
+    // the probe honest and leaves no local state behind.
+    crate::orchestration::plugin::remove_ocg_plugin_for(&mut resolved, adapter.plugin_key());
+    let content = match serde_json::to_string(&resolved) {
+        Ok(content) => content,
+        Err(error) => {
+            return Activation::Failed(format!(
+                "cannot serialize the OpenCode config for activation: {error}"
+            ))
+        }
+    };
+    let proxy = resolve_proxy(disable_proxy);
+    let proxy_env = proxy.child_env();
+    match runtime_effective::observe_owned_v2(
+        &program,
+        &content,
+        &[],
+        &proxy_env,
+        &lead,
+        &invocation_dir.to_string_lossy(),
+    ) {
+        Ok(observed) => Activation::Verified {
+            endpoint: observed.identity.endpoint,
+            session_id: observed.session_id,
+            lead: observed.effective,
+        },
+        Err(error) => Activation::Failed(error.to_string()),
+    }
+}
+
+/// Resolve the Configured / Resolved / Effective state for one throttle level.
+///
+/// `content` is the serialized OpenCode config with OCG's generated plugin
+/// removed: diagnostics must not materialize local state, and the removed
+/// plugin never affects which Lead model the runtime selects. `preflight` is
+/// the already-computed catalogue evidence when the caller has it. Either may
+/// be absent; the state is then reported as unverified/not observed rather than
+/// fabricated.
+#[allow(clippy::too_many_arguments)]
+fn build_runtime_state(
+    effective: &config::Effective,
+    level: &str,
+    program: Option<&Path>,
+    adapter: Option<&dyn RuntimeAdapter>,
+    content: Option<&str>,
+    proxy_env: &crate::proxy::ChildProxyEnv,
+    directory: &Path,
+    preflight: Option<&ModelPreflight>,
+    observe: bool,
+) -> std::result::Result<runtime_effective::RuntimeState, Failure> {
+    let contract = model::lead_contract(&effective.data, level).map_err(Failure::Gear)?;
+    let configured = LeadSelection::from_contract(&contract);
+    let static_errors = validate::validate(effective);
+    let model = runtime_effective::RuntimeState::model_evidence(preflight, &configured);
+    let (evidence, identity) = match (observe, program, adapter, content) {
+        (true, Some(program), Some(adapter), Some(content))
+            if adapter.major() == compat::Major::V2 =>
+        {
+            match runtime_effective::observe_owned_v2(
+                program,
+                content,
+                &[],
+                proxy_env,
+                &configured,
+                &directory.to_string_lossy(),
+            ) {
+                Ok(observed) => (
+                    runtime_effective::EffectiveEvidence::Observed {
+                        session_id: observed.session_id,
+                        lead: observed.effective,
+                    },
+                    Some(observed.identity),
+                ),
+                Err(error) => (
+                    runtime_effective::EffectiveEvidence::Unavailable(error.to_string()),
+                    None,
+                ),
+            }
+        }
+        (true, _, Some(adapter), _) => (
+            runtime_effective::EffectiveEvidence::NotObserved(format!(
+                "the resolved {} runtime has no session-level Lead to observe",
+                adapter.major().as_str()
+            )),
+            None,
+        ),
+        (true, _, _, _) => (
+            runtime_effective::EffectiveEvidence::NotObserved(
+                "no usable OpenCode runtime was resolved".to_string(),
+            ),
+            None,
+        ),
+        (false, _, _, _) => (
+            runtime_effective::EffectiveEvidence::NotObserved(
+                "effective-state verification was not requested (pass --effective)".to_string(),
+            ),
+            None,
+        ),
+    };
+    Ok(runtime_effective::RuntimeState {
+        level: level.to_string(),
+        configured,
+        static_errors,
+        model,
+        effective: evidence,
+        identity,
+    })
+}
+
+fn runtime_state_token(status: &str) -> &'static str {
+    match status {
+        "ok" => "PASS",
+        "warn" => "WARN",
+        "error" => "FAIL",
+        _ => "INFO",
+    }
+}
+
+/// Render one resolved [`runtime_effective::RuntimeState`] as concise lines.
+fn print_runtime_state_lines(state: &runtime_effective::RuntimeState) {
+    println!();
+    println!("Runtime state (level {}):", state.level);
+    let (status, detail) = configured_line(state);
+    println!(
+        "  {:<16} [{}] {detail}",
+        "configured",
+        runtime_state_token(status)
+    );
+    if state.static_errors.is_empty() {
+        println!("  {:<16} [PASS] accepted by OCG validation", "resolved");
+    } else {
+        println!(
+            "  {:<16} [FAIL] {}",
+            "resolved",
+            state.static_errors.join("; ")
+        );
+    }
+    let (status, detail) = state.model.describe(
+        &state.configured.full_model_id(),
+        state.configured.variant.as_deref(),
+    );
+    println!(
+        "  {:<16} [{}] {detail}",
+        "model",
+        runtime_state_token(status)
+    );
+    let (status, detail) = state.effective_line();
+    println!(
+        "  {:<16} [{}] {detail}",
+        "effective",
+        runtime_state_token(status)
+    );
+    match &state.identity {
+        Some(identity) => println!("  {:<16} {}", "runtime", identity.describe()),
+        None => println!(
+            "  {:<16} none — no OCG-owned runtime was resolved",
+            "runtime"
+        ),
+    }
+}
+
+fn configured_line(state: &runtime_effective::RuntimeState) -> (&'static str, String) {
+    let variant = state
+        .configured
+        .variant
+        .as_deref()
+        .unwrap_or("provider-default");
+    (
+        "ok",
+        format!(
+            "{} on {} (variant {variant})",
+            state.configured.agent,
+            state.configured.full_model_id()
+        ),
+    )
+}
+
+/// `ocg status --effective`: resolve the runtime and print the three states.
+fn print_runtime_state(
+    effective: &config::Effective,
+    project_root: &Path,
+    invocation_dir: &Path,
+    level: &str,
+    env: &Env,
+    disable_proxy: bool,
+    observe: bool,
+) -> std::result::Result<(), Failure> {
+    let proxy = resolve_proxy(disable_proxy);
+    let proxy_env = proxy.child_env();
+    let clock = SystemClock;
+    let process = SystemProcessHost;
+    let manager = runtime_manager(project_root, effective, env, &NoHttp, &clock, &process)
+        .map_err(Failure::Gear)?;
+    let report = manager.resolve_for_report();
+    for warning in &report.warnings {
+        eprintln!("ocg: warning: {warning}");
+    }
+    let adapter = match report.version.as_ref() {
+        Some(version) => match compat::classify(version.clone()) {
+            Ok(detected) => Some(compat::adapter_for(&detected)),
+            Err(error) => {
+                eprintln!("ocg: warning: {error}");
+                None
+            }
+        },
+        None => {
+            eprintln!(
+                "ocg: warning: could not determine the OpenCode version; assuming the v1 (1.18.x) contract"
+            );
+            Some(compat::v1_adapter())
+        }
+    };
+    let program = report.path.clone();
+    let content = match (program.as_deref(), adapter) {
+        (Some(_), Some(adapter)) => {
+            let mut resolved = build::build_opencode_config_for(effective, level, adapter)
+                .map_err(Failure::Gear)?;
+            crate::orchestration::plugin::remove_ocg_plugin_for(
+                &mut resolved,
+                adapter.plugin_key(),
+            );
+            Some(serde_json::to_string(&resolved).map_err(|error| {
+                Failure::Gear(GearError::config(format!(
+                    "cannot serialize the OpenCode config for the runtime state report: {error}"
+                )))
+            })?)
+        }
+        _ => None,
+    };
+    let preflight = match (program.as_deref(), content.as_deref()) {
+        (Some(program), Some(content)) => Some(
+            crate::preflight::probe(
+                &effective.data,
+                &process,
+                program,
+                invocation_dir,
+                content,
+                &proxy_env,
+            )
+            .map_err(Failure::Gear)?,
+        ),
+        _ => None,
+    };
+    let state = build_runtime_state(
+        effective,
+        level,
+        program.as_deref(),
+        adapter,
+        content.as_deref(),
+        &proxy_env,
+        invocation_dir,
+        preflight.as_ref(),
+        observe,
+    )?;
+    print_runtime_state_lines(&state);
+    Ok(())
 }
 
 fn throttle_command(

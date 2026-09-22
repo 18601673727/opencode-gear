@@ -346,13 +346,65 @@ replaced by the system runtime, and is preserved by `ocg upgrade`.
 ### Runtime commands
 
 ```bash
-ocg version   # Gear, platform, resolved OpenCode version/source/path (read-only)
-ocg doctor    # layered config, Lead contracts, OpenCode, proxy, provider and runtime (read-only)
-ocg upgrade   # self-update Gear, then force-maintain the active OpenCode
+ocg version            # Gear, platform, resolved OpenCode version/source/path (read-only)
+ocg doctor             # layered config, Lead contracts, OpenCode, proxy, provider and runtime (read-only)
+ocg status --effective # throttle/routing plus the live Configured/Resolved/Effective state
+ocg doctor --effective # doctor plus the live Configured/Resolved/Effective state
+ocg upgrade            # self-update Gear, then force-maintain the active OpenCode
 ```
 
 `ocg version` and `ocg doctor` never install, upgrade or bootstrap anything.
 `ocg doctor` explains what a bootstrap would do when no runtime is present.
+`--effective` is opt-in: it starts and terminates a private runtime, so it is
+never part of the default read-only path.
+
+### Runtime ownership and readiness
+
+A coding launch never attaches to an ambient `opencode serve` daemon: a daemon
+OCG did not start carries a catalogue and configuration OCG cannot reason about,
+and a listening port does not prove the API is ready. OCG therefore starts its
+own loopback server for exactly one invocation, hands it the generated config
+through `OPENCODE_CONFIG_CONTENT`, and terminates it when the invocation ends.
+The identity of that endpoint is explicit and printed at launch and in reports:
+
+```text
+ocg: runtime ocg-managed-invocation http://127.0.0.1:<port> (pid <pid>) | session <id> | effective Lead lead-high on openai/gpt-6-astra (provider-default)
+```
+
+Startup is a handshake (`server listening on <url>`, `server password ...`)
+followed by a **real readiness check**: OCG polls the API until an authenticated
+request succeeds. Reading the handshake lines is necessary but not sufficient —
+the socket may not be bound yet, the process may have died, or the runtime may
+reject the credentials. The probe is bounded (a first immediate probe, then
+150 attempts 100 ms apart), never sleeps when the runtime is already ready, and
+fails with a distinct error when readiness is never reached.
+
+### Configured, Resolved and Effective
+
+Three states are kept distinct and never fabricated from one another:
+
+- **Configured** — what the layered YAML requests (the active throttle level's
+  Lead agent, provider, model and variant).
+- **Resolved** — what OCG's own validation accepts, plus the runtime catalogue
+  evidence that the requested provider/model is actually exposed.
+- **Effective** — what a *live* runtime session reports after OCG activates the
+  resolved contract on it.
+
+`ocg status --effective` and `ocg doctor --effective` resolve the runtime and
+print the three states. The observation is real: OCG starts the owned server,
+activates the resolved Lead on a session and reads the session back, so the
+Effective line comes from the executing runtime rather than from the YAML. The
+private server is terminated before the command returns.
+
+The states stay distinct when they disagree. A model the catalogue does not
+expose is reported as a missing provider or a missing model; a probe that could
+not run is reported as *not checked* (never "missing"); an unobserved runtime is
+*not observed* (never "verified"); and an observed session that reports a
+different agent/model than the configuration requested is a contradiction
+reported as a failure. Because the OpenCode 2 session API accepts any
+provider/model id without validating it (confirmed against a live 2.0.11
+server), the session read-back proves *intent* while the catalogue probe proves
+*availability*; OCG records both and never presents one as the other.
 
 ### `ocg doctor`
 
@@ -409,9 +461,25 @@ It reports:
 - **provider / auth readiness** — whether each configured model is currently
   exposed by the resolved OpenCode runtime, via its own model catalogue. OCG
   never reads or prints provider credentials.
+- **effective runtime state** (only with `--effective`) — the owned runtime
+  identity, the catalogue evidence for the configured model, and whether a live
+  session reports the resolved Lead. Without the flag doctor stays read-only and
+  fast and starts nothing.
 
 Each line is **PASS / INFO / WARN / FAIL**. Only a FAIL makes `ocg doctor` exit
 non-zero, so a warning (for example a SOCKS proxy) is safe in a scripted smoke.
+
+With `--effective`, doctor appends a live runtime-state block observed from an
+owned private runtime:
+
+```text
+Runtime state (level high):
+  configured       [PASS] lead-high on openai/gpt-6-astra (variant provider-default)
+  resolved         [PASS] accepted by OCG validation
+  model            [PASS] openai/gpt-6-astra is exposed by the resolved runtime catalogue
+  effective        [PASS] session <id> on ocg-managed-invocation http://127.0.0.1:<port> (pid <pid>) reports lead-high on openai/gpt-6-astra (provider-default)
+  runtime          ocg-managed-invocation http://127.0.0.1:<port> (pid <pid>)
+```
 
 ### Runtime layout and cleanup
 
@@ -569,6 +637,22 @@ Key facts:
   OpenCode model catalogue (`opencode models`). If the catalogue proves the
   model is not exposed, the change is rejected. If the catalogue cannot be
   read at all, the change is written and the report says it was not verified.
+- After a successful write the change is **activated and verified by default**:
+  OCG starts an owned private runtime, activates the resolved Lead on a session,
+  reads the effective provider/model/variant back and prints it:
+
+  ```text
+    effective: verified on http://127.0.0.1:<port> (session <id>)
+               lead-high on openai/gpt-6-astra (provider-default)
+  ```
+
+  `--no-activate` skips this step; the report then says the change was not
+  verified on a runtime.
+- The commit point is the atomic write. If activation fails, the change is kept
+  and the report says `effective: NOT VERIFIED` (a runtime was reached but
+  read-back failed) or `not observed` (no session-level runtime could be
+  activated). The state is never ambiguous: the file is either the old one or
+  the new one, and the verification status is explicit either way.
 - `--yes` is required for the scriptable forms; interactive mode asks for a
   confirmation instead. `ocg config` never touches provider credentials.
 
@@ -737,15 +821,17 @@ project-agnostic.
 ## Commands
 
 ```text
-ocg [low|mid|high] [--throttle low|mid|high] [--project DIR] [--dry-run] [--disable-proxy] [command] [args...]
+ocg [low|mid|high] [--throttle low|mid|high] [--project DIR] [--dry-run] [--disable-proxy] [--effective] [command] [args...]
 
 (none)              launch interactive OpenCode with the gear config
 run <args...>       launch `opencode run`
 models [args...]    run `opencode models`
 status              throttle, routing and config layers
+                    (--effective also resolves and verifies the live runtime state)
 routing             worker role -> model table
 config              configure the Lead, providers and models (interactive menu)
-config lead [level] show, or switch, the Lead model for a throttle level
+config lead [level] show, or switch and verify, the Lead model for a throttle level
+                    (--no-activate writes the change without activating it)
 config provider add-openai-compatible <name>
                     register an OpenAI-compatible provider (key via {env:VAR})
 throttle [level]    print, or persist, the default throttle level
@@ -764,6 +850,7 @@ checkpoint list|show|save
                     inspect or record a versioned phase checkpoint
 version             Gear, platform and the resolved OpenCode runtime
 doctor              read-only layering/config/OpenCode/proxy/runtime diagnosis
+                    (--effective adds the live Configured/Resolved/Effective state)
 upgrade             self-update Gear, then maintain the active OpenCode
 help                print usage
 ```

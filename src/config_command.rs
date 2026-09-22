@@ -29,6 +29,7 @@ use crate::defaults::EXECUTION_TIERS;
 use crate::error::{GearError, Result};
 use crate::model;
 use crate::preflight::{Availability, ModelPreflight};
+use crate::runtime::compat::EffectiveLead;
 use crate::validate;
 use crate::yaml;
 use serde_json::{json, Map, Value};
@@ -92,6 +93,8 @@ pub enum Request {
         model: Option<String>,
         variant: Option<String>,
         yes: bool,
+        /// Verify the change on a private runtime after writing it (default).
+        activate: bool,
     },
     /// `ocg config provider add-openai-compatible <name> ...`
     ProviderAdd {
@@ -126,6 +129,29 @@ pub struct Context<'a> {
 /// be resolved); the caller then reports the change as runtime-unverified.
 pub type ProbeFn<'a> = dyn Fn(&Effective, &str) -> Option<ModelPreflight> + 'a;
 
+/// The outcome of the activation step — the last stage of a switch.
+#[derive(Debug, Clone)]
+pub enum Activation {
+    /// An OCG-owned runtime accepted the resolved contract and its session
+    /// reports the effective Lead back. This is the only proof that the switch
+    /// reached an actual runtime.
+    Verified {
+        endpoint: String,
+        session_id: String,
+        lead: EffectiveLead,
+    },
+    /// A runtime was reached but activation or read-back failed.
+    Failed(String),
+    /// No session-level runtime could be activated (a v1 runtime, no runtime,
+    /// or the user passed `--no-activate`).
+    NotAvailable(String),
+}
+
+/// The activation probe, injected by the CLI. It starts an OCG-owned runtime
+/// for the candidate configuration, applies the resolved Lead and reads the
+/// effective state back. It never persists the runtime.
+pub type ActivateFn<'a> = dyn Fn(&Effective, &str) -> Activation + 'a;
+
 /// The runtime verdict for the report.
 enum RuntimeVerdict {
     Verified,
@@ -156,11 +182,12 @@ pub fn execute(
     request: &Request,
     ctx: &Context,
     probe: &ProbeFn,
+    activate: &ActivateFn,
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> Result<i32> {
     match request {
-        Request::Interactive => interactive(ctx, probe, input, output),
+        Request::Interactive => interactive(ctx, probe, activate, input, output),
         Request::ShowLead => {
             print_lead_table(ctx, output)?;
             Ok(0)
@@ -171,6 +198,7 @@ pub fn execute(
             model,
             variant,
             yes,
+            activate: should_activate,
         } => {
             if !*yes {
                 return Err(usage(
@@ -180,10 +208,12 @@ pub fn execute(
             apply_lead(
                 ctx,
                 probe,
+                activate,
                 level,
                 *scope,
                 model.as_deref(),
                 variant.as_deref(),
+                *should_activate,
                 output,
             )
         }
@@ -215,12 +245,17 @@ fn parse_lead(words: &[String]) -> Result<Request> {
     let mut model: Option<String> = None;
     let mut variant: Option<String> = None;
     let mut yes = false;
+    let mut activate = true;
     let mut index = 0;
     while index < words.len() {
         let word = words[index].as_str();
         match word {
             "--yes" => {
                 yes = true;
+                index += 1;
+            }
+            "--no-activate" => {
+                activate = false;
                 index += 1;
             }
             "--scope" => {
@@ -281,6 +316,7 @@ fn parse_lead(words: &[String]) -> Result<Request> {
         model,
         variant,
         yes,
+        activate,
     })
 }
 
@@ -399,13 +435,16 @@ struct ModelRef {
     created_provider: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_lead(
     ctx: &Context,
     probe: &ProbeFn,
+    activate: &ActivateFn,
     level: &str,
     scope: Scope,
     model_arg: Option<&str>,
     variant: Option<&str>,
+    should_activate: bool,
     output: &mut dyn Write,
 ) -> Result<i32> {
     if !ctx
@@ -470,6 +509,17 @@ fn apply_lead(
     }
 
     write_layer(&path, &layer)?;
+    // The write is the commit point: from here the change is real. Activation
+    // runs after it and can only *report* a mismatch, never leave a half-written
+    // file behind.
+    let activation = if should_activate {
+        activate(&candidate, level)
+    } else {
+        Activation::NotAvailable(
+            "activation was skipped (--no-activate); the change was not verified on a runtime"
+                .to_string(),
+        )
+    };
     report_lead(
         ctx,
         scope,
@@ -478,6 +528,7 @@ fn apply_lead(
         &candidate,
         created.as_ref(),
         runtime,
+        &activation,
         output,
     )?;
     Ok(0)
@@ -939,6 +990,7 @@ fn report_lead(
     candidate: &Effective,
     created: Option<&ModelRef>,
     runtime: RuntimeVerdict,
+    activation: &Activation,
     output: &mut dyn Write,
 ) -> Result<()> {
     let contract = model::lead_contract(&candidate.data, level)?;
@@ -980,6 +1032,28 @@ fn report_lead(
             "  runtime:  NOT verified — {reason}; the change is written but was not checked against the runtime"
         )?,
         RuntimeVerdict::Rejected => {}
+    }
+    // The activation/effective-state line. A successful switch reports the
+    // effective provider/model/variant the private runtime actually reports;
+    // an unobserved state is never presented as verified.
+    match activation {
+        Activation::Verified {
+            endpoint,
+            session_id,
+            lead,
+        } => {
+            emit!(
+                output,
+                "  effective: verified on {endpoint} (session {session_id})"
+            )?;
+            emit!(
+                output,
+                "             {}",
+                crate::runtime::effective::render_effective(lead)
+            )?;
+        }
+        Activation::Failed(reason) => emit!(output, "  effective: NOT VERIFIED — {reason}")?,
+        Activation::NotAvailable(reason) => emit!(output, "  effective: not observed — {reason}")?,
     }
     // A higher-precedence layer wins silently otherwise: say so explicitly.
     if scope == Scope::User && layer_sets_lead(&ctx.project_path, level) {
@@ -1068,7 +1142,7 @@ fn print_lead_table(ctx: &Context, output: &mut dyn Write) -> Result<()> {
     emit!(output, "")?;
     emit!(
         output,
-        "  change:  ocg config lead <level> --model provider/model [--variant V] [--scope user|project] --yes"
+        "  change:  ocg config lead <level> --model provider/model [--variant V] [--scope user|project] --yes [--no-activate]"
     )?;
     emit!(output, "  provider: ocg config provider add-openai-compatible <name> --base-url URL --api-key-env VAR --model ID --yes")?;
     Ok(())
@@ -1077,6 +1151,7 @@ fn print_lead_table(ctx: &Context, output: &mut dyn Write) -> Result<()> {
 fn interactive(
     ctx: &Context,
     probe: &ProbeFn,
+    activate: &ActivateFn,
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> Result<i32> {
@@ -1095,7 +1170,7 @@ fn interactive(
             "0" | "q" | "quit" | "exit" => return Ok(0),
             "1" => print_lead_table(ctx, output)?,
             "2" => {
-                if let Some(code) = interactive_lead(ctx, probe, input, output)? {
+                if let Some(code) = interactive_lead(ctx, probe, activate, input, output)? {
                     if code != 0 {
                         return Ok(code);
                     }
@@ -1117,6 +1192,7 @@ fn interactive(
 fn interactive_lead(
     ctx: &Context,
     probe: &ProbeFn,
+    activate: &ActivateFn,
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> Result<Option<i32>> {
@@ -1170,10 +1246,12 @@ fn interactive_lead(
     let code = apply_lead(
         ctx,
         probe,
+        activate,
         &level,
         scope,
         model.as_deref(),
         variant.as_deref(),
+        true,
         output,
     )?;
     Ok(Some(code))

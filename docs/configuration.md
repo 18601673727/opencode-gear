@@ -252,6 +252,61 @@ The update cache lives in the platform cache directory
 macOS). Both successful and failed checks are recorded, so a runtime that just
 failed to upgrade is not retried within the interval.
 
+### Runtime ownership and readiness
+
+A coding launch owns its runtime. OCG starts a private loopback OpenCode 2
+server for one invocation (`opencode serve --hostname 127.0.0.1 --port 0`) with
+the generated config passed through `OPENCODE_CONFIG_CONTENT`, and terminates it
+when the invocation ends. It never attaches a launch to an ambient background
+service, because such a server carries a catalogue and configuration OCG cannot
+reason about.
+
+Readiness is a real API probe, not a port check: after reading the startup
+handshake (`server listening on <url>`, `server password ...`), OCG polls the
+API until an authenticated request succeeds. The probe is bounded — a first
+immediate attempt, then up to 150 attempts 100 ms apart — so an already-ready
+runtime costs one request and no sleep, and a runtime that never becomes ready
+fails with a distinct error instead of hanging. The raw handshake is necessary
+but not sufficient: the socket may not be bound, the process may have exited, or
+the credentials may be rejected, and each of those is reported separately from a
+runtime that is still starting.
+
+## Effective runtime state
+
+Configured, Resolved and Effective are three distinct states, and OCG never
+fabricates one from another.
+
+| State | Meaning |
+| --- | --- |
+| Configured | What the layered YAML requests: the active level's Lead agent, provider, model and (optional) variant. |
+| Resolved | What OCG's own static validation accepts, plus runtime catalogue evidence that the requested provider/model is exposed. |
+| Effective | What a live runtime session reports after OCG activates the resolved contract on it. |
+
+`ocg status --effective` and `ocg doctor --effective` print all three from a live
+observation. The Effective line is not derived from YAML: OCG starts the owned
+server, activates the resolved Lead on a session, and reads the session back, so
+the reported agent/provider/model/variant is what the executing runtime actually
+holds. The private server is terminated before the command returns. Without
+`--effective`, both commands stay read-only and fast.
+
+The states stay distinct when they disagree:
+
+| Situation | Reported as |
+| --- | --- |
+| Catalogue does not expose the provider | missing provider (failure) |
+| Provider exposed, model absent | missing model (failure) |
+| Catalogue probe could not run | not checked (warning, never "missing") |
+| No session-level runtime could be observed | not observed (info, never "verified") |
+| Runtime reached, activation/read-back failed | could not be verified (failure) |
+| Session reports a different agent/model/variant | contradiction (failure) |
+
+The OpenCode 2 session API accepts any provider/model id without validating it
+(confirmed against a live 2.0.11 server); the session read-back therefore proves
+*intent* while the catalogue probe proves *availability*, and OCG records both.
+A configured model with no declared variant is satisfied by any reported variant
+(the provider default, rendered as `provider-default`); a declared variant must
+be observed exactly.
+
 ## Context policy
 
 The optional local context engine is configured by the top-level `context`
@@ -526,12 +581,13 @@ GitHub API requests and never attaches it to a non-`api.github.com` host.
 ## Commands
 
 ```text
-ocg [low|mid|high] [--throttle LEVEL] [--project DIR] [--dry-run] [--pretty] [--disable-proxy] [command] [args...]
+ocg [low|mid|high] [--throttle LEVEL] [--project DIR] [--dry-run] [--pretty] [--disable-proxy] [--effective] [command] [args...]
 
 ocg build    [--pretty] [--throttle LEVEL] [--project DIR]
 ocg validate [--throttle LEVEL] [--project DIR]
 ocg routing  [--project DIR]
-ocg status   [--throttle LEVEL] [--project DIR]
+ocg status   [--throttle LEVEL] [--project DIR] [--effective]
+ocg config   lead [level] --model PROVIDER/MODEL [--variant V] [--scope user|project] --yes [--no-activate]
 ocg throttle [LEVEL] [--project DIR]
 ocg layers   [--project DIR]
 ocg init     [--project DIR]
@@ -544,7 +600,7 @@ ocg verify   [fast|normal|full] [--pretty] [--project DIR]
 ocg tools    <task...> [--pretty] [--project DIR]
 ocg checkpoint list|show <id>|save --phase P [--task T] [--decision D] [--pretty] [--project DIR]
 ocg version  (read-only runtime report)
-ocg doctor   (read-only environment check)
+ocg doctor   (read-only environment check; --effective adds the live runtime state)
 ocg upgrade  (self-update Gear, then maintain OpenCode)
 ```
 
@@ -555,6 +611,15 @@ resolution; an absent runtime keeps the deterministic v1 contract). `validate`
 exits non-zero on any configuration
 error and prints every problem it finds; it is a static check and exercises the
 runtime-independent v1 builder without probing any runtime.
+
+`ocg config lead` writes a semantic override atomically and then, by default,
+activates and verifies it: it starts an owned private runtime, activates the
+resolved Lead on a session, reads the effective provider/model/variant back and
+prints it (`effective: verified on <endpoint> (session <id>)`). `--no-activate`
+skips that step. The commit point is the atomic write, so a failed activation
+keeps the written change and reports `effective: NOT VERIFIED` or `not observed`
+rather than leaving a half-switched state. See
+[Effective runtime state](#effective-runtime-state).
 
 ## Observability
 

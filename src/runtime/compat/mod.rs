@@ -23,6 +23,7 @@
 pub mod v1;
 pub mod v2;
 pub mod v2_client;
+pub mod v2_server;
 
 use crate::error::{GearError, Result};
 use crate::model::LeadContract;

@@ -15,6 +15,7 @@
 pub mod archive;
 pub mod cache;
 pub mod compat;
+pub mod effective;
 pub mod hash;
 pub mod install;
 pub mod policy;
