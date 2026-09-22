@@ -503,23 +503,30 @@ fn apply_lead(
         return Ok(1);
     }
 
-    let runtime = probe_runtime(&candidate, probe, level, output)?;
-    if matches!(runtime, RuntimeVerdict::Rejected) {
-        return Ok(1);
-    }
-
-    write_layer(&path, &layer)?;
-    // The write is the commit point: from here the change is real. Activation
-    // runs after it and can only *report* a mismatch, never leave a half-written
-    // file behind.
-    let activation = if should_activate {
-        activate(&candidate, level)
+    // When the user asks not to activate, skip the runtime probe entirely so
+    // we never start an OCG-owned runtime just to validate the candidate.
+    // Static validation already rejected structural problems; the change is
+    // written without a runtime transaction.
+    let (runtime, activation) = if should_activate {
+        let runtime = probe_runtime(&candidate, probe, level, output)?;
+        if matches!(runtime, RuntimeVerdict::Rejected) {
+            return Ok(1);
+        }
+        (runtime, activate(&candidate, level))
     } else {
-        Activation::NotAvailable(
-            "activation was skipped (--no-activate); the change was not verified on a runtime"
-                .to_string(),
+        (
+            RuntimeVerdict::Unavailable("activation skipped (--no-activate)".to_string()),
+            Activation::NotAvailable(
+                "activation was skipped (--no-activate); the change was not verified on a runtime"
+                    .to_string(),
+            ),
         )
     };
+
+    write_layer(&path, &layer)?;
+    // The write is the commit point: from here the change is real. Any
+    // activation was already computed without mutating state and can only
+    // *report* a mismatch, never leave a half-written file behind.
     report_lead(
         ctx,
         scope,

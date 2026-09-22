@@ -502,6 +502,47 @@ impl SessionClient for V2SessionClient {
     }
 }
 
+impl V2SessionClient {
+    /// Query the runtime's loaded configuration for exposed provider/model ids.
+    ///
+    /// OpenCode 2's `/api/config` returns an array of config sources; the
+    /// candidate config passed via `OPENCODE_CONFIG_CONTENT` appears as a
+    /// document entry whose `info.providers` map carries the loaded providers
+    /// and their model ids. The returned strings match the `provider/model_id`
+    /// tokens preflight expects.
+    pub fn catalogue(&self) -> Result<Vec<String>> {
+        let body = self
+            .send("GET", "/api/config", None)?
+            .ok_or_else(|| malformed("/api/config", "empty response"))?;
+        parse_catalogue(&body)
+    }
+}
+
+/// Extract `provider/model_id` tokens from an `/api/config` response.
+fn parse_catalogue(body: &Value) -> Result<Vec<String>> {
+    let entries = body
+        .as_array()
+        .ok_or_else(|| malformed("/api/config", "expected a JSON array"))?;
+    let mut tokens = Vec::new();
+    for entry in entries {
+        let Some(info) = entry.get("info").and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(providers) = info.get("providers").and_then(Value::as_object) else {
+            continue;
+        };
+        for (provider_id, provider) in providers {
+            let Some(models) = provider.get("models").and_then(Value::as_object) else {
+                continue;
+            };
+            for model_id in models.keys() {
+                tokens.push(format!("{provider_id}/{model_id}"));
+            }
+        }
+    }
+    Ok(tokens)
+}
+
 fn malformed(path: &str, reason: &str) -> GearError {
     GearError::config(format!(
         "OpenCode V2 session response from {path} is malformed: {reason}"
@@ -1041,5 +1082,63 @@ mod tests {
             error.to_string().contains("reachable but cannot serve"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn catalogue_extracts_provider_model_tokens_from_config_response() {
+        let body = json!([
+            {"type": "directory", "path": "/tmp/opencode-config"},
+            {
+                "type": "document",
+                "info": {
+                    "$schema": "https://opencode.ai/config.json",
+                    "providers": {
+                        "vsllm": {
+                            "name": "Vsllm",
+                            "package": "aisdk:@ai-sdk/openai-compatible",
+                            "settings": {"baseURL": "https://vsllm.cc/v1", "apiKey": "fake"},
+                            "models": {
+                                "gpt-6-astra": {"name": "Gpt 6 Astra"},
+                                "gpt-5.6-sol": {"name": "Gpt 5 6 Sol"}
+                            }
+                        },
+                        "openai": {
+                            "name": "OpenAI",
+                            "models": {
+                                "gpt-6-astra": {"name": "GPT-6 Astra"}
+                            }
+                        }
+                    }
+                }
+            }
+        ]);
+        let tokens = parse_catalogue(&body).unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                "vsllm/gpt-6-astra",
+                "vsllm/gpt-5.6-sol",
+                "openai/gpt-6-astra",
+            ]
+        );
+    }
+
+    #[test]
+    fn catalogue_skips_entries_without_providers() {
+        let body = json!([
+            {"type": "directory", "path": "/tmp/opencode-config"},
+            {"type": "document", "info": {"providers": {}}},
+            {"type": "document", "info": {}},
+            {"type": "directory", "path": "/tmp"}
+        ]);
+        let tokens = parse_catalogue(&body).unwrap();
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn catalogue_rejects_non_array_response() {
+        let body = json!({"providers": {}});
+        let error = parse_catalogue(&body).unwrap_err();
+        assert!(error.to_string().contains("expected a JSON array"));
     }
 }

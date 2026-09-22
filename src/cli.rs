@@ -3109,8 +3109,12 @@ fn config_command(
 ///
 /// Returns `None` when no probe can be attempted at all (no resolvable runtime
 /// or adapter); the caller then reports the change as runtime-unverified
-/// instead of pretending the model was checked. The probe uses OpenCode's
-/// supported `models` output and never reads credential stores.
+/// instead of pretending the model was checked.
+///
+/// For OpenCode 2 this starts an OCG-owned private server with the exact
+/// candidate configuration and reads the loaded providers/models from
+/// `/api/config`. The v1 family keeps using OpenCode's supported `models` CLI
+/// output. Neither path reads provider credential stores.
 fn probe_candidate_config(
     effective: &config::Effective,
     level: &str,
@@ -3132,6 +3136,17 @@ fn probe_candidate_config(
     let content = serde_json::to_string(&resolved).ok()?;
     let proxy = resolve_proxy(disable_proxy);
     let proxy_env = proxy.child_env();
+
+    if adapter.major() == compat::Major::V2 {
+        return probe_candidate_v2(
+            &effective.data,
+            &program,
+            &content,
+            invocation_dir,
+            &proxy_env,
+        );
+    }
+
     crate::preflight::probe(
         &effective.data,
         &process,
@@ -3141,6 +3156,37 @@ fn probe_candidate_config(
         &proxy_env,
     )
     .ok()
+}
+
+/// Probe a candidate configuration on an OCG-owned OpenCode 2 server.
+///
+/// The server is started with the candidate config, its `/api/config` endpoint
+/// is queried, and the returned provider/model tokens are checked against the
+/// candidate's requirements. This guarantees the validation uses the proposed
+/// configuration, not an ambient runtime that may ignore `OPENCODE_CONFIG_CONTENT`.
+fn probe_candidate_v2(
+    data: &Value,
+    program: &Path,
+    config_content: &str,
+    invocation_dir: &Path,
+    proxy_env: &crate::proxy::ChildProxyEnv,
+) -> Option<ModelPreflight> {
+    use crate::runtime::compat::v2_client::V2SessionClient;
+    use crate::runtime::compat::v2_server::OwnedV2Server;
+
+    let server =
+        OwnedV2Server::start(program, config_content, &[], proxy_env).map_err(|error| {
+            eprintln!("ocg: warning: cannot start a private OpenCode V2 server for the candidate probe: {error}");
+        }).ok()?;
+    let client = V2SessionClient::connect(
+        server.registration(),
+        invocation_dir.to_string_lossy().to_string(),
+    )
+    .ok()?;
+    let catalogue = client.catalogue().ok()?;
+    let output = catalogue.join("\n");
+    let requirements = model::runtime_model_requirements(data).ok()?;
+    Some(crate::preflight::check_output(requirements, &output))
 }
 
 /// Activate a candidate configuration on an OCG-owned private runtime and read

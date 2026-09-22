@@ -7,7 +7,7 @@
 mod common;
 
 use common::{read_yaml, write_yaml, TestDir};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -30,6 +30,7 @@ fn base_command(cwd: &Path, dir: &TestDir, user: &Path) -> Command {
         .env_remove("OC_GEAR_TRACE")
         .env_remove("OPENCODE_GEAR_OPENCODE")
         .env_remove("OPENCODE_GEAR_OPENCODE_BIN")
+        .env_remove("OC_GEAR_OPENCODE")
         .env_remove("OC_GEAR_OPENCODE_BIN")
         .env_remove("OPENCODE_GEAR_API_BASE")
         .env_remove("OPENCODE_GEAR_CACHE_DIR")
@@ -70,27 +71,227 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// A fake OpenCode whose `models` output is fully controlled.
+/// A fake OpenCode whose catalogue is fully controlled.
+///
+/// The fake is a small Python server because OpenCode 2's catalogue probe now
+/// starts an OCG-owned `opencode serve` child and reads `/api/config`; the
+/// same fake also preserves the historical `opencode models` CLI surface and
+/// the activation session API for the post-write read-back.
 fn fake_opencode(dir: &TestDir, name: &str, models: Option<&str>) -> PathBuf {
+    fake_opencode_impl(dir, name, models, false)
+}
+
+/// A fake OpenCode that reflects the providers and models declared in the
+/// generated config it receives through `OPENCODE_CONFIG_CONTENT`.
+fn fake_opencode_config_aware(dir: &TestDir, name: &str) -> PathBuf {
+    fake_opencode_impl(dir, name, None, true)
+}
+
+fn fake_opencode_impl(
+    dir: &TestDir,
+    name: &str,
+    models: Option<&str>,
+    config_aware: bool,
+) -> PathBuf {
     let path = dir.join(name);
-    let catalog = match models {
-        Some(models) => format!("printf '%s\\n' {}", format_models(models)),
-        None => "exit 1".to_string(),
+    let fixed_models_json = models
+        .map(|models| {
+            let mut providers: serde_json::Map<String, Value> = Map::new();
+            for token in models.split_whitespace() {
+                let (provider, id) = token.split_once('/').unwrap_or(("unknown", token));
+                let provider_obj = providers
+                    .entry(provider.to_string())
+                    .or_insert_with(|| json!({"models": {}}));
+                provider_obj["models"][id] = json!({"name": id});
+            }
+            json!(providers).to_string()
+        })
+        .unwrap_or_else(|| "{}".to_string());
+    let config_aware_py = if config_aware { "True" } else { "False" };
+    let fail_probe_py = if models.is_none() && !config_aware {
+        "True"
+    } else {
+        "False"
     };
     let script = format!(
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"2.0.11\"\n  exit 0\nfi\nif [ \"$1\" = \"models\" ]; then\n  {catalog}\n  exit 0\nfi\necho \"fake opencode: unexpected arguments\" >&2\nexit 1\n"
+        r#"#!/usr/bin/env python3
+import base64
+import json
+import os
+import secrets
+import sys
+import threading
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+CONFIG_AWARE = {config_aware_py}
+FAIL_PROBE = {fail_probe_py}
+FIXED_MODELS = json.loads({fixed_models_json:?})
+PASSWORD = secrets.token_urlsafe(32)
+SESSION_STORE = {{}}
+
+
+def catalogue_from_env():
+    content = os.environ.get("OPENCODE_CONFIG_CONTENT", "{{}}")
+    try:
+        config = json.loads(content)
+    except Exception:
+        config = {{}}
+    providers = config.get("provider", {{}})
+    result = {{}}
+    for provider_name, provider in providers.items():
+        result[provider_name] = {{"models": {{}}}}
+        for model_id in provider.get("models", {{}}).keys():
+            result[provider_name]["models"][model_id] = {{"name": model_id}}
+    return result
+
+
+def get_catalogue():
+    if CONFIG_AWARE:
+        return catalogue_from_env()
+    return FIXED_MODELS
+
+
+def config_response():
+    return [
+        {{"type": "directory", "path": os.environ.get("HOME", "/tmp")}},
+        {{
+            "type": "document",
+            "info": {{
+                "$schema": "https://opencode.ai/config.json",
+                "providers": get_catalogue(),
+            }},
+        }},
+    ]
+
+
+def check_auth(headers):
+    auth = headers.get("Authorization", "")
+    if not auth.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(auth[6:]).decode("utf-8")
+        return decoded.split(":", 1)[1] == PASSWORD
+    except Exception:
+        return False
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def send_json(self, status, body):
+        data = json.dumps(body).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if not check_auth(self.headers):
+            self.send_error(401)
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/config":
+            self.send_json(200, config_response())
+        elif parsed.path == "/api/session":
+            self.send_json(
+                200,
+                {{"data": [], "cursor": {{"previous": None, "next": None}}}},
+            )
+        elif parsed.path.startswith("/api/session/"):
+            session_id = parsed.path[len("/api/session/"):].split("/")[0]
+            model = SESSION_STORE.get(session_id, {{}})
+            self.send_json(
+                200,
+                {{
+                    "data": {{
+                        "agent": model.get("agent", ""),
+                        "model": {{
+                            "providerID": model.get("providerID", ""),
+                            "id": model.get("id", ""),
+                            "variant": model.get("variant"),
+                        }},
+                    }}
+                }},
+            )
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        if not check_auth(self.headers):
+            self.send_error(401)
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length) if length else b"{{}}"
+        try:
+            payload = json.loads(body)
+        except Exception:
+            payload = {{}}
+        if parsed.path == "/api/session":
+            session_id = "ses_test_" + secrets.token_hex(8)
+            self.send_json(200, {{"data": {{"id": session_id}}}})
+        elif parsed.path.startswith("/api/session/"):
+            session_id = parsed.path[len("/api/session/"):].split("/")[0]
+            rest = "/".join(parsed.path[len("/api/session/"):].split("/")[1:])
+            if rest == "agent":
+                SESSION_STORE[session_id] = SESSION_STORE.get(session_id, {{}})
+                SESSION_STORE[session_id]["agent"] = payload.get("agent", "")
+                self.send_response(204)
+                self.end_headers()
+            elif rest == "model":
+                model = payload.get("model", {{}})
+                SESSION_STORE[session_id] = {{
+                    "agent": SESSION_STORE.get(session_id, {{}}).get("agent", ""),
+                    "providerID": model.get("providerID", ""),
+                    "id": model.get("id", ""),
+                    "variant": model.get("variant"),
+                }}
+                self.send_response(204)
+                self.end_headers()
+            else:
+                self.send_error(404)
+        else:
+            self.send_error(404)
+
+
+def run_serve():
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    print(f"server listening on http://127.0.0.1:{{port}}", flush=True)
+    print(f"server password {{PASSWORD}}", flush=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    thread.join()
+
+
+if sys.argv[1:] == ["--version"]:
+    print("2.0.11")
+    sys.exit(0)
+
+if sys.argv[1:] == ["models"]:
+    if FAIL_PROBE:
+        sys.exit(1)
+    catalogue = get_catalogue()
+    for provider_name, provider in catalogue.items():
+        for model_id in provider.get("models", {{}}).keys():
+            print(f"{{provider_name}}/{{model_id}}")
+    sys.exit(0)
+
+if sys.argv[1:] and sys.argv[1] == "serve":
+    if FAIL_PROBE:
+        sys.exit(1)
+    run_serve()
+
+print("fake opencode: unexpected arguments", file=sys.stderr)
+sys.exit(1)
+"#
     );
     fs::write(&path, script).expect("write fake opencode");
     make_executable(&path);
     path
-}
-
-fn format_models(models: &str) -> String {
-    models
-        .split_whitespace()
-        .map(|model| format!("'{model}'"))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 #[cfg(unix)]
@@ -610,6 +811,188 @@ fn a_missing_yes_refuses_to_write_in_scripted_mode() {
     );
     assert_ne!(output.status.code(), Some(0));
     assert!(!user.is_file(), "nothing may be written without --yes");
+}
+
+#[test]
+fn selecting_a_user_scoped_custom_provider_at_project_scope_succeeds() {
+    let dir = TestDir::new();
+    let project = project(&dir);
+    let user = user_path(&dir);
+    let fake = fake_opencode_config_aware(&dir, "fake-config-aware");
+
+    // Register the provider at user scope.
+    let add = run_with_fake(
+        &project,
+        &dir,
+        &user,
+        &fake,
+        &[
+            "config",
+            "provider",
+            "add-openai-compatible",
+            "vsllm",
+            "--base-url",
+            "https://vsllm.cc/v1",
+            "--api-key-env",
+            "VSLLM_API_KEY",
+            "--model",
+            "gpt-6-astra",
+            "--model",
+            "gpt-5.6-sol",
+            "--scope",
+            "user",
+            "--yes",
+        ],
+    );
+    assert_eq!(add.status.code(), Some(0), "stderr: {}", stderr(&add));
+
+    // Project config already exists with some content so it is not empty.
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
+        &json!({"throttle": {"levels": {"high": {"model": "astra"}}}}),
+    );
+
+    // Select a model from the user-scoped provider at project scope.
+    let output = run_with_fake(
+        &project,
+        &dir,
+        &user,
+        &fake,
+        &[
+            "config",
+            "lead",
+            "high",
+            "--model",
+            "vsllm/gpt-6-astra",
+            "--scope",
+            "project",
+            "--yes",
+        ],
+    );
+    let text = format!("{}\n{}", stdout(&output), stderr(&output));
+    assert_eq!(output.status.code(), Some(0), "output: {text}");
+    assert!(text.contains("Lead for throttle 'high' updated"), "{text}");
+    assert!(text.contains("vsllm/gpt-6-astra"), "{text}");
+    // The candidate runtime validated and the post-write activation read back
+    // the effective Lead from the OCG-owned private server.
+    assert!(
+        text.contains("runtime:  verified") || text.contains("effective: verified"),
+        "expected runtime/effective verification in: {text}"
+    );
+
+    let project_file = project.join(".opencode-gear.yaml");
+    let written = read_yaml(&project_file);
+    assert_eq!(
+        written["throttle"]["levels"]["high"]["model"],
+        json!("vsllm-gpt-6-astra")
+    );
+
+    // The user-scoped provider definition and env reference survive untouched.
+    let user_written = read_yaml(&user);
+    assert_eq!(
+        user_written["opencode"]["provider"]["vsllm"]["options"]["apiKey"],
+        json!("{env:VSLLM_API_KEY}")
+    );
+    let user_text = fs::read_to_string(&user).expect("read user yaml");
+    assert!(
+        !user_text.contains("sk-"),
+        "the actual secret must never be persisted: {user_text}"
+    );
+}
+
+#[test]
+fn missing_provider_is_rejected_and_leaves_files_unchanged() {
+    let dir = TestDir::new();
+    let project = project(&dir);
+    let user = user_path(&dir);
+    let fake = fake_opencode(&dir, "fake-ok", Some("openai/gpt-6-astra"));
+
+    let original_user = json!({"throttle": {"levels": {"high": {"model": "astra"}}}});
+    write_yaml(&user, &original_user);
+    let project_file = project.join(".opencode-gear.yaml");
+    let original_project = json!({"throttle": {"levels": {"low": {"model": "sol"}}}});
+    write_yaml(&project_file, &original_project);
+
+    let output = run_with_fake(
+        &project,
+        &dir,
+        &user,
+        &fake,
+        &[
+            "config",
+            "lead",
+            "high",
+            "--model",
+            "nonexistent/widget-7",
+            "--yes",
+        ],
+    );
+    assert_ne!(output.status.code(), Some(0));
+    let text = format!("{}\n{}", stdout(&output), stderr(&output));
+    assert!(
+        text.contains("does not expose nonexistent/widget-7"),
+        "{text}"
+    );
+    assert_eq!(read_yaml(&user), original_user);
+    assert_eq!(read_yaml(&project_file), original_project);
+}
+
+#[test]
+fn valid_provider_with_invalid_model_is_rejected_and_leaves_files_unchanged() {
+    let dir = TestDir::new();
+    let project = project(&dir);
+    let user = user_path(&dir);
+
+    // Register a provider that only exposes gpt-6-astra.
+    write_yaml(
+        &user,
+        &json!({
+            "models": {
+                "providers": {"vsllm": {"label": "Vsllm"}},
+                "models": {"vsllm-gpt-6-astra": {"provider": "vsllm", "id": "gpt-6-astra"}}
+            },
+            "opencode": {
+                "provider": {
+                    "vsllm": {
+                        "npm": "@ai-sdk/openai-compatible",
+                        "options": {
+                            "baseURL": "https://vsllm.cc/v1",
+                            "apiKey": "{env:VSLLM_API_KEY}"
+                        },
+                        "models": {"gpt-6-astra": {"name": "Gpt 6 Astra"}}
+                    }
+                }
+            }
+        }),
+    );
+
+    // The fake runtime reflects the configured provider/models exactly.
+    let fake = fake_opencode_config_aware(&dir, "fake-config-aware");
+    let project_file = project.join(".opencode-gear.yaml");
+    let original_project = json!({"throttle": {"levels": {"high": {"model": "astra"}}}});
+    write_yaml(&project_file, &original_project);
+
+    let output = run_with_fake(
+        &project,
+        &dir,
+        &user,
+        &fake,
+        &[
+            "config",
+            "lead",
+            "high",
+            "--model",
+            "vsllm/gpt-5.6-sol",
+            "--scope",
+            "project",
+            "--yes",
+        ],
+    );
+    assert_ne!(output.status.code(), Some(0));
+    let text = format!("{}\n{}", stdout(&output), stderr(&output));
+    assert!(text.contains("does not expose vsllm/gpt-5.6-sol"), "{text}");
+    assert_eq!(read_yaml(&user), read_yaml(&user));
+    assert_eq!(read_yaml(&project_file), original_project);
 }
 
 #[test]
