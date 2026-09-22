@@ -114,7 +114,7 @@ fn fake_opencode_impl(
         "False"
     };
     let script = format!(
-        r#"#!/usr/bin/env python3
+        r#"
 import base64
 import json
 import os
@@ -289,7 +289,14 @@ print("fake opencode: unexpected arguments", file=sys.stderr)
 sys.exit(1)
 "#
     );
-    fs::write(&path, script).expect("write fake opencode");
+    let python_path = path.with_extension("py");
+    fs::write(&python_path, script).expect("write fake opencode python");
+    let launcher = format!(
+        "#!/bin/sh\nset -eu\nif command -v python3 >/dev/null 2>&1; then\n  exec \"$(command -v python3)\" \"{}\" \"$@\"\nfi\nif [ -x /usr/bin/python3 ]; then\n  exec /usr/bin/python3 \"{}\" \"$@\"\nfi\nprintf '%s\\n' 'fake opencode requires python3' >&2\nexit 127\n",
+        python_path.display(),
+        python_path.display()
+    );
+    fs::write(&path, launcher).expect("write fake opencode launcher");
     make_executable(&path);
     path
 }
