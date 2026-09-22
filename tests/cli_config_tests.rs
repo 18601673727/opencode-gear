@@ -130,6 +130,9 @@ FIXED_MODELS = json.loads({fixed_models_json:?})
 PASSWORD = secrets.token_urlsafe(32)
 SESSION_STORE = {{}}
 
+print("fake checkpoint: python entry", file=sys.stderr, flush=True)
+print(f"fake checkpoint: argv={{sys.argv[1:]!r}}", file=sys.stderr, flush=True)
+
 
 def catalogue_from_env():
     content = os.environ.get("OPENCODE_CONFIG_CONTENT", "{{}}")
@@ -258,16 +261,21 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run_serve():
+    print("fake checkpoint: before HTTPServer", file=sys.stderr, flush=True)
     server = HTTPServer(("127.0.0.1", 0), Handler)
+    print("fake checkpoint: after HTTPServer", file=sys.stderr, flush=True)
     port = server.server_address[1]
+    print("fake checkpoint: before handshake", file=sys.stderr, flush=True)
     print(f"server listening on http://127.0.0.1:{{port}}", flush=True)
     print(f"server password {{PASSWORD}}", flush=True)
+    print("fake checkpoint: after handshake prints", file=sys.stderr, flush=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     thread.join()
 
 
 if sys.argv[1:] == ["--version"]:
+    print("fake checkpoint: version", file=sys.stderr, flush=True)
     print("2.0.11")
     sys.exit(0)
 
@@ -283,6 +291,7 @@ if sys.argv[1:] == ["models"]:
 if sys.argv[1:] and sys.argv[1] == "serve":
     if FAIL_PROBE:
         sys.exit(1)
+    print("fake checkpoint: serve dispatch", file=sys.stderr, flush=True)
     run_serve()
 
 print("fake opencode: unexpected arguments", file=sys.stderr)
