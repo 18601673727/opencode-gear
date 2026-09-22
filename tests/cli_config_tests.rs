@@ -3,14 +3,28 @@
 //! Every test runs the real binary against temp directories and an isolated
 //! HOME. The runtime catalogue probe is driven by a fake OpenCode executable
 //! so no real runtime, network or credential store is involved.
+//!
+//! The fake's HTTP surface is served by a Rust-owned `TcpListener` inside the
+//! test process. The generated executable only answers `--version`, prints the
+//! handshake for the already-listening Rust server, and stays alive until OCG
+//! terminates it. No external interpreter is involved, which keeps the tests
+//! deterministic on every supported platform (Linux and macOS runners).
+//!
+//! The candidate catalogue can be either fixed (`Fixed`) or derived from the
+//! exact candidate config OCG passes through `OPENCODE_CONFIG_CONTENT`
+//! (`ConfigAware`), which is what a real OpenCode 2 runtime loads.
 
 mod common;
 
 use common::{read_yaml, write_yaml, TestDir};
 use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 
 /// All environment that could leak the developer's real configuration.
 fn base_command(cwd: &Path, dir: &TestDir, user: &Path) -> Command {
@@ -18,6 +32,7 @@ fn base_command(cwd: &Path, dir: &TestDir, user: &Path) -> Command {
     command
         .current_dir(cwd)
         .env("HOME", dir.join("home"))
+        .env("PATH", "/usr/bin:/bin")
         .env("OPENCODE_GEAR_USER_CONFIG", user)
         .env_remove("OPENCODE_GEAR_PROJECT_CONFIG")
         .env_remove("OC_GEAR_USER_CONFIG")
@@ -71,243 +86,76 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// A fake OpenCode whose catalogue is fully controlled.
+/// The password OCG will be given for the fake runtime's local service.
+const FAKE_PASSWORD: &str = "local-fake-password";
+
+/// What the fake runtime answers `GET /api/config` with.
+#[derive(Clone)]
+enum Catalogue {
+    /// A fixed provider -> models mapping.
+    Fixed(BTreeMap<String, Vec<String>>),
+    /// Reflect the providers/models declared in `OPENCODE_CONFIG_CONTENT`.
+    ConfigAware,
+}
+
+/// A Rust-owned fake OpenCode 2 runtime server.
 ///
-/// The fake is a small Python server because OpenCode 2's catalogue probe now
-/// starts an OCG-owned `opencode serve` child and reads `/api/config`; the
-/// same fake also preserves the historical `opencode models` CLI surface and
-/// the activation session API for the post-write read-back.
-fn fake_opencode(dir: &TestDir, name: &str, models: Option<&str>) -> PathBuf {
-    fake_opencode_impl(dir, name, models, false)
+/// The listener is bound before the fake executable exists, so the
+/// advertisement the fake prints always describes a live socket. The
+/// executable itself is only a thin `sh` wrapper; the HTTP contract lives
+/// here, in the test process.
+struct FakeV2Server {
+    port: u16,
+    sessions: Arc<Mutex<BTreeMap<String, Value>>>,
 }
 
-/// A fake OpenCode that reflects the providers and models declared in the
-/// generated config it receives through `OPENCODE_CONFIG_CONTENT`.
-fn fake_opencode_config_aware(dir: &TestDir, name: &str) -> PathBuf {
-    fake_opencode_impl(dir, name, None, true)
-}
+impl FakeV2Server {
+    fn spawn(catalogue: Catalogue, candidate_path: PathBuf) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake runtime");
+        let port = listener.local_addr().expect("addr").port();
+        let sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let state = Arc::new(ServerState {
+            catalogue: Mutex::new(catalogue),
+            sessions: Arc::clone(&sessions),
+            candidate_path,
+        });
+        std::thread::spawn(move || serve(state, listener));
+        Self { port, sessions }
+    }
 
-fn fake_opencode_impl(
-    dir: &TestDir,
-    name: &str,
-    models: Option<&str>,
-    config_aware: bool,
-) -> PathBuf {
-    let path = dir.join(name);
-    let fixed_models_json = models
-        .map(|models| {
-            let mut providers: serde_json::Map<String, Value> = Map::new();
-            for token in models.split_whitespace() {
-                let (provider, id) = token.split_once('/').unwrap_or(("unknown", token));
-                let provider_obj = providers
-                    .entry(provider.to_string())
-                    .or_insert_with(|| json!({"models": {}}));
-                provider_obj["models"][id] = json!({"name": id});
-            }
-            json!(providers).to_string()
-        })
-        .unwrap_or_else(|| "{}".to_string());
-    let config_aware_py = if config_aware { "True" } else { "False" };
-    let fail_probe_py = if models.is_none() && !config_aware {
-        "True"
-    } else {
-        "False"
-    };
-    let script = format!(
-        r#"
-import base64
-import json
-import os
-import secrets
-import sys
-import threading
-import urllib.parse
-from http.server import BaseHTTPRequestHandler, HTTPServer
+    /// Write the fake OpenCode executable that advertises this server.
+    ///
+    /// The child writes its candidate `OPENCODE_CONFIG_CONTENT` to a file
+    /// shared with the Rust-owned server before printing the handshake.
+    fn executable(&self, dir: &TestDir, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        let config_path = dir.join(format!("{name}.candidate.json").as_str());
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then printf '%s\\n' '2.0.11'; exit 0; fi\n\
+             if [ \"$1\" = \"serve\" ]; then\n\
+               if [ -n \"${{OPENCODE_CONFIG_CONTENT+x}}\" ]; then\n\
+                 printf '%s' \"$OPENCODE_CONFIG_CONTENT\" > '{config_path}'\n\
+               fi\n\
+               printf '%s\\n' 'server listening on http://127.0.0.1:{port}'\n\
+               printf '%s\\n' 'server password {FAKE_PASSWORD}'\n\
+               while :; do sleep 5; done\n\
+             fi\n\
+             printf '%s\\n' 'fake opencode: unexpected arguments' >&2\n\
+             exit 1\n",
+            config_path = config_path.display(),
+            port = self.port,
+        );
+        fs::write(&path, script).expect("write fake opencode");
+        make_executable(&path);
+        path
+    }
 
-CONFIG_AWARE = {config_aware_py}
-FAIL_PROBE = {fail_probe_py}
-FIXED_MODELS = json.loads({fixed_models_json:?})
-PASSWORD = secrets.token_urlsafe(32)
-SESSION_STORE = {{}}
-
-print("fake checkpoint: python entry", file=sys.stderr, flush=True)
-print(f"fake checkpoint: argv={{sys.argv[1:]!r}}", file=sys.stderr, flush=True)
-
-
-def catalogue_from_env():
-    content = os.environ.get("OPENCODE_CONFIG_CONTENT", "{{}}")
-    try:
-        config = json.loads(content)
-    except Exception:
-        config = {{}}
-    providers = config.get("provider", {{}})
-    result = {{}}
-    for provider_name, provider in providers.items():
-        result[provider_name] = {{"models": {{}}}}
-        for model_id in provider.get("models", {{}}).keys():
-            result[provider_name]["models"][model_id] = {{"name": model_id}}
-    return result
-
-
-def get_catalogue():
-    if CONFIG_AWARE:
-        return catalogue_from_env()
-    return FIXED_MODELS
-
-
-def config_response():
-    return [
-        {{"type": "directory", "path": os.environ.get("HOME", "/tmp")}},
-        {{
-            "type": "document",
-            "info": {{
-                "$schema": "https://opencode.ai/config.json",
-                "providers": get_catalogue(),
-            }},
-        }},
-    ]
-
-
-def check_auth(headers):
-    auth = headers.get("Authorization", "")
-    if not auth.startswith("Basic "):
-        return False
-    try:
-        decoded = base64.b64decode(auth[6:]).decode("utf-8")
-        return decoded.split(":", 1)[1] == PASSWORD
-    except Exception:
-        return False
-
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass
-
-    def send_json(self, status, body):
-        data = json.dumps(body).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def do_GET(self):
-        if not check_auth(self.headers):
-            self.send_error(401)
-            return
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path == "/api/config":
-            self.send_json(200, config_response())
-        elif parsed.path == "/api/session":
-            self.send_json(
-                200,
-                {{"data": [], "cursor": {{"previous": None, "next": None}}}},
-            )
-        elif parsed.path.startswith("/api/session/"):
-            session_id = parsed.path[len("/api/session/"):].split("/")[0]
-            model = SESSION_STORE.get(session_id, {{}})
-            self.send_json(
-                200,
-                {{
-                    "data": {{
-                        "agent": model.get("agent", ""),
-                        "model": {{
-                            "providerID": model.get("providerID", ""),
-                            "id": model.get("id", ""),
-                            "variant": model.get("variant"),
-                        }},
-                    }}
-                }},
-            )
-        else:
-            self.send_error(404)
-
-    def do_POST(self):
-        if not check_auth(self.headers):
-            self.send_error(401)
-            return
-        parsed = urllib.parse.urlparse(self.path)
-        length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length) if length else b"{{}}"
-        try:
-            payload = json.loads(body)
-        except Exception:
-            payload = {{}}
-        if parsed.path == "/api/session":
-            session_id = "ses_test_" + secrets.token_hex(8)
-            self.send_json(200, {{"data": {{"id": session_id}}}})
-        elif parsed.path.startswith("/api/session/"):
-            session_id = parsed.path[len("/api/session/"):].split("/")[0]
-            rest = "/".join(parsed.path[len("/api/session/"):].split("/")[1:])
-            if rest == "agent":
-                SESSION_STORE[session_id] = SESSION_STORE.get(session_id, {{}})
-                SESSION_STORE[session_id]["agent"] = payload.get("agent", "")
-                self.send_response(204)
-                self.end_headers()
-            elif rest == "model":
-                model = payload.get("model", {{}})
-                SESSION_STORE[session_id] = {{
-                    "agent": SESSION_STORE.get(session_id, {{}}).get("agent", ""),
-                    "providerID": model.get("providerID", ""),
-                    "id": model.get("id", ""),
-                    "variant": model.get("variant"),
-                }}
-                self.send_response(204)
-                self.end_headers()
-            else:
-                self.send_error(404)
-        else:
-            self.send_error(404)
-
-
-def run_serve():
-    print("fake checkpoint: before HTTPServer", file=sys.stderr, flush=True)
-    server = HTTPServer(("127.0.0.1", 0), Handler)
-    print("fake checkpoint: after HTTPServer", file=sys.stderr, flush=True)
-    port = server.server_address[1]
-    print("fake checkpoint: before handshake", file=sys.stderr, flush=True)
-    print(f"server listening on http://127.0.0.1:{{port}}", flush=True)
-    print(f"server password {{PASSWORD}}", flush=True)
-    print("fake checkpoint: after handshake prints", file=sys.stderr, flush=True)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    thread.join()
-
-
-if sys.argv[1:] == ["--version"]:
-    print("fake checkpoint: version", file=sys.stderr, flush=True)
-    print("2.0.11")
-    sys.exit(0)
-
-if sys.argv[1:] == ["models"]:
-    if FAIL_PROBE:
-        sys.exit(1)
-    catalogue = get_catalogue()
-    for provider_name, provider in catalogue.items():
-        for model_id in provider.get("models", {{}}).keys():
-            print(f"{{provider_name}}/{{model_id}}")
-    sys.exit(0)
-
-if sys.argv[1:] and sys.argv[1] == "serve":
-    if FAIL_PROBE:
-        sys.exit(1)
-    print("fake checkpoint: serve dispatch", file=sys.stderr, flush=True)
-    run_serve()
-
-print("fake opencode: unexpected arguments", file=sys.stderr)
-sys.exit(1)
-"#
-    );
-    let python_path = path.with_extension("py");
-    fs::write(&python_path, script).expect("write fake opencode python");
-    let launcher = format!(
-        "#!/bin/sh\nset -eu\nif command -v python3 >/dev/null 2>&1; then\n  exec \"$(command -v python3)\" \"{}\" \"$@\"\nfi\nif [ -x /usr/bin/python3 ]; then\n  exec /usr/bin/python3 \"{}\" \"$@\"\nfi\nprintf '%s\\n' 'fake opencode requires python3' >&2\nexit 127\n",
-        python_path.display(),
-        python_path.display()
-    );
-    fs::write(&path, launcher).expect("write fake opencode launcher");
-    make_executable(&path);
-    path
+    /// The session state the fake accumulated, for assertions.
+    #[allow(dead_code)]
+    fn sessions(&self) -> BTreeMap<String, Value> {
+        self.sessions.lock().expect("sessions").clone()
+    }
 }
 
 #[cfg(unix)]
@@ -321,8 +169,251 @@ fn make_executable(path: &Path) {
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) {}
 
+struct ServerState {
+    catalogue: Mutex<Catalogue>,
+    sessions: Arc<Mutex<BTreeMap<String, Value>>>,
+    candidate_path: PathBuf,
+}
+
+/// Read one HTTP request, returning `(method, path, body)`.
+fn read_request(stream: &mut TcpStream) -> Option<(String, String, String)> {
+    let mut reader = BufReader::new(stream.try_clone().ok()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line).ok()?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?.to_string();
+    let path = parts.next()?.to_string();
+    let mut length = 0usize;
+    loop {
+        let mut header = String::new();
+        reader.read_line(&mut header).ok()?;
+        if header == "\r\n" || header.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    let mut body = vec![0u8; length];
+    if length > 0 {
+        reader.read_exact(&mut body).ok()?;
+    }
+    Some((method, path, String::from_utf8_lossy(&body).into_owned()))
+}
+
+fn respond(stream: &mut TcpStream, status: u16, body: &str) {
+    let reason = match status {
+        200 => "OK",
+        204 => "No Content",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        _ => "OK",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+/// Serve the routes `V2SessionClient` uses, exactly like the Python fake did.
+fn serve(state: Arc<ServerState>, listener: TcpListener) {
+    for stream in listener.incoming().take(256) {
+        let Ok(mut stream) = stream else { break };
+        let Some((method, path, body)) = read_request(&mut stream) else {
+            continue;
+        };
+        let path_only = path.split('?').next().unwrap_or("");
+        match (method.as_str(), path_only) {
+            ("GET", "/api/config") => {
+                let providers = match &*state.catalogue.lock().expect("catalogue") {
+                    Catalogue::Fixed(map) => {
+                        let mut result = Map::new();
+                        for (provider, models) in map {
+                            let mut model_map = Map::new();
+                            for model in models {
+                                model_map.insert(model.clone(), json!({"name": model}));
+                            }
+                            result.insert(provider.clone(), json!({"models": model_map}));
+                        }
+                        result
+                    }
+                    Catalogue::ConfigAware => catalogue_from_candidate(&state.candidate_path),
+                };
+                let body = json!([
+                    {"type": "directory", "path": "/tmp"},
+                    {
+                        "type": "document",
+                        "info": {
+                            "$schema": "https://opencode.ai/config.json",
+                            "providers": Value::Object(providers),
+                        },
+                    },
+                ]);
+                respond(&mut stream, 200, &body.to_string());
+            }
+            ("GET", "/api/session") => {
+                respond(
+                    &mut stream,
+                    200,
+                    &json!({"data": [], "cursor": {"previous": null, "next": null}}).to_string(),
+                );
+            }
+            ("POST", "/api/session") => {
+                let id = format!(
+                    "ses_fake_{}",
+                    state.sessions.lock().expect("sessions").len()
+                );
+                state
+                    .sessions
+                    .lock()
+                    .expect("sessions")
+                    .insert(id.clone(), json!({}));
+                respond(&mut stream, 200, &json!({"data": {"id": id}}).to_string());
+            }
+            ("GET", "/api/session/current") => {
+                let sessions = state.sessions.lock().expect("sessions");
+                let Some((id, model)) = sessions.iter().next_back() else {
+                    respond(&mut stream, 404, "{}");
+                    continue;
+                };
+                let agent = model.get("agent").and_then(Value::as_str).unwrap_or("");
+                respond(
+                    &mut stream,
+                    200,
+                    &json!({"data": {"id": id, "agent": agent, "model": model.get("model")}})
+                        .to_string(),
+                );
+            }
+            _ if method == "GET" && path_only.starts_with("/api/session/") => {
+                let id = path_only.trim_start_matches("/api/session/");
+                let sessions = state.sessions.lock().expect("sessions");
+                let Some(model) = sessions.get(id) else {
+                    respond(&mut stream, 404, "{}");
+                    continue;
+                };
+                respond(
+                    &mut stream,
+                    200,
+                    &json!({"data": {"agent": model.get("agent").unwrap_or(&json!("")),
+                                     "model": model.get("model")}})
+                    .to_string(),
+                );
+            }
+            _ if method == "POST" && path_only.ends_with("/agent") => {
+                let id = path_only
+                    .trim_start_matches("/api/session/")
+                    .trim_end_matches("/agent");
+                let agent = serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|value| value.get("agent").cloned())
+                    .unwrap_or(Value::Null);
+                let mut sessions = state.sessions.lock().expect("sessions");
+                let entry = sessions.entry(id.to_string()).or_insert(json!({}));
+                entry["agent"] = agent;
+                respond(&mut stream, 204, "");
+            }
+            _ if method == "POST" && path_only.ends_with("/model") => {
+                let id = path_only
+                    .trim_start_matches("/api/session/")
+                    .trim_end_matches("/model");
+                let model = serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|value| value.get("model").cloned())
+                    .unwrap_or(Value::Null);
+                let mut sessions = state.sessions.lock().expect("sessions");
+                let entry = sessions.entry(id.to_string()).or_insert(json!({}));
+                entry["model"] = model;
+                respond(&mut stream, 204, "");
+            }
+            _ => {
+                respond(&mut stream, 404, "{}");
+            }
+        }
+    }
+}
+
+/// Reflect the providers/models declared in the candidate config the fake
+/// child wrote before printing its handshake.
+fn catalogue_from_candidate(path: &Path) -> Map<String, Value> {
+    let content = fs::read_to_string(path).unwrap_or_default();
+    let config: Value = serde_json::from_str(&content).unwrap_or(Value::Null);
+    let mut result = Map::new();
+    if let Some(providers) = config.get("provider").and_then(Value::as_object) {
+        for (name, provider) in providers {
+            let mut models = Map::new();
+            if let Some(declared) = provider.get("models").and_then(Value::as_object) {
+                for model_id in declared.keys() {
+                    models.insert(model_id.clone(), json!({"name": model_id}));
+                }
+            }
+            result.insert(name.clone(), json!({"models": models}));
+        }
+    }
+    result
+}
+
 fn project(dir: &TestDir) -> PathBuf {
     dir.project()
+}
+
+/// A fake OpenCode whose catalogue is fully controlled.
+///
+/// The HTTP surface is a Rust-owned listener inside this test process; the
+/// generated executable only answers `--version`, prints the handshake for
+/// that listener and stays alive until OCG terminates it.
+fn fake_opencode(dir: &TestDir, name: &str, models: Option<&str>) -> PathBuf {
+    let Some(models) = models else {
+        return fake_opencode_failing_probe(dir, name);
+    };
+    let server = FakeV2Server::spawn(
+        Catalogue::Fixed(parse_fixed_models(models)),
+        dir.join(format!("{name}.candidate.json").as_str()),
+    );
+    server.executable(dir, name)
+}
+
+/// A fake OpenCode that reflects the providers and models declared in the
+/// generated config it receives through `OPENCODE_CONFIG_CONTENT`.
+fn fake_opencode_config_aware(dir: &TestDir, name: &str) -> PathBuf {
+    FakeV2Server::spawn(
+        Catalogue::ConfigAware,
+        dir.join(format!("{name}.candidate.json").as_str()),
+    )
+    .executable(dir, name)
+}
+
+/// A fake whose catalogue probe fails entirely: `models` exits non-zero and
+/// `serve` exits before any handshake, so OCG must report the probe as
+/// unavailable rather than return a catalogue verdict.
+fn fake_opencode_failing_probe(dir: &TestDir, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    let script = "#!/bin/sh\n\
+                  if [ \"$1\" = \"--version\" ]; then printf '%s\\n' '2.0.11'; exit 0; fi\n\
+                  exit 1\n";
+    fs::write(&path, script).expect("write fake opencode");
+    make_executable(&path);
+    path
+}
+
+fn parse_fixed_models(models: &str) -> BTreeMap<String, Vec<String>> {
+    let mut providers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for token in models.split_whitespace() {
+        match token.split_once('/') {
+            Some((provider, id)) => providers
+                .entry(provider.to_string())
+                .or_default()
+                .push(id.to_string()),
+            None => providers
+                .entry("unknown".to_string())
+                .or_default()
+                .push(token.to_string()),
+        }
+    }
+    providers
 }
 
 fn user_path(dir: &TestDir) -> PathBuf {
