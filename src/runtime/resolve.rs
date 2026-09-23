@@ -12,6 +12,7 @@ use crate::platform::Platform;
 use crate::process::{is_executable, ProcessHost};
 use crate::proxy::ChildProxyEnv;
 use crate::runtime::cache::{self, CacheRecord};
+use crate::runtime::compat;
 use crate::runtime::install::{ensure_gitignore, install_opencode, ActiveRuntime, Layout};
 use crate::runtime::policy::{self, RuntimePolicy};
 use crate::runtime::release::{self, Release};
@@ -170,6 +171,15 @@ impl<'a> RuntimeManager<'a> {
         }
 
         if let Some(active) = ActiveRuntime::read(&self.project_root) {
+            // Unpinned only (a pin returned above): a managed runtime from an
+            // older supported OpenCode family must not shadow a system
+            // runtime from a newer supported family. The managed install is
+            // left on disk untouched — it simply stops winning resolution.
+            if let Some(system) = self.system_selection() {
+                if system_is_newer_supported_family(&active.version, system.version.as_ref()) {
+                    return self.resolve_system(system);
+                }
+            }
             return self.resolve_managed(active);
         }
 
@@ -203,6 +213,14 @@ impl<'a> RuntimeManager<'a> {
                         "runtime.version pins {pin}, but the managed runtime is {}",
                         active.version
                     ));
+                }
+            } else if let Some(system) = self.system_selection() {
+                // Read-only reporting resolves exactly like a launch: an
+                // unpinned older-family managed runtime must not shadow a
+                // newer-family system runtime here either, otherwise
+                // `ocg version`/`ocg doctor` would disagree with `ocg run`.
+                if system_is_newer_supported_family(&active.version, system.version.as_ref()) {
+                    return RuntimeReport::from_selection(system);
                 }
             }
             return RuntimeReport {
@@ -844,6 +862,30 @@ fn is_compatible(version: &Option<Version>) -> bool {
         .as_ref()
         .map(|version| *version >= policy::min_opencode_version())
         .unwrap_or(false)
+}
+
+/// Whether an unpinned project should resolve to the system runtime instead of
+/// its existing managed one: the managed runtime belongs to an older
+/// *supported* OpenCode family and the system runtime to a newer one (managed
+/// V1 vs system V2).
+///
+/// Both sides go through the compat classifier rather than a raw number
+/// comparison, so a system runtime whose version cannot be probed or
+/// classified — or which belongs to an unsupported major, no matter how high
+/// its number is — never wins, and the managed fallback is preserved. A
+/// same-family system runtime never wins either: the managed preference is
+/// kept.
+fn system_is_newer_supported_family(managed: &Version, system: Option<&Version>) -> bool {
+    let Some(system) = system else {
+        return false;
+    };
+    let (Ok(managed), Ok(system)) = (
+        compat::classify(managed.clone()),
+        compat::classify(system.clone()),
+    ) else {
+        return false;
+    };
+    system.major() > managed.major()
 }
 
 /// Keep the system runtime as selected, replacing only the warnings.

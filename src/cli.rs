@@ -1656,57 +1656,94 @@ fn doctor_command(
                 "cannot serialize the OpenCode config for runtime model checks: {error}"
             )))
         })?;
-        let preflight = crate::preflight::probe(
-            &effective.data,
-            &process,
-            program,
-            project_root,
-            &content,
-            &proxy_env,
-        )
-        .map_err(Failure::Gear)?;
-        match &preflight {
-            ModelPreflight::Unavailable { reason } => doctor.line("warn", "runtime models", reason),
-            ModelPreflight::Complete { checks } => {
-                for check in checks {
-                    let variant = check
-                        .requirement
-                        .variant
-                        .as_deref()
-                        .map(|variant| format!(" (variant {variant})"))
-                        .unwrap_or_default();
-                    match check.availability {
-                        Availability::Available => doctor.line(
-                            "ok",
-                            &check.requirement.label,
-                            &format!("{}{}", check.requirement.full_model_id, variant),
-                        ),
-                        Availability::MissingProvider => {
-                            doctor.line(
-                                "error",
+        // OpenCode 2 is a background daemon: `opencode models` would silently
+        // query whatever ambient service happens to be up, ignoring the
+        // generated `OPENCODE_CONFIG_CONTENT` and provider credential env. And
+        // even an OCG-owned V2 runtime exposes no catalogue of config-declared
+        // providers, so Gear never infers V2 availability from any endpoint:
+        // it reports the catalogue evidence as unavailable (only when the
+        // caller opted into runtime contact with `--effective`, because the
+        // default doctor must never start a runtime) and relies on the
+        // effective-state observation instead. The v1 family keeps using
+        // OpenCode's supported `models` CLI surface.
+        if adapter.major() == compat::Major::V2 && !effective_state {
+            doctor.line(
+                "info",
+                "runtime models",
+                "not checked (pass --effective to probe the catalogue of an OCG-owned OpenCode V2 runtime)",
+            );
+            runtime_content = Some(content);
+        } else {
+            let preflight = if adapter.major() == compat::Major::V2 {
+                match probe_v2_owned_catalogue(
+                    &effective.data,
+                    program,
+                    &content,
+                    project_root,
+                    &proxy_env,
+                ) {
+                    Some(report) => report,
+                    None => ModelPreflight::Unavailable {
+                        reason: "runtime model check could not be completed (private OpenCode V2 server for the catalogue probe failed to start, connect, or report a catalogue)"
+                            .to_string(),
+                    },
+                }
+            } else {
+                crate::preflight::probe(
+                    &effective.data,
+                    &process,
+                    program,
+                    project_root,
+                    &content,
+                    &proxy_env,
+                )
+                .map_err(Failure::Gear)?
+            };
+            match &preflight {
+                ModelPreflight::Unavailable { reason } => {
+                    doctor.line("warn", "runtime models", reason)
+                }
+                ModelPreflight::Complete { checks } => {
+                    for check in checks {
+                        let variant = check
+                            .requirement
+                            .variant
+                            .as_deref()
+                            .map(|variant| format!(" (variant {variant})"))
+                            .unwrap_or_default();
+                        match check.availability {
+                            Availability::Available => doctor.line(
+                                "ok",
                                 &check.requirement.label,
-                                &format!(
-                                    "{}{} — provider is not currently exposed by OpenCode; authenticate/configure the provider or adjust OCG configuration",
-                                    check.requirement.full_model_id, variant
-                                ),
-                            );
-                        }
-                        Availability::MissingModel => {
-                            doctor.line(
-                                "error",
-                                &check.requirement.label,
-                                &format!(
-                                    "{}{} — model is not currently exposed by OpenCode; authenticate/configure the provider or adjust OCG configuration",
-                                    check.requirement.full_model_id, variant
-                                ),
-                            );
+                                &format!("{}{}", check.requirement.full_model_id, variant),
+                            ),
+                            Availability::MissingProvider => {
+                                doctor.line(
+                                    "error",
+                                    &check.requirement.label,
+                                    &format!(
+                                        "{}{} — provider is not currently exposed by OpenCode; authenticate/configure the provider or adjust OCG configuration",
+                                        check.requirement.full_model_id, variant
+                                    ),
+                                );
+                            }
+                            Availability::MissingModel => {
+                                doctor.line(
+                                    "error",
+                                    &check.requirement.label,
+                                    &format!(
+                                        "{}{} — model is not currently exposed by OpenCode; authenticate/configure the provider or adjust OCG configuration",
+                                        check.requirement.full_model_id, variant
+                                    ),
+                                );
+                            }
                         }
                     }
                 }
             }
+            runtime_content = Some(content);
+            runtime_preflight = Some(preflight);
         }
-        runtime_content = Some(content);
-        runtime_preflight = Some(preflight);
     } else {
         doctor.line(
             "info",
@@ -3111,10 +3148,11 @@ fn config_command(
 /// or adapter); the caller then reports the change as runtime-unverified
 /// instead of pretending the model was checked.
 ///
-/// For OpenCode 2 this starts an OCG-owned private server with the exact
-/// candidate configuration and reads the loaded providers/models from
-/// `/api/config`. The v1 family keeps using OpenCode's supported `models` CLI
-/// output. Neither path reads provider credential stores.
+/// OpenCode 2 exposes no catalogue of config-declared providers, so for the
+/// V2 family this honestly reports the catalogue evidence as unavailable (see
+/// [`probe_v2_owned_catalogue`]); availability is proven by activation on an
+/// OCG-owned runtime instead. The v1 family keeps using OpenCode's supported
+/// `models` CLI output. Neither path reads provider credential stores.
 fn probe_candidate_config(
     effective: &config::Effective,
     level: &str,
@@ -3158,12 +3196,47 @@ fn probe_candidate_config(
     .ok()
 }
 
-/// Probe a candidate configuration on an OCG-owned OpenCode 2 server.
+/// Report provider/model catalogue evidence for an OCG-owned OpenCode 2
+/// runtime.
 ///
-/// The server is started with the candidate config, its `/api/config` endpoint
-/// is queried, and the returned provider/model tokens are checked against the
-/// candidate's requirements. This guarantees the validation uses the proposed
-/// configuration, not an ambient runtime that may ignore `OPENCODE_CONFIG_CONTENT`.
+/// OpenCode 2 exposes no catalogue of config-declared providers, so no
+/// private server is started and no endpoint is queried here: the only honest
+/// catalogue answer is [`ModelPreflight::Unavailable`], and the real
+/// availability evidence is the OCG-owned runtime accepting and applying the
+/// selected Lead (see the activation/effective-state observation).
+///
+/// The `Option` return shape is retained for the shared call sites; this
+/// implementation never returns `None` because there is no probe attempt that
+/// could fail.
+fn probe_v2_owned_catalogue(
+    _data: &Value,
+    _program: &Path,
+    _config_content: &str,
+    _invocation_dir: &Path,
+    _proxy_env: &crate::proxy::ChildProxyEnv,
+) -> Option<ModelPreflight> {
+    // OpenCode 2 exposes no catalogue of config-declared providers. Verified
+    // against real OpenCode 2.0.14 on linux-arm64 and darwin-arm64:
+    // /api/config document entries carry an empty `info`, and /api/model +
+    // /api/provider list only built-in/registry models — never configured
+    // custom providers (their credentials resolve at use time). The previous
+    // implementation parsed a fictional `info.providers` shape and therefore
+    // reported every configured provider as "not currently exposed" while the
+    // same owned runtime demonstrably served the model — a false failure.
+    //
+    // The only honest availability evidence is the OCG-owned runtime itself:
+    // every launch applies the Lead on an owned session (hard-failing if the
+    // runtime cannot honor it), and status/doctor --effective observe the
+    // effective agent/provider/model on an owned session. Report Unavailable
+    // with this reason rather than fabricating a negative catalogue.
+    Some(ModelPreflight::Unavailable {
+        reason: "OpenCode 2 exposes no model catalogue for configured providers; the active Lead is verified by the OCG-owned runtime's session observation (see the effective state) and enforced at launch".to_string(),
+    })
+}
+
+/// Backwards-compatible alias used by the candidate-activation path. Identical
+/// to [`probe_v2_owned_catalogue`] — kept so this refactor does not split one
+/// proven helper across two names.
 fn probe_candidate_v2(
     data: &Value,
     program: &Path,
@@ -3171,22 +3244,7 @@ fn probe_candidate_v2(
     invocation_dir: &Path,
     proxy_env: &crate::proxy::ChildProxyEnv,
 ) -> Option<ModelPreflight> {
-    use crate::runtime::compat::v2_client::V2SessionClient;
-    use crate::runtime::compat::v2_server::OwnedV2Server;
-
-    let server =
-        OwnedV2Server::start(program, config_content, &[], proxy_env).map_err(|error| {
-            eprintln!("ocg: warning: cannot start a private OpenCode V2 server for the candidate probe: {error}");
-        }).ok()?;
-    let client = V2SessionClient::connect(
-        server.registration(),
-        invocation_dir.to_string_lossy().to_string(),
-    )
-    .ok()?;
-    let catalogue = client.catalogue().ok()?;
-    let output = catalogue.join("\n");
-    let requirements = model::runtime_model_requirements(data).ok()?;
-    Some(crate::preflight::check_output(requirements, &output))
+    probe_v2_owned_catalogue(data, program, config_content, invocation_dir, proxy_env)
 }
 
 /// Activate a candidate configuration on an OCG-owned private runtime and read
@@ -3469,15 +3527,34 @@ fn print_runtime_state(
     };
     let preflight = match (program.as_deref(), content.as_deref()) {
         (Some(program), Some(content)) => Some(
-            crate::preflight::probe(
-                &effective.data,
-                &process,
-                program,
-                invocation_dir,
-                content,
-                &proxy_env,
-            )
-            .map_err(Failure::Gear)?,
+            if adapter
+                .map(|adapter| adapter.major() == compat::Major::V2)
+                .unwrap_or(false)
+            {
+                match probe_v2_owned_catalogue(
+                    &effective.data,
+                    program,
+                    content,
+                    invocation_dir,
+                    &proxy_env,
+                ) {
+                    Some(report) => report,
+                    None => ModelPreflight::Unavailable {
+                        reason: "runtime model check could not be completed (private OpenCode V2 server for the catalogue probe failed to start, connect, or report a catalogue)"
+                            .to_string(),
+                    },
+                }
+            } else {
+                crate::preflight::probe(
+                    &effective.data,
+                    &process,
+                    program,
+                    invocation_dir,
+                    content,
+                    &proxy_env,
+                )
+                .map_err(Failure::Gear)?
+            },
         ),
         _ => None,
     };

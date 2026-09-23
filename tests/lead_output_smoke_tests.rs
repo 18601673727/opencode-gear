@@ -11,8 +11,11 @@
 //! adapter source, the bridge spawn (direct argv, JSON on stdin), the reports
 //! policy, and the atomic write. The OpenCode host itself is not started (a
 //! nested runtime cannot be isolated on this host; that limitation is recorded
-//! in the closeout report), so the event objects below mirror the documented
-//! OpenCode 2 event shapes (`message.updated` / `message.part.updated`).
+//! in the closeout report), so the event objects below mirror the OpenCode
+//! 2.0.14 plugin event contract observed directly on the real runtime:
+//! `{id, created, type, location?, durable?, data}` envelopes with
+//! `session.step.started` / `session.text.delta` / `session.text.ended` /
+//! `session.step.ended` payloads (there is no `properties` bag).
 
 mod common;
 
@@ -78,6 +81,33 @@ const ctx = {
   session: { hook: async () => ({ dispose: async () => {} }) },
   tool: { hook: async () => ({ dispose: async () => {} }) },
 };
+
+// The real OpenCode 2.0.14 plugin envelope, as observed on the live runtime.
+let eventSeq = 0;
+const envelope = (type, data) => ({
+  id: `evt_smoke_${++eventSeq}`,
+  created: 1790120849467 + eventSeq,
+  type,
+  durable: { aggregateID: typeof data.sessionID === "string" ? data.sessionID : "ses_smoke", seq: eventSeq, version: 1 },
+  location: { directory: process.env.OPENCODE_GEAR_PROJECT || process.cwd() },
+  data,
+});
+const stepStarted = (sessionID, messageID, agent) =>
+  envelope("session.step.started", { sessionID, assistantMessageID: messageID, agent, model: { id: "smoke-model", providerID: "smoke-provider" }, started: 1 });
+const textDelta = (sessionID, messageID, ordinal, delta) =>
+  envelope("session.text.delta", { sessionID, assistantMessageID: messageID, ordinal, delta });
+const textEnded = (sessionID, messageID, ordinal, text) =>
+  envelope("session.text.ended", { sessionID, assistantMessageID: messageID, ordinal, text });
+const stepEnded = (sessionID, messageID, finish) =>
+  envelope("session.step.ended", { sessionID, assistantMessageID: messageID, finish });
+const executionInterrupted = (sessionID) =>
+  envelope("session.execution.interrupted", { sessionID });
+const completedLeadTurn = (sessionID, stepID, text) => {
+  stream.push(stepStarted(sessionID, stepID, "lead-low"));
+  stream.push(textDelta(sessionID, stepID, 0, text.slice(0, 3)));
+  stream.push(textEnded(sessionID, stepID, 0, text));
+  stream.push(stepEnded(sessionID, stepID, "stop"));
+};
 "#;
 
 fn project(dir: &TestDir) -> PathBuf {
@@ -115,12 +145,17 @@ fn the_generated_v2_adapter_produces_the_raw_latest_lead_output_file() {
     let body = format!(
         r#"{PRELUDE}
 const dispose = await plugin.setup(ctx);
-stream.push({{ type: "message.part.updated", data: {{ sessionID: "root", part: {{ id: "p1", messageID: "m1", type: "text", text: "{escaped}" }} }} }});
-stream.push({{ type: "message.part.updated", data: {{ sessionID: "root", part: {{ id: "r1", messageID: "m1", type: "reasoning", text: "thinking" }} }} }});
-// Still streaming: no completion timestamp yet.
-stream.push({{ type: "message.updated", data: {{ sessionID: "root", info: {{ id: "m1", role: "assistant", agent: "lead-high", time: {{ created: 1 }} }} }} }});
-// Completed root Lead message.
-stream.push({{ type: "message.updated", data: {{ sessionID: "root", info: {{ id: "m1", role: "assistant", agent: "lead-high", time: {{ created: 1, completed: 2 }} }} }} }});
+// The intermediate tool-call step narrates but never completes the turn:
+// `finish: "tool-calls"` is not a completed response.
+stream.push(stepStarted("root", "m1", "lead-high"));
+stream.push(textDelta("root", "m1", 0, "narration that must not be reported"));
+stream.push(stepEnded("root", "m1", "tool-calls"));
+// The final step of the turn: streaming deltas, then the full ordinal text,
+// then `finish: "stop"` — the completed root Lead response.
+stream.push(stepStarted("root", "m2", "lead-high"));
+stream.push(textDelta("root", "m2", 0, "{escaped}"));
+stream.push(textEnded("root", "m2", 0, "{escaped}"));
+stream.push(stepEnded("root", "m2", "stop"));
 const target = process.env.OCG_EXPECTED_FILE;
 const deadline = Date.now() + 10000;
 while (!fs.existsSync(target) && Date.now() < deadline) {{
@@ -235,5 +270,186 @@ console.log(JSON.stringify({ exists: fs.existsSync(process.env.OCG_EXPECTED_FILE
     assert!(
         !expected.exists(),
         "a disabled switch must not write anything"
+    );
+}
+
+/// Regression boundary for the real OpenCode 2.0.14 contract: a completed
+/// root Lead response is written; a later interrupted, errored, failed,
+/// worker or non-OCG response never replaces it; the next genuinely completed
+/// root Lead response does. The events below replay the envelope and payload
+/// shapes captured from the live 2.0.14 runtime (session.* types, `data`
+/// payloads, `durable`/`location` envelope fields).
+#[test]
+fn only_a_completed_root_lead_response_replaces_the_latest_output() {
+    if !node_or_skip("only_a_completed_root_lead_response_replaces_the_latest_output") {
+        return;
+    }
+    let dir = TestDir::new();
+    let project = project(&dir);
+    let plugin_path = opencode_gear::orchestration::plugin::materialize_v2_with(
+        &project,
+        opencode_gear::runtime::compat::v2_adapter().plugin_source(),
+    )
+    .expect("materialize the V2 adapter");
+    fs::write(
+        dir.join("plugin.mjs"),
+        fs::read_to_string(&plugin_path).expect("read adapter"),
+    )
+    .expect("stage adapter");
+
+    let body = r#"import fs from "node:fs";
+import plugin from "./plugin.mjs";
+
+function makeStream() {
+  const queue = [];
+  let pending = null;
+  let closed = false;
+  const iterator = {
+    [Symbol.asyncIterator]() { return this; },
+    next() {
+      if (queue.length) return Promise.resolve({ value: queue.shift(), done: false });
+      if (closed) return Promise.resolve({ value: undefined, done: true });
+      return new Promise((resolve) => { pending = resolve; });
+    },
+    return() {
+      closed = true;
+      if (pending) { const resolve = pending; pending = null; resolve({ value: undefined, done: true }); }
+      return Promise.resolve({ value: undefined, done: true });
+    },
+  };
+  return {
+    iterator,
+    push(event) {
+      if (pending) { const resolve = pending; pending = null; resolve({ value: event, done: false }); }
+      else queue.push(event);
+    },
+  };
+}
+
+const stream = makeStream();
+const ctx = {
+  event: { subscribe: () => stream.iterator },
+  session: { hook: async () => ({ dispose: async () => {} }) },
+  tool: { hook: async () => ({ dispose: async () => {} }) },
+};
+
+// Real 2.0.14 envelope shapes, mirrored from the captured live event dump.
+let eventSeq = 0;
+const envelope = (type, data) => ({
+  id: `evt_regression_${++eventSeq}`,
+  created: 1790120849467 + eventSeq,
+  type,
+  durable: { aggregateID: typeof data.sessionID === "string" ? data.sessionID : "ses_regression", seq: eventSeq, version: 1 },
+  location: { directory: process.env.OPENCODE_GEAR_PROJECT || process.cwd() },
+  data,
+});
+const stepStarted = (sessionID, messageID, agent) =>
+  envelope("session.step.started", { sessionID, assistantMessageID: messageID, agent, model: { id: "claude-fable-5", providerID: "vsllm", variant: "high" }, snapshot: "abc", started: 1 });
+const textDelta = (sessionID, messageID, ordinal, delta) =>
+  envelope("session.text.delta", { sessionID, assistantMessageID: messageID, ordinal, delta });
+const textEnded = (sessionID, messageID, ordinal, text) =>
+  envelope("session.text.ended", { sessionID, assistantMessageID: messageID, ordinal, text });
+const stepEnded = (sessionID, messageID, finish, extra = {}) =>
+  envelope("session.step.ended", { sessionID, assistantMessageID: messageID, finish, rawFinish: finish === "stop" ? "stop" : finish === "tool-calls" ? "tool_calls" : null, cost: 0, tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }, snapshot: "abc", files: [], ...extra });
+const executionInterrupted = (sessionID) => envelope("session.execution.interrupted", { sessionID });
+const executionFailed = (sessionID) => envelope("session.execution.failed", { sessionID, error: { type: "unknown", message: "boom" } });
+
+const target = process.env.OCG_EXPECTED_FILE;
+const readTarget = () => { try { return fs.readFileSync(target, "utf8"); } catch (_) { return null; } };
+const waitFor = async (expected) => {
+  const deadline = Date.now() + 10000;
+  while (readTarget() !== expected && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return readTarget();
+};
+
+const dispose = await plugin.setup(ctx);
+
+// Turn 1: a completed root Lead response (deltas then the full ordinal text).
+stream.push(stepStarted("ses_root", "msg_good1", "lead-low"));
+stream.push(textDelta("ses_root", "msg_good1", 0, "GOOD-"));
+stream.push(textDelta("ses_root", "msg_good1", 0, "ONE"));
+stream.push(textEnded("ses_root", "msg_good1", 0, "GOOD-ONE"));
+stream.push(stepEnded("ses_root", "msg_good1", "stop"));
+const first = await waitFor("GOOD-ONE");
+
+// Turn 2: an interrupted response — partial text, an interruption and no
+// completing stop. The good output must stay byte-identical.
+stream.push(stepStarted("ses_root", "msg_partial", "lead-low"));
+stream.push(textDelta("ses_root", "msg_partial", 0, "PARTIAL-"));
+stream.push(executionInterrupted("ses_root"));
+// Turn 3: an errored step (finish: "error") and a failed execution.
+stream.push(stepStarted("ses_root", "msg_errored", "lead-low"));
+stream.push(textEnded("ses_root", "msg_errored", 0, "ERRORED"));
+stream.push(stepEnded("ses_root", "msg_errored", "error"));
+stream.push(stepStarted("ses_root", "msg_failed", "lead-low"));
+stream.push(textEnded("ses_root", "msg_failed", 0, "FAILED"));
+stream.push(executionFailed("ses_root"));
+// Turn 4: a worker and an unrelated agent complete but must never report.
+stream.push(stepStarted("ses_worker", "msg_worker", "ocg-explore"));
+stream.push(textEnded("ses_worker", "msg_worker", 0, "WORKER"));
+stream.push(stepEnded("ses_worker", "msg_worker", "stop"));
+stream.push(stepStarted("ses_other", "msg_other", "general"));
+stream.push(textEnded("ses_other", "msg_other", 0, "OTHER"));
+stream.push(stepEnded("ses_other", "msg_other", "stop"));
+// Give the pump every chance to (wrongly) overwrite the good output.
+await new Promise((resolve) => setTimeout(resolve, 500));
+const afterBad = readTarget();
+
+// Turn 5: the next genuinely completed root Lead response replaces it.
+stream.push(stepStarted("ses_root", "msg_good2", "lead-mid"));
+stream.push(textEnded("ses_root", "msg_good2", 0, "GOOD-TWO"));
+stream.push(stepEnded("ses_root", "msg_good2", "stop"));
+const second = await waitFor("GOOD-TWO");
+
+await dispose();
+console.log(JSON.stringify({ first, afterBad, second }));
+"#;
+    write_check(dir.path(), body);
+
+    let expected = opencode_gear::reports::latest_lead_output_path(&project);
+    let output = Command::new("node")
+        .arg("check.mjs")
+        .current_dir(dir.path())
+        .env("OPENCODE_GEAR_OCG", env!("CARGO_BIN_EXE_ocg"))
+        .env("OPENCODE_GEAR_PROJECT", &project)
+        .env("OPENCODE_GEAR_ORCHESTRATION_ENABLED", "1")
+        .env("OPENCODE_GEAR_REPORTS_LATEST_LEAD_OUTPUT", "1")
+        .env("OPENCODE_GEAR_USER_CONFIG", dir.join("no-user.yaml"))
+        .env(
+            "OPENCODE_GEAR_PROJECT_CONFIG",
+            project.join(".opencode-gear.yaml"),
+        )
+        .env("HOME", dir.join("home"))
+        .env("OCG_EXPECTED_FILE", &expected)
+        .output()
+        .expect("run the node adapter check");
+    assert!(
+        output.status.success(),
+        "node check failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse check output");
+    assert_eq!(
+        value["first"],
+        serde_json::json!("GOOD-ONE"),
+        "the first completed root Lead response must be captured"
+    );
+    assert_eq!(
+        value["afterBad"],
+        serde_json::json!("GOOD-ONE"),
+        "an interrupted, errored, failed, worker or non-OCG response must never overwrite a good output"
+    );
+    assert_eq!(
+        value["second"],
+        serde_json::json!("GOOD-TWO"),
+        "a later completed root Lead response must replace the previous one"
+    );
+    assert_eq!(
+        fs::read_to_string(&expected).expect("read final report"),
+        "GOOD-TWO",
+        "the final artifact is the latest good response, byte-verbatim"
     );
 }

@@ -226,7 +226,13 @@ Validation rejects unknown values and a pin below the OpenCode `1.18.0` floor.
 
 Resolution order for a launch is: explicit `OPENCODE_GEAR_OPENCODE` -> existing
 managed project runtime -> compatible system `opencode` on `PATH` ->
-project-local bootstrap.
+project-local bootstrap. One cross-family exception applies to unpinned
+projects: when the existing managed runtime belongs to an older supported
+OpenCode family (1.18.x) and the system runtime belongs to a newer supported
+family (2.x), the system runtime wins. The managed install stays on disk
+untouched; it simply stops shadowing the newer family. A `runtime.version`
+pin, a same-family system runtime, an unprobeable system binary, or an
+unsupported system major all keep the managed preference.
 
 - A compatible system runtime with a due check runs its own
   `opencode upgrade`, reprobes the version and continues. A failed upgrade

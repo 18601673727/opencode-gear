@@ -22,7 +22,10 @@ The errors name the offending key, for example:
 
 `ocg` resolves a runtime in a fixed order: explicit executable, existing
 managed project runtime, compatible system `opencode` on `PATH`, then a
-project-local bootstrap. Diagnose it with:
+project-local bootstrap. For unpinned projects there is one cross-family
+exception: a managed runtime from an older supported family (1.18.x) does not
+shadow a system runtime from a newer supported family (2.x); the managed
+install is left on disk. Diagnose it with:
 
 ```bash
 ocg doctor

@@ -630,7 +630,7 @@ fn an_invalid_variant_is_rejected_without_replacing_the_file() {
 }
 
 #[test]
-fn a_definitely_missing_active_model_is_rejected_when_the_probe_succeeds() {
+fn a_missing_active_model_is_written_but_reported_unverified_for_v2() {
     let dir = TestDir::new();
     let project = project(&dir);
     let user = user_path(&dir);
@@ -653,13 +653,13 @@ fn a_definitely_missing_active_model_is_rejected_when_the_probe_succeeds() {
             "--yes",
         ],
     );
-    assert_ne!(output.status.code(), Some(0));
+    assert_eq!(output.status.code(), Some(0));
     let text = format!("{}{}", stdout(&output), stderr(&output));
     assert!(
-        text.contains("does not expose openai/gpt-6-astra"),
+        text.contains("OpenCode 2 exposes no model catalogue"),
         "{text}"
     );
-    assert_eq!(read_yaml(&user), original, "the file must be unchanged");
+    assert_ne!(read_yaml(&user), original, "the file must be written");
 }
 
 #[test]
@@ -1008,7 +1008,7 @@ fn selecting_a_user_scoped_custom_provider_at_project_scope_succeeds() {
 }
 
 #[test]
-fn missing_provider_is_rejected_and_leaves_files_unchanged() {
+fn missing_provider_is_written_but_reported_unverified_for_v2() {
     let dir = TestDir::new();
     let project = project(&dir);
     let user = user_path(&dir);
@@ -1034,18 +1034,17 @@ fn missing_provider_is_rejected_and_leaves_files_unchanged() {
             "--yes",
         ],
     );
-    assert_ne!(output.status.code(), Some(0));
+    assert_eq!(output.status.code(), Some(0));
     let text = format!("{}\n{}", stdout(&output), stderr(&output));
     assert!(
-        text.contains("does not expose nonexistent/widget-7"),
+        text.contains("OpenCode 2 exposes no model catalogue"),
         "{text}"
     );
-    assert_eq!(read_yaml(&user), original_user);
-    assert_eq!(read_yaml(&project_file), original_project);
+    assert_ne!(read_yaml(&user), original_user);
 }
 
 #[test]
-fn valid_provider_with_invalid_model_is_rejected_and_leaves_files_unchanged() {
+fn invalid_model_is_written_but_reported_unverified_for_v2() {
     let dir = TestDir::new();
     let project = project(&dir);
     let user = user_path(&dir);
@@ -1095,11 +1094,13 @@ fn valid_provider_with_invalid_model_is_rejected_and_leaves_files_unchanged() {
             "--yes",
         ],
     );
-    assert_ne!(output.status.code(), Some(0));
+    assert_eq!(output.status.code(), Some(0));
     let text = format!("{}\n{}", stdout(&output), stderr(&output));
-    assert!(text.contains("does not expose vsllm/gpt-5.6-sol"), "{text}");
-    assert_eq!(read_yaml(&user), read_yaml(&user));
-    assert_eq!(read_yaml(&project_file), original_project);
+    assert!(
+        text.contains("OpenCode 2 exposes no model catalogue"),
+        "{text}"
+    );
+    assert_ne!(read_yaml(&project_file), original_project);
 }
 
 #[test]

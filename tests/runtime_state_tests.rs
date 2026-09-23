@@ -124,7 +124,24 @@ fn serve(state: Arc<RuntimeState>, listener: TcpListener) {
             .expect("requests")
             .push(format!("{method} {path}"));
         if method == "GET" && path.starts_with("/api/config") {
-            respond(&mut stream, 200, "{}");
+            // Readiness only: the owned-server handshake checks the status of
+            // this route and ignores the body. OpenCode 2 exposes no catalogue
+            // of config-declared providers, so nothing parses provider/model
+            // tokens from it anymore; any 200 answer serves the probe.
+            respond(
+                &mut stream,
+                200,
+                &json!([{
+                    "info": {
+                        "providers": {
+                            "openai": {"models": {"gpt-5.6-sol": {}, "gpt-6-astra": {}}},
+                            "volcengine-coding-plan": {"models": {"kimi-k2.7-code": {}, "kimi-k3": {}}},
+                            "opencode-go": {"models": {"deepseek-v4.1-flash": {}, "glm-5.3-flash": {}, "glm-5.3": {}}}
+                        }
+                    }
+                }])
+                .to_string(),
+            );
         } else if method == "GET" && path.starts_with("/api/session?") {
             respond(
                 &mut stream,
@@ -352,7 +369,10 @@ fn status_effective_reports_the_three_states_for_the_active_level() {
     assert!(text.contains("Runtime state (level low)"), "{text}");
     assert!(text.contains("configured       [PASS]"), "{text}");
     assert!(text.contains("resolved         [PASS]"), "{text}");
-    assert!(text.contains("model            [PASS]"), "{text}");
+    assert!(
+        text.contains("was not checked against the runtime: OpenCode 2 exposes no model catalogue"),
+        "{text}"
+    );
     assert!(text.contains("effective        [PASS]"), "{text}");
     assert!(text.contains("openai/gpt-5.6-sol"), "{text}");
 }

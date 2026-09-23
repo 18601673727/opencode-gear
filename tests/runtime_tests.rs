@@ -185,25 +185,171 @@ fn compatible_system_runtime_is_used_without_installing() {
     assert!(process.upgrade_calls().is_empty());
 }
 
+/// Same-family invariant: an existing managed runtime keeps winning over a
+/// system runtime from the *same* supported OpenCode family — even a newer
+/// same-family system release must not displace it.
 #[test]
-fn existing_managed_runtime_beats_system() {
+fn existing_managed_runtime_beats_same_family_system() {
     let dir = TestDir::new();
     let managed = install_fake_managed(dir.path(), "1.18.31");
     fresh_cache(&dir);
 
     let system = dir.join("opencode-system");
-    write_executable(&system, "#!/bin/sh\necho 1.18.31\n");
+    write_executable(&system, "#!/bin/sh\necho 1.18.40\n");
     let process = FakeProcessHost::new()
         .with_program("opencode", system)
-        .with_version(dir.join("opencode-system"), "1.18.31");
+        .with_version(dir.join("opencode-system"), "1.18.40");
 
     let http = MemoryHttp::new();
     let clock = FixedClock::new(1_000);
-    let selection = manager(&dir, RuntimePolicy::default(), &http, &clock, &process)
-        .resolve_for_launch()
-        .unwrap();
+    let manager = manager(&dir, RuntimePolicy::default(), &http, &clock, &process);
+    let selection = manager.resolve_for_launch().unwrap();
     assert_eq!(selection.source, RuntimeSource::Managed);
     assert_eq!(selection.path, managed);
+    let report = manager.resolve_for_report();
+    assert_eq!(report.source, Some(RuntimeSource::Managed));
+    assert_eq!(report.version, Some(Version::new(1, 18, 31)));
+}
+
+/// Cross-family invariant: an unpinned project whose managed runtime is an
+/// older supported family (V1) must resolve to a newer supported system
+/// family (V2) — the managed install stays on disk but stops shadowing the
+/// newer runtime. Launch and read-only reporting must agree.
+#[test]
+fn newer_family_system_runtime_beats_older_family_managed() {
+    let dir = TestDir::new();
+    install_fake_managed(dir.path(), "1.18.32");
+    fresh_cache(&dir);
+
+    let system = dir.join("opencode-system");
+    write_executable(&system, "#!/bin/sh\necho 2.0.14\n");
+    let process = FakeProcessHost::new()
+        .with_program("opencode", system.clone())
+        .with_version(system.clone(), "2.0.14");
+
+    let http = MemoryHttp::new();
+    let clock = FixedClock::new(1_000);
+    let manager = manager(&dir, RuntimePolicy::default(), &http, &clock, &process);
+
+    let selection = manager.resolve_for_launch().unwrap();
+    assert_eq!(selection.source, RuntimeSource::System);
+    assert_eq!(selection.path, system);
+    assert_eq!(selection.version, Some(Version::new(2, 0, 14)));
+
+    // `ocg version` / `ocg doctor` (resolve_for_report) must agree with `ocg run`.
+    let report = manager.resolve_for_report();
+    assert_eq!(report.source, Some(RuntimeSource::System));
+    assert_eq!(report.version, Some(Version::new(2, 0, 14)));
+
+    // The old managed runtime is never deleted or mutated.
+    let active = ActiveRuntime::read(dir.path()).unwrap();
+    assert_eq!(active.version, Version::new(1, 18, 32));
+}
+
+/// Same family on both sides: the managed V2 preference is preserved even
+/// against a newer system V2.
+#[test]
+fn managed_v2_still_beats_newer_system_v2() {
+    let dir = TestDir::new();
+    let managed = install_fake_managed(dir.path(), "2.0.14");
+    fresh_cache(&dir);
+
+    let system = dir.join("opencode-system");
+    write_executable(&system, "#!/bin/sh\necho 2.9.1\n");
+    let process = FakeProcessHost::new()
+        .with_program("opencode", system)
+        .with_version(dir.join("opencode-system"), "2.9.1");
+
+    let http = MemoryHttp::new();
+    let clock = FixedClock::new(1_000);
+    let manager = manager(&dir, RuntimePolicy::default(), &http, &clock, &process);
+    let selection = manager.resolve_for_launch().unwrap();
+    assert_eq!(selection.source, RuntimeSource::Managed);
+    assert_eq!(selection.path, managed);
+    let report = manager.resolve_for_report();
+    assert_eq!(report.source, Some(RuntimeSource::Managed));
+}
+
+/// An explicit `runtime.version` pin is authoritative and managed-only: a V1
+/// pin must not silently move the project to a system V2 runtime.
+#[test]
+fn pinned_managed_v1_beats_newer_family_system() {
+    let dir = TestDir::new();
+    let managed = install_fake_managed(dir.path(), "1.18.32");
+    fresh_cache(&dir);
+
+    let system = dir.join("opencode-system");
+    write_executable(&system, "#!/bin/sh\necho 2.0.14\n");
+    let process = FakeProcessHost::new()
+        .with_program("opencode", system)
+        .with_version(dir.join("opencode-system"), "2.0.14");
+
+    let policy = RuntimePolicy {
+        version: Some(Version::new(1, 18, 32)),
+        ..RuntimePolicy::default()
+    };
+    let http = MemoryHttp::new();
+    let clock = FixedClock::new(1_000);
+    let manager = manager(&dir, policy, &http, &clock, &process);
+    let selection = manager.resolve_for_launch().unwrap();
+    assert_eq!(selection.source, RuntimeSource::Managed);
+    assert_eq!(selection.path, managed);
+    assert_eq!(selection.version, Some(Version::new(1, 18, 32)));
+    let report = manager.resolve_for_report();
+    assert_eq!(report.source, Some(RuntimeSource::Managed));
+    assert_eq!(report.version, Some(Version::new(1, 18, 32)));
+}
+
+/// An unsupported system runtime — no matter how high its version number —
+/// must never displace a working managed runtime.
+#[test]
+fn unsupported_newer_system_never_beats_managed() {
+    let dir = TestDir::new();
+    let managed = install_fake_managed(dir.path(), "1.18.32");
+    fresh_cache(&dir);
+
+    let system = dir.join("opencode-system");
+    write_executable(&system, "#!/bin/sh\necho 9.0.0\n");
+    let process = FakeProcessHost::new()
+        .with_program("opencode", system)
+        .with_version(dir.join("opencode-system"), "9.0.0");
+
+    let http = MemoryHttp::new();
+    let clock = FixedClock::new(1_000);
+    let manager = manager(&dir, RuntimePolicy::default(), &http, &clock, &process);
+    let selection = manager.resolve_for_launch().unwrap();
+    assert_eq!(selection.source, RuntimeSource::Managed);
+    assert_eq!(selection.path, managed);
+    let report = manager.resolve_for_report();
+    assert_eq!(report.source, Some(RuntimeSource::Managed));
+}
+
+/// An explicit `OPENCODE_GEAR_OPENCODE` stays authoritative even when both a
+/// managed runtime and a newer-family system runtime exist.
+#[test]
+fn explicit_runtime_beats_managed_and_newer_family_system() {
+    let dir = TestDir::new();
+    install_fake_managed(dir.path(), "1.18.32");
+    fresh_cache(&dir);
+
+    let system = dir.join("opencode-system");
+    write_executable(&system, "#!/bin/sh\necho 2.0.14\n");
+    let explicit_bin = dir.join("my-opencode");
+    write_executable(&explicit_bin, "#!/bin/sh\necho 2.0.11\n");
+    let process = FakeProcessHost::new()
+        .with_program("opencode", system)
+        .with_version(dir.join("opencode-system"), "2.0.14")
+        .with_version(explicit_bin.clone(), "2.0.11");
+
+    let http = MemoryHttp::new();
+    let clock = FixedClock::new(1_000);
+    let manager = manager(&dir, RuntimePolicy::default(), &http, &clock, &process)
+        .with_explicit(Some(explicit_bin.clone().into_os_string()));
+    let selection = manager.resolve_for_launch().unwrap();
+    assert_eq!(selection.source, RuntimeSource::Explicit);
+    assert_eq!(selection.path, explicit_bin);
+    let report = manager.resolve_for_report();
+    assert_eq!(report.source, Some(RuntimeSource::Explicit));
 }
 
 #[test]

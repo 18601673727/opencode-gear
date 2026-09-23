@@ -267,8 +267,14 @@ Rules that fall out of this:
 
 - An explicit executable is authoritative. If it is missing or not
   executable, `ocg` errors instead of silently falling back.
-- An existing managed runtime always wins over the system `opencode`, so a
-  project stays deterministic once bootstrapped.
+- An existing managed runtime wins over a system `opencode` from the same
+  supported family, so a project stays deterministic once bootstrapped. For
+  unpinned projects there is one cross-family exception: a managed runtime
+  from an older supported family (1.18.x) does not shadow a system runtime
+  from a newer supported family (2.x) — the newer system runtime wins and the
+  managed install is simply left on disk. A `runtime.version` pin, an
+  unprobeable system binary or an unsupported system major all keep the
+  managed preference.
 - If there is no managed runtime and the system `opencode` is compatible,
   nothing is installed; the system runtime is used.
 - When a compatible system runtime has a **due** check, `ocg` resolves the
