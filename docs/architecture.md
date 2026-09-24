@@ -316,20 +316,27 @@ and launch differences.
 
 ## Resource Registry
 
-The Resource Registry is the descriptive factual substrate that a future
-Reconciler → Policy → Placement → Runtime pipeline will read:
+The Resource Registry is the descriptive factual substrate the
+Reconciler → Policy → Placement → Runtime pipeline reads:
 
 ```text
 Reconciler (observes)
         ↓
 Resource Registry (describes: facts, provenance, Unknown)
         ↓
-future Policy (interprets)
+Policy (decides: admissibility of the proposed action)
         ↓
-future Placement (selects)
+Placement (selects among admissible resources; still future)
         ↓
 Runtime (executes)
 ```
+
+The registry only *describes*. It never decides: a `ResourceId` is not (yet) a
+permanent policy key, `ResourceHealth::Available` is not capacity, and no row of
+facts is a recommendation. [Policy](#policy-admission-engine) is the layer that
+turns those facts into an admissibility decision, and it only consults the
+resource currently associated with the Mission — it never enumerates, ranks or
+selects.
 
 It answers *what execution resources does OCG know about, what facts are known
 about each, where did those facts come from, how fresh are they, and what
@@ -398,9 +405,123 @@ inspection surface (`--observe` records one local runtime observation);
 `ocg doctor --effective` prints a counts/health summary, never a record dump.
 
 Resource Broker, ranking, placement, automatic failover or rotation, quota
-routing, price optimisation, hard budget enforcement, a Policy engine, a
-scheduler/queue, distributed leases and a second runtime remain explicitly
-deferred.
+routing, price optimisation, hard budget enforcement, a scheduler/queue,
+distributed leases and a second runtime remain explicitly deferred. (The
+admission-only [Policy engine](#policy-admission-engine) is no longer deferred;
+it does not do any of the above.)
+
+## Policy admission engine
+
+Policy answers exactly one question:
+
+```text
+given this Mission,
+      this proposed control-plane action,
+      these current durable/runtime/resource facts,
+is the action allowed to proceed?
+```
+
+It answers *whether the Reconciler's proposed action is admissible for the
+resource the Mission is already associated with*. It never answers *which
+resource is best*: it does not enumerate, rank, score, rotate, fail over or
+select, and it does not enforce a hard budget. That remains future Placement /
+Resource Broker work. The four layers stay mechanically distinct:
+
+```text
+Mission      durable semantic truth
+Reconciler   determines what convergence action is needed
+Registry     describes factual resource state
+Policy       decides whether the proposed action is admissible
+Placement    later chooses among admissible resources
+Runtime      executes
+```
+
+### Decision vocabulary
+
+Decisions are typed, never boolean:
+
+```text
+Allow            proceed with the planned action
+Defer            not currently safe; keep durable state and retry later
+RequireApproval  needs an explicit approval bound to this exact generation/action
+Deny             never proceed for this action/context
+```
+
+Rules are evaluated in a fixed order and aggregated by an explicit precedence —
+`Deny > RequireApproval > Defer > Allow` — so the result is independent of rule
+ordering. The winning rule is always recorded, so *why was this allowed or
+blocked?* is answerable. Every non-trivial assessment carries the decision, a
+stable `reason_code`, a bounded secret-free human reason, `evaluated_at`, the
+rule identifier, the Mission identity/generation, the proposed action, the
+relevant fact probes and the approval view. None of these fields ever contains a
+credential. There is no boolean-only API and no "engine error ⇒ Allow" path:
+evaluation over a fully typed context is pure and total, and uncertainty fails
+closed.
+
+### Rules
+
+The engine ships a small fixed set of rules; there is no YAML rule DSL and no
+executable user code.
+
+- `policy.integrity` — a structurally invalid Mission/action identity is `Deny`.
+- `mission.terminal` — a terminal Mission never proceeds (`Deny`).
+- `runtime.capability` — a required lifecycle capability the adapter does not
+  support is `Defer`.
+- `observation.authoritative_absence` — creating/replacing an execution from a
+  non-authoritative absence (a failed inspection) is `Defer`. A durable create
+  intent already owned by the runtime recovery path is left alone.
+- `resource.availability` — a fresh `Unavailable` health fact defers; `Degraded`,
+  `Available`, `Unknown` and `Stale` do not block by themselves.
+- `approval` — when the configured policy requires approval for the action:
+  `Approved ⇒ Allow`, `Rejected ⇒ Deny`, `Pending`/absent ⇒ `RequireApproval`,
+  and a corrupt record is `Defer`. When no rule decides, the default is `Allow`
+  with rule `policy.default_allow`.
+
+Each rule declares the facts it actually requires. An unknown or stale *required*
+fact is never read optimistically — unknown quota is not unlimited, unknown
+capacity is not available, unknown cost is not free, unknown health is not
+healthy, and a stale fact is not a current fact. A fact a rule does not require
+can be `Unknown` without blocking it.
+
+### Resource facts and identity
+
+Policy consumes a runtime-neutral `ResourceFacts` view derived from the
+currently associated registry record. The association is resolved
+deterministically from the exact `ResourceId` the runtime profile/identity
+derives; if no record exists the facts are `Unknown`, which does not by itself
+deny. `ResourceHealth::Available` is availability evidence, **not** capacity, and
+a `ResourceId` is a derived identity — useful for association but not yet a
+permanent policy key. Registry load/format failure is fail-soft and unrelated to
+the facts a rule requires, so it never turns into a `Deny`.
+
+### Approvals
+
+An approval is a durable primitive bound to the exact Mission, generation,
+proposed action and current execution identity. It is stored as a small bounded
+document under `.opencode-gear/orchestration/approvals/` (schema-versioned,
+redacted, idempotent, pruned to a fixed bound); a pending request is idempotent
+and a stale or mismatched generation does not authorize the action. Inspect and
+act on approvals with `ocg approvals`, `ocg approve <id>` and `ocg reject <id>`
+(each accepts `--json`). `ocg policy [--json]` shows the effective policy and the
+latest durable admission per Mission.
+
+### Configuration and compatibility
+
+The top-level `policy` key controls the boundary:
+
+```yaml
+policy:
+  enabled: true            # default true
+  requireApprovalFor: []   # default empty
+```
+
+With the defaults the boundary is evaluated but never changes a previously
+successful workflow; approval is only demanded for actions explicitly listed in
+`requireApprovalFor`. The winning decision is persisted as a compact, redacted
+Policy receipt alongside the existing reconcile receipt; `Deny`, `Defer` and
+`RequireApproval` perform no runtime side effect and keep durable state intact
+for a later tick. Hard-dollar budgets, resource ranking/selection, a rules DSL
+and executable user policy remain explicitly deferred.
 
 ## Single-node reconciliation
 
@@ -414,6 +535,8 @@ durable Mission state
         ↓
 pure ReconcileDecision (reason + action)
         ↓
+Policy.evaluate (admissible? Allow/Defer/RequireApproval/Deny)
+        ↓
 at most one consequential action
         ↓
 Mission CAS / recovery artifact persistence
@@ -425,7 +548,11 @@ repeat on a later explicit tick
 mechanics and observation. The `Reconciler` only compares those inputs and
 coordinates existing rollover/continuation mechanisms; it does not define new
 Mission phases or execute Explore/Build/Verify as a workflow. It is
-single-node, explicit-invocation, and has no resource selection.
+single-node, explicit-invocation, and has no resource selection. Every
+consequential action passes through the [Policy admission
+engine](#policy-admission-engine) before its side effect: a `Deny`, `Defer` or
+`RequireApproval` performs no runtime call, keeps durable state, and records a
+bounded policy receipt for a later tick.
 
 The planner is pure and transport-neutral. Its observation taxonomy keeps
 `exists`, authoritative `missing`, and `observation_failed` distinct from
@@ -453,8 +580,11 @@ runtime, unsupported lifecycle capability, or failed observation is reported
 and deferred/blocked rather than treated as execution absence. No credentials,
 service URLs, or raw runtime diagnostics are persisted in receipts.
 
-This is deliberately not Policy, Resource Broker, scheduler, distributed
-controller, second runtime, or a generic queue. Those remain deferred.
+The Reconciler consults the admission-only
+[Policy engine](#policy-admission-engine); Policy decides admissibility, it does
+not choose a resource. Resource Broker, placement/ranking, automatic failover,
+quota routing, hard budgets, a scheduler, a distributed controller, a second
+runtime and a generic queue remain deferred.
 
 Orchestration is the layer that carries a task across roles. It is deliberately
 split so policy cannot drift into the wrong language:

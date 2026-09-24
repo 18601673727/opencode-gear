@@ -19,6 +19,7 @@ pub fn validate(effective: &Effective) -> Vec<String> {
     errors.extend(crate::capabilities::CapabilityConfig::validate(data));
     errors.extend(crate::telemetry::TelemetryConfig::validate(data));
     errors.extend(crate::orchestration::OrchestrationConfig::validate(data));
+    errors.extend(crate::orchestration::policy::PolicyConfig::validate(data));
     errors.extend(crate::reports::ReportsConfig::validate(data));
 
     let empty = Map::new();

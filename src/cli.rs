@@ -195,6 +195,15 @@ pub enum Command {
     Reconcile(Vec<OsString>),
     /// Read-only inspection of the descriptive Resource Registry.
     Resources(Vec<OsString>),
+    /// Read-only inspection of the effective Policy and the latest admission
+    /// decision per durable Mission.
+    Policy(Vec<OsString>),
+    /// Read-only listing of durable, generation-bound approval requests.
+    Approvals(Vec<OsString>),
+    /// Resolve a pending approval as approved.
+    Approve(Vec<OsString>),
+    /// Resolve a pending approval as rejected.
+    Reject(Vec<OsString>),
     /// Hidden/internal: the generated plugin's bridge. Never advertised.
     Bridge(Vec<OsString>),
     Version,
@@ -384,7 +393,14 @@ where
             // error it always had.
             if matches!(
                 command_token.as_deref(),
-                Some("checkpoint") | Some("config") | Some("reconcile") | Some("resources")
+                Some("checkpoint")
+                    | Some("config")
+                    | Some("reconcile")
+                    | Some("resources")
+                    | Some("policy")
+                    | Some("approvals")
+                    | Some("approve")
+                    | Some("reject")
             ) {
                 rest.push(args[index].clone());
                 index += 1;
@@ -444,6 +460,10 @@ where
         Some("checkpoint") => Command::Checkpoint(rest),
         Some("reconcile") => Command::Reconcile(rest),
         Some("resources") => Command::Resources(rest),
+        Some("policy") => Command::Policy(rest),
+        Some("approvals") => Command::Approvals(rest),
+        Some("approve") => Command::Approve(rest),
+        Some("reject") => Command::Reject(rest),
         Some("__bridge") => Command::Bridge(rest),
         Some("version") => Command::Version,
         Some("doctor") => Command::Doctor,
@@ -504,6 +524,12 @@ Commands:
   reconcile [--once]    reconcile durable Missions once (explicit; no daemon)
   resources [--json] [--observe]
                         inspect the descriptive Resource Registry (read-only)
+  policy [--json]       show the effective Policy and latest admission per Mission
+  approvals [--json]    list durable approval requests (read-only)
+  approve <id> [--note TEXT] [--json]
+                        approve a pending admission request
+  reject <id> [--note TEXT] [--json]
+                        reject a pending admission request
   version               report Gear, platform and the resolved OpenCode runtime
   doctor                diagnose layering, Lead contracts, OpenCode, proxy and runtime (read-only)
   upgrade               self-update Gear, then maintain the active OpenCode
@@ -848,6 +874,34 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
             boundary.require(&invocation_dir).map_err(Failure::Gear)?;
             resources_command(&effective, &project_root, &env, args, cli.pretty)
         }
+        Command::Policy(args) => {
+            boundary.require(&invocation_dir).map_err(Failure::Gear)?;
+            policy_command(&effective, &project_root, args, cli.pretty)
+        }
+        Command::Approvals(args) => {
+            boundary.require(&invocation_dir).map_err(Failure::Gear)?;
+            approvals_command(&effective, &project_root, args, cli.pretty)
+        }
+        Command::Approve(args) => {
+            boundary.require(&invocation_dir).map_err(Failure::Gear)?;
+            resolve_approval_command(
+                &effective,
+                &project_root,
+                args,
+                crate::orchestration::policy::ApprovalStatus::Approved,
+                cli.pretty,
+            )
+        }
+        Command::Reject(args) => {
+            boundary.require(&invocation_dir).map_err(Failure::Gear)?;
+            resolve_approval_command(
+                &effective,
+                &project_root,
+                args,
+                crate::orchestration::policy::ApprovalStatus::Rejected,
+                cli.pretty,
+            )
+        }
         Command::Bridge(args) => {
             boundary.require(&invocation_dir).map_err(Failure::Gear)?;
             bridge_command(&effective, &project_root, args, &env)
@@ -896,6 +950,8 @@ fn reconcile_command(
     let context = ContextConfig::from_config(&effective.data).map_err(Failure::Gear)?;
     let capabilities = CapabilityConfig::from_config(&effective.data).map_err(Failure::Gear)?;
     let verification = VerificationConfig::from_config(&effective.data).map_err(Failure::Gear)?;
+    let policy = crate::orchestration::policy::PolicyConfig::from_config(&effective.data)
+        .map_err(Failure::Gear)?;
     let contract = model::lead_contract(&effective.data, level).map_err(Failure::Gear)?;
     let profile = LeadSelection::from_contract(&contract).runtime_profile();
     let git = SystemGitHost;
@@ -908,7 +964,8 @@ fn reconcile_command(
         verification,
         &git,
         &clock,
-    );
+    )
+    .with_policy(policy);
 
     let print_run = |run: crate::orchestration::reconcile::ReconcileRun| {
         let value = serde_json::to_value(&run).map_err(|error| {
@@ -1237,6 +1294,251 @@ fn print_resources_text(
     for issue in issues {
         println!("warning: resource {}: {}", issue.resource, issue.detail);
     }
+}
+
+/// `ocg policy [--json]`: read-only inspection of the effective admission
+/// policy and the latest durable Policy decision per Mission.
+///
+/// It never evaluates a live action, mutates a Mission or writes an approval.
+fn policy_command(
+    effective: &config::Effective,
+    project_root: &Path,
+    args: &[OsString],
+    pretty: bool,
+) -> std::result::Result<i32, Failure> {
+    let mut json = false;
+    for arg in args {
+        match arg.to_str() {
+            Some("--json") => json = true,
+            _ => {
+                return Err(usage_failure(format!(
+                    "unknown policy option: {} (only --json is supported)",
+                    arg.to_string_lossy()
+                )))
+            }
+        }
+    }
+    validate::require_valid(effective).map_err(Failure::Gear)?;
+    let config = crate::orchestration::policy::PolicyConfig::from_config(&effective.data)
+        .map_err(Failure::Gear)?;
+
+    let (summaries, corrupt) = crate::orchestration::mission::list(project_root);
+    let mut decisions = Vec::new();
+    for summary in &summaries {
+        let Ok(Some(mission)) =
+            crate::orchestration::mission::load(project_root, &summary.mission_id)
+        else {
+            continue;
+        };
+        if let Some(policy) = mission
+            .reconcile
+            .last_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.policy.as_ref())
+        {
+            decisions.push((
+                summary.mission_id.clone(),
+                summary.generation,
+                policy.clone(),
+            ));
+        }
+    }
+
+    if json {
+        let value = json!({
+            "enabled": config.enabled,
+            "require_approval_for": config.require_approval_for,
+            "fingerprint": config.fingerprint(),
+            "corrupt_missions": corrupt,
+            "missions": decisions
+                .iter()
+                .map(|(mission_id, generation, policy)| {
+                    json!({
+                        "mission_id": mission_id,
+                        "generation": generation,
+                        "decision": policy.decision,
+                        "rule": policy.rule,
+                        "reason_code": policy.reason_code,
+                        "reason": policy.reason,
+                        "action": policy.action,
+                        "approval_id": policy.approval_id,
+                        "required_facts": policy.required_facts,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        });
+        print_json(&value, pretty);
+    } else {
+        println!(
+            "policy: {}",
+            if config.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        println!(
+            "require approval for: {}",
+            if config.require_approval_for.is_empty() {
+                "none".to_string()
+            } else {
+                config.require_approval_for.join(", ")
+            }
+        );
+        if corrupt > 0 {
+            println!("corrupt Missions: {corrupt} (skipped)");
+        }
+        if decisions.is_empty() {
+            println!("no recorded policy decisions");
+        }
+        for (mission_id, generation, policy) in &decisions {
+            println!("{mission_id} gen {generation}");
+            println!(
+                "  {} {} {} [{}]",
+                policy.decision, policy.rule, policy.reason_code, policy.action
+            );
+            println!("  {}", policy.reason);
+            if let Some(id) = &policy.approval_id {
+                println!("  approval {id}");
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// `ocg approvals [--json]`: read-only listing of durable approval requests.
+fn approvals_command(
+    effective: &config::Effective,
+    project_root: &Path,
+    args: &[OsString],
+    pretty: bool,
+) -> std::result::Result<i32, Failure> {
+    let mut json = false;
+    for arg in args {
+        match arg.to_str() {
+            Some("--json") => json = true,
+            _ => {
+                return Err(usage_failure(format!(
+                    "unknown approvals option: {} (only --json is supported)",
+                    arg.to_string_lossy()
+                )))
+            }
+        }
+    }
+    validate::require_valid(effective).map_err(Failure::Gear)?;
+    let loaded = crate::orchestration::policy::list_approvals(project_root);
+    if json {
+        let value = json!({
+            "approvals": loaded.approvals,
+            "issues": loaded.issues,
+        });
+        print_json(&value, pretty);
+    } else {
+        if loaded.approvals.is_empty() {
+            println!("no approvals recorded");
+        }
+        for record in &loaded.approvals {
+            println!("{} {}", record.approval_id, record.status.as_str());
+            println!(
+                "  mission {} gen {} action {}",
+                record.mission_id, record.generation, record.action
+            );
+            if let Some(execution) = &record.current_execution_id {
+                println!("  execution {execution}");
+            }
+            println!(
+                "  requested {} resolved {}",
+                record.requested_at,
+                record
+                    .resolved_at
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "never".to_string())
+            );
+        }
+        for issue in &loaded.issues {
+            println!("warning: approval {}: {}", issue.file, issue.detail);
+        }
+    }
+    Ok(0)
+}
+
+/// `ocg approve <id>` / `ocg reject <id>`: resolve one durable approval.
+///
+/// The resolution is bound to the record's exact Mission generation and action;
+/// a later generation or a different action can never inherit it.
+fn resolve_approval_command(
+    effective: &config::Effective,
+    project_root: &Path,
+    args: &[OsString],
+    status: crate::orchestration::policy::ApprovalStatus,
+    pretty: bool,
+) -> std::result::Result<i32, Failure> {
+    let mut json = false;
+    let mut note: Option<String> = None;
+    let mut approval_id: Option<String> = None;
+    let mut index = 0;
+    while index < args.len() {
+        let text = args[index].to_string_lossy().into_owned();
+        if text == "--json" {
+            json = true;
+            index += 1;
+            continue;
+        }
+        if text == "--note" {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| usage_failure("--note needs a value"))?;
+            note = Some(value.to_string_lossy().into_owned());
+            index += 2;
+            continue;
+        }
+        if let Some(value) = text.strip_prefix("--note=") {
+            note = Some(value.to_string());
+            index += 1;
+            continue;
+        }
+        if text.starts_with('-') {
+            return Err(usage_failure(format!("unknown option: {text}")));
+        }
+        if approval_id.is_some() {
+            return Err(usage_failure(format!("unexpected argument: {text}")));
+        }
+        approval_id = Some(text);
+        index += 1;
+    }
+    let approval_id = approval_id.ok_or_else(|| usage_failure("an approval id is required"))?;
+    validate::require_valid(effective).map_err(Failure::Gear)?;
+    let clock = SystemClock;
+    let record = crate::orchestration::policy::resolve_approval(
+        project_root,
+        &approval_id,
+        status,
+        note,
+        clock.now_unix(),
+    )
+    .map_err(Failure::Gear)?;
+    if json {
+        let value = serde_json::to_value(&record).unwrap_or(serde_json::Value::Null);
+        print_json(&value, pretty);
+    } else {
+        println!("{} {}", record.approval_id, record.status.as_str());
+        println!(
+            "  mission {} gen {} action {}",
+            record.mission_id, record.generation, record.action
+        );
+    }
+    Ok(0)
+}
+
+fn print_json(value: &serde_json::Value, pretty: bool) {
+    println!(
+        "{}",
+        if pretty {
+            serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string())
+        } else {
+            serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
+        }
+    );
 }
 
 /// The project template written by `ocg init`.

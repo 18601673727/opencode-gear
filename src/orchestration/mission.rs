@@ -375,6 +375,30 @@ pub struct MissionReconcileReceipt {
     pub reason: String,
     pub result: String,
     pub timestamp: i64,
+    /// The bounded Policy projection for this pass, when Policy was evaluated.
+    /// It is additive to schema version 1; old records deserialize as `None`.
+    pub policy: Option<MissionPolicyReceipt>,
+}
+
+/// The durable, bounded projection of one Policy assessment. It is a plain
+/// string record so the durable Mission schema stays independent of the Policy
+/// module's types.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MissionPolicyReceipt {
+    /// The effective decision (`allow`, `defer`, `require_approval`, `deny`).
+    pub decision: String,
+    /// The winning rule identifier.
+    pub rule: String,
+    pub reason_code: String,
+    /// Bounded, secret-redacted reason.
+    pub reason: String,
+    /// The evaluated action name.
+    pub action: String,
+    /// The approval id, when the decision requires an approval.
+    pub approval_id: Option<String>,
+    /// Bounded `kind=status` fact summaries the winning rule used.
+    pub required_facts: Vec<String>,
 }
 
 /// Durable reconcile intent and its current local phase. The bounded
@@ -747,6 +771,23 @@ impl Mission {
         receipt.action = bounded_reconcile_text(&receipt.action, 64);
         receipt.reason = redact_reconcile_reason(&receipt.reason);
         receipt.result = bounded_reconcile_text(&receipt.result, 32);
+        if let Some(policy) = receipt.policy.as_mut() {
+            policy.decision = bounded_reconcile_text(&policy.decision, 32);
+            policy.rule = bounded_reconcile_text(&policy.rule, 64);
+            policy.reason_code = bounded_reconcile_text(&policy.reason_code, 64);
+            policy.reason = redact_reconcile_reason(&policy.reason);
+            policy.action = bounded_reconcile_text(&policy.action, 64);
+            policy.approval_id = policy
+                .approval_id
+                .as_deref()
+                .map(|id| bounded_reconcile_text(id, 96));
+            policy.required_facts = policy
+                .required_facts
+                .iter()
+                .take(16)
+                .map(|fact| bounded_reconcile_text(fact, 64))
+                .collect();
+        }
         let changed = self.reconcile.last_receipt.as_ref().is_none_or(|previous| {
             previous.generation != receipt.generation
                 || previous.current_execution_id != receipt.current_execution_id
@@ -754,6 +795,7 @@ impl Mission {
                 || previous.action != receipt.action
                 || previous.reason != receipt.reason
                 || previous.result != receipt.result
+                || previous.policy != receipt.policy
         });
         if changed {
             self.reconcile.last_receipt = Some(receipt.clone());

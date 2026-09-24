@@ -10,10 +10,16 @@ use crate::error::{GearError, Result};
 use crate::orchestration::context_governor::{ContextObservation, TelemetryProvenance};
 use crate::orchestration::controller::Controller;
 use crate::orchestration::mission::{
-    self, Mission, MissionReconcileReceipt, MissionReconcileStatus, MissionRolloverStatus,
+    self, Mission, MissionPolicyReceipt, MissionReconcileReceipt, MissionReconcileStatus,
+    MissionRolloverStatus,
+};
+use crate::orchestration::policy::{
+    self, approval_id, resource_identity_for_profile, ApprovalView, PolicyAction, PolicyAssessment,
+    PolicyContext, PolicyDecision, PolicySummary, ResourceFacts,
 };
 use crate::orchestration::rollover::{self, ContinuationPacket, RolloverArtifact, RolloverStatus};
 use crate::orchestration::state;
+use crate::resources::ResourceId;
 use crate::runtime::lifecycle::{
     RuntimeAdapter, RuntimeCapabilities, RuntimeContinuation, RuntimeError, RuntimeErrorKind,
     RuntimeExecution, RuntimeExecutionId, RuntimeProfile, RuntimeRecoveryKey, RuntimeResult,
@@ -195,6 +201,10 @@ pub enum ReconcileOutcome {
     Deferred,
     Noop,
     Failed,
+    /// Policy refused the action outright; no side effect was attempted.
+    Denied,
+    /// Policy requires an explicit approval before the action may proceed.
+    AwaitingApproval,
 }
 
 impl ReconcileOutcome {
@@ -204,6 +214,8 @@ impl ReconcileOutcome {
             Self::Deferred => "deferred",
             Self::Noop => "noop",
             Self::Failed => "failed",
+            Self::Denied => "denied",
+            Self::AwaitingApproval => "awaiting_approval",
         }
     }
 }
@@ -524,6 +536,9 @@ pub struct ReconcileResult {
     pub reason: String,
     pub result: ReconcileOutcome,
     pub timestamp: i64,
+    /// The bounded Policy projection for this pass, when Policy was evaluated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicySummary>,
 }
 
 impl ReconcileResult {
@@ -543,6 +558,7 @@ impl ReconcileResult {
             reason: redact(&reason.into()),
             result,
             timestamp,
+            policy: None,
         }
     }
 }
@@ -568,7 +584,10 @@ impl ReconcileRun {
             || self.results.iter().any(|result| {
                 matches!(
                     result.result,
-                    ReconcileOutcome::Deferred | ReconcileOutcome::Failed
+                    ReconcileOutcome::Deferred
+                        | ReconcileOutcome::Failed
+                        | ReconcileOutcome::Denied
+                        | ReconcileOutcome::AwaitingApproval
                 )
             })
     }
@@ -873,6 +892,10 @@ pub struct Reconciler<'a, 'r> {
     controller: &'a Controller<'a>,
     runtime: Option<&'r mut (dyn RuntimeAdapter + 'r)>,
     profile: RuntimeProfile,
+    /// The Policy projection for the action currently being dispatched. It is
+    /// reset at the start of every `reconcile_mission` call so a stale summary
+    /// can never leak into an unrelated Mission's receipt.
+    policy_summary: Option<PolicySummary>,
 }
 
 impl<'a, 'r> Reconciler<'a, 'r> {
@@ -885,6 +908,7 @@ impl<'a, 'r> Reconciler<'a, 'r> {
             controller,
             runtime: Some(runtime),
             profile,
+            policy_summary: None,
         }
     }
 
@@ -893,6 +917,7 @@ impl<'a, 'r> Reconciler<'a, 'r> {
             controller,
             runtime: None,
             profile,
+            policy_summary: None,
         }
     }
 
@@ -923,6 +948,9 @@ impl<'a, 'r> Reconciler<'a, 'r> {
     /// Reconcile one Mission for at most one consequential action.
     pub fn reconcile_mission(&mut self, mission_id: &str) -> ReconcileResult {
         let now = self.controller.now_unix();
+        // Reset the per-tick Policy projection first: a stale summary must never
+        // leak into an unrelated Mission's receipt or result.
+        self.policy_summary = None;
         if !self.controller.config().enabled {
             return ReconcileResult {
                 mission_id: mission_id.to_string(),
@@ -933,6 +961,7 @@ impl<'a, 'r> Reconciler<'a, 'r> {
                 reason: "orchestration reconciliation is disabled".to_string(),
                 result: ReconcileOutcome::Noop,
                 timestamp: now,
+                policy: None,
             };
         }
         let mission = match mission::load(self.controller.root(), mission_id) {
@@ -947,6 +976,7 @@ impl<'a, 'r> Reconciler<'a, 'r> {
                     reason: "Mission record is missing".to_string(),
                     result: ReconcileOutcome::Failed,
                     timestamp: now,
+                    policy: None,
                 };
             }
             Err(error) => {
@@ -959,6 +989,7 @@ impl<'a, 'r> Reconciler<'a, 'r> {
                     reason: redact(&error.to_string()),
                     result: ReconcileOutcome::Failed,
                     timestamp: now,
+                    policy: None,
                 };
             }
         };
@@ -1074,7 +1105,66 @@ impl<'a, 'r> Reconciler<'a, 'r> {
             now,
         });
 
-        match decision.action {
+        // Policy admission boundary. Every consequential action passes through
+        // an explicit, inspectable decision *before* its costly or destructive
+        // side effect. A Deny, Defer or RequireApproval performs no runtime
+        // work; only Allow reaches the action executor.
+        if let Some(action) = PolicyAction::from_reconcile(decision.action) {
+            if self.controller.policy().enabled {
+                let assessment = self.evaluate_policy(&mission, &decision, action, now);
+                self.policy_summary = Some(assessment.summary());
+                match assessment.decision {
+                    PolicyDecision::Allow => {}
+                    PolicyDecision::Deny => {
+                        return self.finish_policy(
+                            &mission,
+                            &decision,
+                            ReconcileOutcome::Denied,
+                            assessment.reason.clone(),
+                            now,
+                        );
+                    }
+                    PolicyDecision::Defer => {
+                        return self.finish_policy(
+                            &mission,
+                            &decision,
+                            ReconcileOutcome::Deferred,
+                            assessment.reason.clone(),
+                            now,
+                        );
+                    }
+                    PolicyDecision::RequireApproval => {
+                        // Record the pending approval idempotently. A failure to
+                        // persist it is fail-closed: the action stays deferred.
+                        if let Some(request) = assessment.approval.as_ref() {
+                            if let Err(error) =
+                                policy::ensure_pending(self.controller.root(), request)
+                            {
+                                return self.finish_policy(
+                                    &mission,
+                                    &decision,
+                                    ReconcileOutcome::Deferred,
+                                    format!(
+                                        "the required approval could not be recorded: {}",
+                                        redact(&error.to_string())
+                                    ),
+                                    now,
+                                );
+                            }
+                        }
+                        return self.finish_policy(
+                            &mission,
+                            &decision,
+                            ReconcileOutcome::AwaitingApproval,
+                            assessment.reason.clone(),
+                            now,
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut result = match decision.action {
             ReconcileAction::Noop => self.finish_noop(&mission, &decision, now),
             ReconcileAction::Wait | ReconcileAction::Escalate | ReconcileAction::Blocked => {
                 self.finish_deferred(&mission, &decision, decision.reason.clone(), now)
@@ -1088,7 +1178,11 @@ impl<'a, 'r> Reconciler<'a, 'r> {
             ReconcileAction::ContinueExecution => {
                 self.execute_continuation(&mission, artifact, &decision, now)
             }
-        }
+        };
+        // Surface the admission decision that let the action run. Non-policy
+        // outcomes keep `None`.
+        result.policy = self.policy_summary.clone();
+        result
     }
 
     fn capabilities(&self) -> RuntimeCapabilities {
@@ -1096,6 +1190,105 @@ impl<'a, 'r> Reconciler<'a, 'r> {
             .as_ref()
             .map(|runtime| runtime.capabilities())
             .unwrap_or(RuntimeCapabilities::NONE)
+    }
+
+    /// Evaluate Policy for one consequential action. Pure with respect to
+    /// runtime state: it reads durable Mission/registry facts and an approval
+    /// record, and performs no runtime side effect.
+    fn evaluate_policy(
+        &self,
+        mission: &Mission,
+        decision: &ReconcileDecision,
+        action: PolicyAction,
+        now: i64,
+    ) -> PolicyAssessment {
+        let current_execution_id = mission.runtime_execution_id();
+        let approval = self.approval_view(mission, action, current_execution_id.as_ref());
+        let context = PolicyContext {
+            mission_id: mission.mission_id.clone(),
+            generation: mission.generation,
+            mission_status: mission.status,
+            action,
+            current_execution_id,
+            observation: decision.observation,
+            reconcile_status: mission.reconcile.status,
+            capabilities: self.capabilities(),
+            resource: self.associated_resource_facts(),
+            approval,
+            evaluated_at: now,
+        };
+        policy::evaluate(&context)
+    }
+
+    /// Resolve the pre-existing approval state for an action. Policy itself
+    /// performs no I/O, so the caller resolves the record. A corrupt or
+    /// identity-mismatched record is reported as `corrupt` (fail-closed), never
+    /// silently treated as "no approval".
+    fn approval_view(
+        &self,
+        mission: &Mission,
+        action: PolicyAction,
+        current_execution_id: Option<&RuntimeExecutionId>,
+    ) -> ApprovalView {
+        if !self.controller.policy().requires_approval(action) {
+            return ApprovalView::not_required();
+        }
+        let id = approval_id(
+            &mission.mission_id,
+            mission.generation,
+            action,
+            current_execution_id,
+        );
+        match policy::load_approval(self.controller.root(), &id) {
+            Ok(Some(record))
+                if record.mission_id == mission.mission_id
+                    && record.generation == mission.generation
+                    && record.action == action.as_str() =>
+            {
+                ApprovalView {
+                    required: true,
+                    status: Some(record.status),
+                    corrupt: false,
+                }
+            }
+            Ok(Some(_)) => ApprovalView {
+                required: true,
+                status: None,
+                corrupt: true,
+            },
+            Ok(None) => ApprovalView {
+                required: true,
+                status: None,
+                corrupt: false,
+            },
+            Err(_) => ApprovalView {
+                required: true,
+                status: None,
+                corrupt: true,
+            },
+        }
+    }
+
+    /// The registry facts for the *currently associated* resource.
+    ///
+    /// The identity is resolved from the runtime profile plus the attached
+    /// adapter identity, then looked up directly. Policy never enumerates,
+    /// ranks or substitutes: a missing record stays Unknown (which does not
+    /// authorize anything) rather than selecting another resource.
+    ///
+    /// Registry read failure is fail-soft for the admission boundary. The
+    /// registry is a descriptive substrate; a registry problem that is unrelated
+    /// to a required fact must not deny a safe action. If the registry cannot be
+    /// read, every fact is simply Unknown and the rules that require a fact
+    /// treat it conservatively.
+    fn associated_resource_facts(&self) -> ResourceFacts {
+        let runtime_identity = self.runtime.as_ref().map(|runtime| runtime.identity());
+        let identity = resource_identity_for_profile(&self.profile, runtime_identity.as_ref());
+        let loaded = crate::resources::load(self.controller.root());
+        match loaded.registry.resource(&ResourceId::derive(&identity)) {
+            Some(record) => ResourceFacts::from_record(&record),
+            None => ResourceFacts::unknown(identity),
+        }
     }
 
     fn observe_current(&self, mission: &Mission) -> RuntimeObservation {
@@ -1182,6 +1375,24 @@ impl<'a, 'r> Reconciler<'a, 'r> {
         result
     }
 
+    /// Finish a tick whose only outcome is a Policy decision that did not
+    /// execute anything (`Denied`, `Deferred` or `AwaitingApproval`). The
+    /// bounded assessment is attached and persisted so the refusal is
+    /// inspectable and durable.
+    fn finish_policy(
+        &mut self,
+        mission: &Mission,
+        decision: &ReconcileDecision,
+        outcome: ReconcileOutcome,
+        reason: String,
+        now: i64,
+    ) -> ReconcileResult {
+        let mut result = ReconcileResult::new(mission, decision, outcome, reason, now);
+        result.policy = self.policy_summary.clone();
+        self.persist_receipt(mission, &result);
+        result
+    }
+
     fn persist_observation_backoff(&self, mission: &Mission, result: &ReconcileResult, now: i64) {
         let retry_after = now.saturating_add(
             self.controller
@@ -1253,6 +1464,10 @@ impl<'a, 'r> Reconciler<'a, 'r> {
         }
         let expected_revision = current.revision;
         let expected_owner = current.session_id.clone();
+        // Prefer the summary attached to the result; fall back to the per-tick
+        // summary so an action that executed after an Allow still records the
+        // admitting rule.
+        let policy = result.policy.as_ref().or(self.policy_summary.as_ref());
         let receipt = MissionReconcileReceipt {
             generation: result.generation,
             current_execution_id: result
@@ -1264,6 +1479,15 @@ impl<'a, 'r> Reconciler<'a, 'r> {
             reason: result.reason.clone(),
             result: result.result.as_str().to_string(),
             timestamp: result.timestamp,
+            policy: policy.map(|summary| MissionPolicyReceipt {
+                decision: summary.decision.clone(),
+                rule: summary.rule.clone(),
+                reason_code: summary.reason_code.clone(),
+                reason: summary.reason.clone(),
+                action: summary.action.clone(),
+                approval_id: summary.approval_id.clone(),
+                required_facts: summary.required_facts.clone(),
+            }),
         };
         if current.record_reconcile_receipt(receipt)
             && !mission::save_if_revision(

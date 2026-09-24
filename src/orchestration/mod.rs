@@ -28,6 +28,7 @@ pub mod controller;
 pub mod handoff;
 pub mod mission;
 pub mod plugin;
+pub mod policy;
 pub mod projection;
 pub mod reconcile;
 pub mod rollover;
@@ -48,9 +49,16 @@ pub use handoff::{
     Transition,
 };
 pub use mission::{
-    Mission, MissionEvent, MissionEventKind, MissionReconcileReceipt, MissionReconcileState,
-    MissionReconcileStatus, MissionRolloverState, MissionRolloverStatus, MissionStatus,
-    MissionSummary, NextAction, MISSION_SCHEMA_VERSION,
+    Mission, MissionEvent, MissionEventKind, MissionPolicyReceipt, MissionReconcileReceipt,
+    MissionReconcileState, MissionReconcileStatus, MissionRolloverState, MissionRolloverStatus,
+    MissionStatus, MissionSummary, NextAction, MISSION_SCHEMA_VERSION,
+};
+pub use policy::{
+    approval_dir, approval_id, approval_path, ensure_pending, evaluate as evaluate_policy,
+    list_approvals, load_approval, resolve_approval, save_approval, ApprovalIssue, ApprovalRecord,
+    ApprovalRequest, ApprovalStatus, ApprovalView, FactProbe, FactStatus, LoadedApprovals,
+    PolicyAction, PolicyAssessment, PolicyConfig, PolicyContext, PolicyDecision, PolicySummary,
+    ResourceFacts, APPROVALS_DIR, APPROVAL_SCHEMA_VERSION, MAX_APPROVALS,
 };
 pub use reconcile::{
     latest_artifact, load_artifact, plan, MissionStoreIssue, ObservationStatus, ReconcileAction,

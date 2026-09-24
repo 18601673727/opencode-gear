@@ -42,6 +42,7 @@ use crate::orchestration::handoff::{
 use crate::orchestration::mission::{
     self, Mission, MissionEventKind, MissionReconcileStatus, MissionRolloverStatus, MissionStatus,
 };
+use crate::orchestration::policy::PolicyConfig;
 use crate::orchestration::projection::{self, ProjectionLimits};
 use crate::orchestration::rollover::{
     self, ContinuationPacket, LeadBinding, RolloverArtifact, RolloverStatus,
@@ -246,6 +247,7 @@ pub struct Controller<'a> {
     context: ContextConfig,
     capabilities: CapabilityConfig,
     verification: VerificationConfig,
+    policy: PolicyConfig,
     git: &'a dyn GitHost,
     clock: &'a dyn Clock,
 }
@@ -266,9 +268,21 @@ impl<'a> Controller<'a> {
             context,
             capabilities,
             verification,
+            policy: PolicyConfig::default(),
             git,
             clock,
         }
+    }
+
+    /// Attach an explicit Policy configuration. The default preserves current
+    /// behavior exactly (Policy enabled, no action requiring approval).
+    pub fn with_policy(mut self, policy: PolicyConfig) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn policy(&self) -> &PolicyConfig {
+        &self.policy
     }
 
     pub fn root(&self) -> &Path {

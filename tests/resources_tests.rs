@@ -650,6 +650,7 @@ fn reconcile_result(
         reason: "test".to_string(),
         result: outcome,
         timestamp: 1,
+        policy: None,
     }
 }
 
