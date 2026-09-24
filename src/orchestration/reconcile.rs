@@ -574,6 +574,57 @@ impl ReconcileRun {
     }
 }
 
+/// Purely observational: publish this pass's neutral runtime observations as
+/// resource health facts.
+///
+/// This never changes a reconcile decision, a receipt or the Mission store. It
+/// only describes the resource the pass observed, so the existing Reconciler
+/// behavior is unchanged. `Missing`/`Unbound` produce no health fact: the
+/// absence of an execution is not evidence about the resource.
+pub fn publish_resource_observations(
+    run: &ReconcileRun,
+    registry: &mut crate::resources::ResourceRegistry,
+    identity: &crate::resources::ResourceIdentity,
+    now: i64,
+) {
+    let mut best: Option<crate::resources::HealthFacts> = None;
+    for result in &run.results {
+        let Some(health) = health_for(result.observed, now) else {
+            continue;
+        };
+        let take = best
+            .as_ref()
+            .map(|current| health.state.severity() > current.state.severity())
+            .unwrap_or(true);
+        if take {
+            best = Some(health);
+        }
+    }
+    if let Some(health) = best {
+        registry.observe_health(identity, health, now);
+    }
+}
+
+fn health_for(status: ObservationStatus, now: i64) -> Option<crate::resources::HealthFacts> {
+    use crate::resources::{HealthFacts, ResourceHealth, ResourceProvenance};
+    let state = match status {
+        ObservationStatus::Exists => ResourceHealth::Available,
+        ObservationStatus::Missing | ObservationStatus::Unbound => return None,
+        ObservationStatus::RuntimeUnavailable | ObservationStatus::AuthenticationFailure => {
+            ResourceHealth::Unavailable
+        }
+        ObservationStatus::ObservationFailed
+        | ObservationStatus::TransientTransportFailure
+        | ObservationStatus::Unsupported => ResourceHealth::Degraded,
+    };
+    Some(HealthFacts {
+        state,
+        reason: Some(format!("reconcile observation: {}", status.as_str())),
+        provenance: ResourceProvenance::RuntimeObserved,
+        observed_at: Some(now),
+    })
+}
+
 /// A bounded generic recovery artifact. It contains the Mission-derived
 /// continuation, not a transcript or an OpenCode response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

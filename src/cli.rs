@@ -28,6 +28,7 @@ use crate::report;
 use crate::runtime::compat::{self, LeadSelection, RuntimeAdapter, SessionClient};
 use crate::runtime::effective as runtime_effective;
 use crate::runtime::lifecycle::RuntimeAdapter as RuntimeLifecycleAdapter;
+use crate::runtime::lifecycle::RuntimeIdentity;
 use crate::runtime::policy::RuntimePolicy;
 use crate::runtime::{self, install::Layout};
 use crate::telemetry::{self, TelemetryConfig};
@@ -192,6 +193,8 @@ pub enum Command {
     Checkpoint(Vec<OsString>),
     /// Explicitly reconcile durable Missions once.
     Reconcile(Vec<OsString>),
+    /// Read-only inspection of the descriptive Resource Registry.
+    Resources(Vec<OsString>),
     /// Hidden/internal: the generated plugin's bridge. Never advertised.
     Bridge(Vec<OsString>),
     Version,
@@ -381,7 +384,7 @@ where
             // error it always had.
             if matches!(
                 command_token.as_deref(),
-                Some("checkpoint") | Some("config") | Some("reconcile")
+                Some("checkpoint") | Some("config") | Some("reconcile") | Some("resources")
             ) {
                 rest.push(args[index].clone());
                 index += 1;
@@ -440,6 +443,7 @@ where
         Some("tools") => Command::Tools(rest),
         Some("checkpoint") => Command::Checkpoint(rest),
         Some("reconcile") => Command::Reconcile(rest),
+        Some("resources") => Command::Resources(rest),
         Some("__bridge") => Command::Bridge(rest),
         Some("version") => Command::Version,
         Some("doctor") => Command::Doctor,
@@ -498,6 +502,8 @@ Commands:
   checkpoint list|show|save
                         inspect, or create, a phase checkpoint
   reconcile [--once]    reconcile durable Missions once (explicit; no daemon)
+  resources [--json] [--observe]
+                        inspect the descriptive Resource Registry (read-only)
   version               report Gear, platform and the resolved OpenCode runtime
   doctor                diagnose layering, Lead contracts, OpenCode, proxy and runtime (read-only)
   upgrade               self-update Gear, then maintain the active OpenCode
@@ -838,6 +844,10 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
                 cli.pretty,
             )
         }
+        Command::Resources(args) => {
+            boundary.require(&invocation_dir).map_err(Failure::Gear)?;
+            resources_command(&effective, &project_root, &env, args, cli.pretty)
+        }
         Command::Bridge(args) => {
             boundary.require(&invocation_dir).map_err(Failure::Gear)?;
             bridge_command(&effective, &project_root, args, &env)
@@ -917,6 +927,26 @@ fn reconcile_command(
         Ok(if run.has_failures() { 1 } else { 0 })
     };
 
+    // Purely observational: the registry records the runtime availability the
+    // pass actually observed. It never changes a reconcile decision, receipt or
+    // exit status, and a registry write failure is ignored.
+    let publish = |run: &crate::orchestration::reconcile::ReconcileRun| {
+        let identity = crate::resources::ResourceIdentity::for_model(
+            &contract.provider_id,
+            &contract.model_id,
+        )
+        .with_runtime_family("opencode", "v2");
+        let now = clock.now_unix();
+        let mut registry = crate::resources::load(project_root).registry;
+        crate::orchestration::reconcile::publish_resource_observations(
+            run,
+            &mut registry,
+            &identity,
+            now,
+        );
+        let _ = crate::resources::save(project_root, &registry);
+    };
+
     if let (Some(url), Some(password)) = (
         env.v2_server_url.as_deref(),
         env.v2_server_password.as_ref(),
@@ -934,7 +964,9 @@ fn reconcile_command(
                     &mut client,
                     profile,
                 );
-                return print_run(reconciler.reconcile_once());
+                let run = reconciler.reconcile_once();
+                publish(&run);
+                return print_run(run);
             }
             Err(_) => {
                 let mut reconciler = crate::orchestration::reconcile::Reconciler::without_runtime(
@@ -955,13 +987,256 @@ fn reconcile_command(
         ) {
             let mut reconciler =
                 crate::orchestration::reconcile::Reconciler::new(&controller, &mut client, profile);
-            return print_run(reconciler.reconcile_once());
+            let run = reconciler.reconcile_once();
+            publish(&run);
+            return print_run(run);
         }
     }
 
     let mut reconciler =
         crate::orchestration::reconcile::Reconciler::without_runtime(&controller, profile);
     print_run(reconciler.reconcile_once())
+}
+
+/// `ocg resources [--json] [--observe]`: read-only inspection of the
+/// descriptive Resource Registry.
+///
+/// It never selects, ranks, scores or routes a resource. `--observe` resolves
+/// the local runtime and records its identity, lifecycle capabilities and a
+/// factual availability observation; without it nothing is written and only the
+/// configured + previously persisted facts are shown.
+fn resources_command(
+    effective: &config::Effective,
+    project_root: &Path,
+    env: &Env,
+    args: &[OsString],
+    pretty: bool,
+) -> std::result::Result<i32, Failure> {
+    let mut json = false;
+    let mut observe = false;
+    for arg in args {
+        match arg.to_str() {
+            Some("--json") => json = true,
+            Some("--observe") => observe = true,
+            _ => {
+                return Err(usage_failure(format!(
+                    "unknown resources option: {} (only --json and --observe are supported)",
+                    arg.to_string_lossy()
+                )))
+            }
+        }
+    }
+    validate::require_valid(effective).map_err(Failure::Gear)?;
+
+    let clock = SystemClock;
+    let now = clock.now_unix();
+    let process = SystemProcessHost;
+    let manager = runtime_manager(project_root, effective, env, &NoHttp, &clock, &process)
+        .map_err(Failure::Gear)?;
+    let report = manager.resolve_for_report();
+    let resolved = report
+        .version
+        .clone()
+        .and_then(|version| compat::classify(version).ok());
+    let runtime_identity = resolved
+        .as_ref()
+        .map(|version| RuntimeIdentity::new("opencode", version.major().as_str(), "resolved"));
+
+    let loaded = crate::resources::load(project_root);
+    let file_corrupt = loaded.corrupt;
+    let mut issues = loaded.issues;
+    let mut registry = loaded.registry;
+
+    if observe {
+        if let (Some(identity), Some(version)) = (&runtime_identity, resolved.as_ref()) {
+            let adapter = compat::adapter_for(version);
+            registry.observe_runtime_capabilities(
+                identity.clone(),
+                adapter.lifecycle_capabilities(),
+                now,
+            );
+            let runtime_scoped = crate::resources::ResourceIdentity::for_runtime(identity);
+            registry.observe_available(
+                &runtime_scoped,
+                format!(
+                    "runtime {} resolved ({})",
+                    identity.family,
+                    describe_runtime_version(report.version.as_ref())
+                ),
+                now,
+            );
+            if let Err(error) = crate::resources::save(project_root, &registry) {
+                issues.push(crate::resources::ResourceIssue {
+                    resource: crate::resources::registry_path(project_root)
+                        .display()
+                        .to_string(),
+                    detail: format!("registry was not persisted: {error}"),
+                });
+            }
+        }
+    }
+
+    for entry in crate::resources::configured_entries(&effective.data, runtime_identity.as_ref())
+        .map_err(Failure::Gear)?
+    {
+        registry.register_configured(&entry.identity, entry.configured, now);
+    }
+
+    let records = registry.list();
+    if json {
+        let value = json!({
+            "schema_version": registry.schema_version(),
+            "updated_at": registry.updated_at(),
+            "corrupt": file_corrupt,
+            "issues": issues
+                .iter()
+                .map(|issue| json!({"resource": issue.resource, "detail": issue.detail}))
+                .collect::<Vec<_>>(),
+            "resources": records,
+        });
+        println!(
+            "{}",
+            if pretty {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
+            } else {
+                serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+            }
+        );
+    } else {
+        print_resources_text(&records, now, file_corrupt, &issues);
+    }
+    Ok(0)
+}
+
+fn print_resources_text(
+    records: &[crate::resources::ResourceRecord],
+    now: i64,
+    corrupt: bool,
+    issues: &[crate::resources::ResourceIssue],
+) {
+    if corrupt {
+        println!("registry: corrupt (unreadable or unsupported schema); no facts are trusted");
+    }
+    if records.is_empty() {
+        println!("no resources known");
+    }
+    for record in records {
+        println!("{}", record.resource_id);
+        println!("  identity      {}", record.identity.describe());
+        if !record.configured.is_empty() {
+            let uses = record
+                .configured
+                .iter()
+                .map(|use_| {
+                    format!(
+                        "{} (variant {})",
+                        use_.role.as_deref().unwrap_or("?"),
+                        use_.variant.as_deref().unwrap_or("default")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("  configured    {uses}");
+        }
+        match &record.runtime.value {
+            Some(runtime) => println!(
+                "  runtime       {}/{} [{}]",
+                runtime.runtime,
+                runtime.family,
+                record.runtime.provenance.as_str()
+            ),
+            None => println!("  runtime       unknown"),
+        }
+        match &record.capabilities.value {
+            Some(capabilities) => {
+                let names = capabilities.listed();
+                println!(
+                    "  capabilities  {}",
+                    if names.is_empty() {
+                        "none".to_string()
+                    } else {
+                        names.join(", ")
+                    }
+                );
+            }
+            None => println!("  capabilities  unknown"),
+        }
+        println!(
+            "  resolved      {} [{}]",
+            record
+                .resolved
+                .value
+                .map(|evidence| evidence.as_str())
+                .unwrap_or("unknown"),
+            record.resolved.provenance.as_str()
+        );
+        match &record.effective.value {
+            Some(effective) => println!(
+                "  effective     {}/{} agent {} variant {} [{}]",
+                effective.provider.as_deref().unwrap_or("?"),
+                effective.model.as_deref().unwrap_or("?"),
+                effective.agent.as_deref().unwrap_or("?"),
+                effective.variant.as_deref().unwrap_or("default"),
+                record.effective.provenance.as_str()
+            ),
+            None => println!("  effective     unknown"),
+        }
+        println!(
+            "  health        {}{} [{}]",
+            record.health.state.as_str(),
+            record
+                .health
+                .reason
+                .as_deref()
+                .map(|reason| format!(" ({reason})"))
+                .unwrap_or_default(),
+            record.health.provenance.as_str()
+        );
+        match record.context_limit.value {
+            Some(limit) => println!(
+                "  context limit {limit} [{}]",
+                record.context_limit.provenance.as_str()
+            ),
+            None => println!("  context limit unknown"),
+        }
+        match record.capacity.value {
+            Some(slots) => println!(
+                "  capacity      {slots} slots [{}]",
+                record.capacity.provenance.as_str()
+            ),
+            None => println!("  capacity      unknown"),
+        }
+        println!(
+            "  quota         {}",
+            if record.quota.is_known() {
+                "known"
+            } else {
+                "unknown"
+            }
+        );
+        println!(
+            "  cost          {}",
+            if record.cost.is_known() {
+                "known"
+            } else {
+                "unknown"
+            }
+        );
+        match record.observed_at() {
+            Some(at) => println!(
+                "  observed      {at}{}",
+                if record.is_stale(now, crate::resources::DEFAULT_STALE_AFTER_SECONDS) {
+                    " (stale)"
+                } else {
+                    ""
+                }
+            ),
+            None => println!("  observed      never"),
+        }
+    }
+    for issue in issues {
+        println!("warning: resource {}: {}", issue.resource, issue.detail);
+    }
 }
 
 /// The project template written by `ocg init`.
@@ -2016,6 +2291,41 @@ fn doctor_command(
             }
             Err(Failure::Usage(message)) => doctor.line("fail", "runtime state", &message),
             Err(Failure::Gear(error)) => doctor.line("fail", "runtime state", &error.to_string()),
+        }
+        // Registry summary: counts and health only, never a record dump.
+        let loaded = crate::resources::load(project_root);
+        if loaded.exists {
+            let records = loaded.registry.list();
+            let mut available = 0usize;
+            let mut degraded = 0usize;
+            let mut unavailable = 0usize;
+            for record in &records {
+                match record.health.state {
+                    crate::resources::ResourceHealth::Available => available += 1,
+                    crate::resources::ResourceHealth::Degraded => degraded += 1,
+                    crate::resources::ResourceHealth::Unavailable => unavailable += 1,
+                    crate::resources::ResourceHealth::Unknown => {}
+                }
+            }
+            let status = if loaded.corrupt || unavailable > 0 || degraded > 0 {
+                "warn"
+            } else if records.is_empty() {
+                "info"
+            } else {
+                "ok"
+            };
+            doctor.line(
+                status,
+                "resources",
+                &format!(
+                    "{} known ({} available, {} degraded, {} unavailable){}",
+                    records.len(),
+                    available,
+                    degraded,
+                    unavailable,
+                    if loaded.corrupt { "; corrupt" } else { "" }
+                ),
+            );
         }
     } else {
         doctor.line(

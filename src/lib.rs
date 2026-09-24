@@ -29,6 +29,7 @@ pub mod prompt;
 pub mod proxy;
 pub mod report;
 pub mod reports;
+pub mod resources;
 pub mod runtime;
 pub mod telemetry;
 pub mod validate;

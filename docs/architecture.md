@@ -308,10 +308,99 @@ silent fallback. Errors retain a redacted detail alongside a small classificatio
 invalid response, observation failure, profile selection, or provider
 completion).
 
-This boundary does not introduce a registry, scheduler, Resource Broker,
-second runtime, or generic plugin protocol. The existing OpenCode
-compatibility descriptor remains responsible for V1/V2 config, plugin, and
-launch differences.
+This boundary does not introduce a scheduler, Resource Broker, second runtime,
+or generic plugin protocol. The descriptive [Resource
+Registry](#resource-registry) is a separate, non-selecting layer. The existing
+OpenCode compatibility descriptor remains responsible for V1/V2 config, plugin,
+and launch differences.
+
+## Resource Registry
+
+The Resource Registry is the descriptive factual substrate that a future
+Reconciler → Policy → Placement → Runtime pipeline will read:
+
+```text
+Reconciler (observes)
+        ↓
+Resource Registry (describes: facts, provenance, Unknown)
+        ↓
+future Policy (interprets)
+        ↓
+future Placement (selects)
+        ↓
+Runtime (executes)
+```
+
+It answers *what execution resources does OCG know about, what facts are known
+about each, where did those facts come from, how fresh are they, and what
+capabilities and availability are known*. It deliberately does **not** answer
+*which resource a Mission should use*. Nothing in the registry selects, ranks,
+scores, rotates, fails over or enforces a budget.
+
+Three identities stay mechanically distinct:
+
+```text
+MissionId           durable work identity          orchestration::mission
+ResourceId          execution-capable resource     resources
+RuntimeExecutionId  one concrete execution         runtime::lifecycle
+```
+
+A `ResourceId` is derived deterministically from the known identity dimensions
+— runtime engine/family, provider, model, account/profile and protocol — never
+from a Mission, execution or session id, and never from a raw OpenCode agent
+label. An empty identity still yields a stable, filesystem-safe `res-…` id.
+`account_profile` and `protocol` are part of the model so two accounts or
+protocols can never be conflated, but no current source populates them: they
+stay `None` (Unknown).
+
+Each resource record keeps its facts apart and provenance-tagged:
+
+- **Configured** — what the layered configuration requests (StaticConfig). This
+  is re-derived from the effective configuration on every load and is never
+  persisted, so configuration cannot become stale durable truth.
+- **Resolved** — catalogue evidence that the runtime currently exposes the
+  model. OCG static validation stays owned by `validate`.
+- **Effective** — what a live session reported after activation.
+- **Observed** — health, runtime identity/capabilities, context limit and any
+  runtime-reported model metadata, each with its own observation time.
+
+Dynamic facts carry a `ResourceProvenance` source (`static_config`,
+`provider_reported`, `runtime_observed`, `runtime_reported`, `estimated`,
+`unknown`) and are merged rather than replaced: a stronger source is never
+silently overwritten by a weaker guess, an unknown never erases a known value,
+equal sources defer to recency, and equal observations merge idempotently.
+`RuntimeProvenance`/`TelemetryProvenance` convert into a resource source rather
+than competing with it.
+
+Unknown is first-class. Quota, capacity, cost, context limit, health, account
+state and protocol support are `None`/`unknown` until an authoritative source
+exists; missing evidence is never turned into an optimistic `0`, `unlimited`,
+`available` or `healthy`. Health is factual evidence, not a score:
+`available`/`degraded`/`unavailable`/`unknown` with a bounded secret-free reason
+and timestamp. A transient transport failure is `degraded`, never permanent
+absence; an authentication rejection is `unavailable`; a missing execution means
+the runtime answered, so the resource is still `available`.
+
+Only dynamic observations are persisted, atomically, in a single bounded
+document at `.opencode-gear/resources/registry.json` with an explicit
+`schema_version`. The document holds no credentials and health reasons are
+redacted on ingestion. A corrupt record is reported and skipped without
+poisoning unrelated resources and never silently becomes "resource absent"; an
+unreadable document or an unsupported schema version is reported as corrupt.
+
+The ingestion seams are deliberately narrow. A `RuntimeAdapter` contributes
+runtime identity and lifecycle capabilities through a neutral lifecycle type —
+no OpenCode HTTP object or `/api/session/...` knowledge enters the registry. The
+Reconciler may publish the availability it already observed as a factual health
+fact; that path is purely observational and never changes a decision, receipt or
+exit status. `ocg resources [--json]` is a stable, redacted, read-only
+inspection surface (`--observe` records one local runtime observation);
+`ocg doctor --effective` prints a counts/health summary, never a record dump.
+
+Resource Broker, ranking, placement, automatic failover or rotation, quota
+routing, price optimisation, hard budget enforcement, a Policy engine, a
+scheduler/queue, distributed leases and a second runtime remain explicitly
+deferred.
 
 ## Single-node reconciliation
 
@@ -366,7 +455,6 @@ service URLs, or raw runtime diagnostics are persisted in receipts.
 
 This is deliberately not Policy, Resource Broker, scheduler, distributed
 controller, second runtime, or a generic queue. Those remain deferred.
-
 
 Orchestration is the layer that carries a task across roles. It is deliberately
 split so policy cannot drift into the wrong language:

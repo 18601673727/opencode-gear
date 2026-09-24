@@ -144,6 +144,10 @@ impl RuntimeIdentity {
 pub struct RuntimeCapabilities {
     pub resolve_execution: bool,
     pub create_execution: bool,
+    /// Whether the adapter can authoritatively recover an interrupted create
+    /// through [`RuntimeAdapter::recover_execution`]. It is separate from
+    /// [`RuntimeCapability::RecoverExecution`], which names the operation.
+    pub recover_execution: bool,
     pub inspect_execution: bool,
     pub select_profile: bool,
     pub observe_context: bool,
@@ -155,6 +159,7 @@ impl RuntimeCapabilities {
     pub const NONE: Self = Self {
         resolve_execution: false,
         create_execution: false,
+        recover_execution: false,
         inspect_execution: false,
         select_profile: false,
         observe_context: false,
@@ -165,6 +170,7 @@ impl RuntimeCapabilities {
     pub const OPENCODE_V2: Self = Self {
         resolve_execution: true,
         create_execution: true,
+        recover_execution: true,
         inspect_execution: true,
         select_profile: true,
         observe_context: true,

@@ -856,6 +856,7 @@ tools <task...>     capability plan / Tool Context Firewall view (advisory)
 checkpoint list|show|save
                     inspect or record a versioned phase checkpoint
 reconcile [--once]  explicit single-node Mission convergence pass (no daemon)
+resources [--json]  readable facts about known execution resources (read-only)
 version             Gear, platform and the resolved OpenCode runtime
 doctor              read-only layering/config/OpenCode/proxy/runtime diagnosis
                     (--effective adds the live Configured/Resolved/Effective state)
@@ -871,6 +872,15 @@ keeps terminal Missions inert, and never uses raw OpenCode agent/model metadata
 as identity. The command is explicit and single-node; it does not start a
 background daemon. A missing runtime or unsupported lifecycle capability is
 reported as deferred/blocked rather than causing silent replacement.
+
+`ocg resources [--json]` prints the descriptive Resource Registry: the known
+execution resources with their runtime, provider/model, capabilities, health and
+provenance, and an explicit `unknown` wherever OCG has no authoritative fact
+(quota, capacity, cost, context limit). It is read-only and never selects,
+ranks or routes a resource. `--observe` records one local runtime observation;
+otherwise only configured and previously persisted facts are shown. Configured
+facts are re-derived from the configuration rather than stored, and health
+reasons are redacted before they are written.
 
 Inside the TUI, `Tab` / `Shift+Tab` cycle the three Lead agents. The cycle
 order depends on the active `default_agent`; the default configuration starts
