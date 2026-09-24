@@ -371,10 +371,11 @@ OCG did not start carries a catalogue and configuration OCG cannot reason about,
 and a listening port does not prove the API is ready. OCG therefore starts its
 own loopback server for exactly one invocation, hands it the generated config
 through `OPENCODE_CONFIG_CONTENT`, and terminates it when the invocation ends.
-The identity of that endpoint is explicit and printed at launch and in reports:
+The ownership of that endpoint is explicit and printed at launch and in
+reports, while the loopback URL and local password remain invocation-scoped:
 
 ```text
-ocg: runtime ocg-managed-invocation http://127.0.0.1:<port> (pid <pid>) | session <id> | effective Lead lead-high on openai/gpt-6-astra (provider-default)
+ocg: runtime ocg-managed-invocation (pid <pid>) | session <id> | effective Lead lead-high on openai/gpt-6-astra (provider-default)
 ```
 
 Startup is a handshake (`server listening on <url>`, `server password ...`)
@@ -483,8 +484,8 @@ Runtime state (level high):
   configured       [PASS] lead-high on openai/gpt-6-astra (variant provider-default)
   resolved         [PASS] accepted by OCG validation
   model            [PASS] openai/gpt-6-astra is exposed by the resolved runtime catalogue
-  effective        [PASS] session <id> on ocg-managed-invocation http://127.0.0.1:<port> (pid <pid>) reports lead-high on openai/gpt-6-astra (provider-default)
-  runtime          ocg-managed-invocation http://127.0.0.1:<port> (pid <pid>)
+  effective        [PASS] session <id> on ocg-managed-invocation (pid <pid>) reports lead-high on openai/gpt-6-astra (provider-default)
+  runtime          ocg-managed-invocation (pid <pid>)
 ```
 
 ### Runtime layout and cleanup
@@ -648,7 +649,7 @@ Key facts:
   reads the effective provider/model/variant back and prints it:
 
   ```text
-    effective: verified on http://127.0.0.1:<port> (session <id>)
+    effective: verified on the invocation-owned runtime (session <id>)
                lead-high on openai/gpt-6-astra (provider-default)
   ```
 

@@ -163,14 +163,17 @@ runtime/common contract
   to that same child, resolves or creates the project session, selects the Lead
   agent/model (sending a variant only when configured), then reads the effective
   state back and fails on a mismatch. The OpenCode client is pointed at that
-  same private server and the child is terminated and reaped when it exits;
-  Gear never restarts or reconfigures the user's shared service.
+  same private server with the verified `--session` target and the child is
+  terminated and reaped when it exits; Gear never restarts or reconfigures the
+  user's shared service. The V2 URL, local password and target session are
+  invocation-scoped child environment values only; they never enter Mission,
+  telemetry, continuation or rollover artifacts.
 - **Runtime ownership and readiness are explicit.** A V2 launch only ever uses
-  the server it started for that invocation; its identity
-  (`ocg-managed-invocation <endpoint> (pid N)`) is reported, never an ambient
-  service. Startup reads the handshake and then waits for a real authenticated
-  API response, bounded by a fixed budget, so a bound-but-unready or dead
-  process fails distinctly instead of hanging.
+  the server it started for that invocation; its identity is reported as
+  `ocg-managed-invocation (pid N)` without the endpoint or password, never as
+  an ambient service. Startup reads the handshake and then waits for a real
+  authenticated API response, bounded by a fixed budget, so a bound-but-unready
+  or dead process fails distinctly instead of hanging.
 - **Configured / Resolved / Effective are never conflated.** The effective state
   comes from a live session read-back, but the OpenCode 2 session API accepts
   any provider/model id, so that read-back proves *intent*; the catalogue probe
@@ -380,6 +383,65 @@ outside that lifetime:
   Checkpoints stay the shared evidence store — Missions store references to
   them, not copies. Sessions predate Missions and adopt one lazily on their
   next touch, keeping their progress.
+- **UI/client failure is not Mission failure.** The OpenCode TUI, event
+  subscription, bridge process and local V2 HTTP client are replaceable
+  messengers. If one disappears, the bridge records an `unknown` observation
+  (or no observation at all) and leaves the Mission owner, generation,
+  progress and terminal state untouched. A later session can reload the Mission
+  and continue. Only a durable, artifact-backed transition may change the
+  execution binding; a client disconnect, failed report or interrupted process
+  can never imply completion or failure.
+
+### Context pressure and same-generation rollover
+
+The context governor is a small, artifact-backed layer above the Mission. It
+observes one V2 message at the completed root-Lead boundary, after the output
+event has been handled and the disposable session view has been synchronized:
+
+```text
+session.step.ended(stop)
+  → lead.output / output acknowledgement
+  → context.observe (no transcript text)
+  → atomic context telemetry
+  → Mission CAS + bounded continuation artifact
+  → fresh V2 session + verified Lead
+  → staged synthetic continuation
+  → owner cutover and acknowledgement
+```
+
+- The active-context projection is **one message's** `input + cache.read`.
+  Output, reasoning and `cache.write` remain raw telemetry fields; message
+  usage is never summed into a cumulative transcript denominator. Overflow,
+  missing usage, missing model limits and failed V2 queries are explicit
+  `unknown` observations and cannot trigger automatic replacement.
+- Policy defaults are an ordered 70% approaching warning and 80% rollover
+  request. Thresholds require a trustworthy `/api/model` limit; an optional
+  absolute cap can operate without one. No percentage is fabricated.
+- A required observation at an unsafe boundary is durably marked pending. Only
+  a completed root-Lead `stop` after output handling is a safe boundary. Tool
+  errors, partial output, missing clients and `tool-calls` steps do not claim
+  safety.
+- The target is created explicitly rather than through `resolve_session`. Its
+  agent/model/variant are selected and read back, the target session identity
+  is verified, and the launched V2 client is given that `--session` target.
+  The old session/transcript remains retained for diagnostics.
+- Continuation is a bounded packet derived from Mission state (goal,
+  constraints, findings, files, verification references, checkpoints, phase,
+  attempts and next action), not a transcript copy. The packet is embedded in
+  the rollover artifact and mirrored as an inspectable sidecar under
+  `.opencode-gear/orchestration/context/continuations/`; it is staged with
+  `resume:false` and resumed with the same stable message id only after the
+  owner cutover.
+- Mission writes use an atomic sibling lock plus revision/owner compare-and-
+  swap at the cutover boundary. A concurrent progress update or stale owner
+  produces a conflict; it is never overwritten. A failed pre-cutover step
+  preserves the old binding and records a bounded retry cooldown. A failure
+  after cutover is recorded as active-but-unacknowledged and is recoverable by
+  a later target session. If a new explicit user admission replaces that
+  session, it marks the old artifact conflicted, preserves the same generation
+  and progress, and prevents stale workers from writing over the new owner;
+  conflicted Missions require operator review. Terminal Missions are never
+  reopened.
 
 > **Refresh policy.** OCG injects the full repository context snapshot on the
 > first Lead prompt of a session. On OpenCode v1 the snapshot is persisted into

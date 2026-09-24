@@ -21,25 +21,35 @@
 pub mod bridge;
 pub mod checkpoint;
 pub mod config;
+pub mod context_governor;
 pub mod controller;
 pub mod handoff;
 pub mod mission;
 pub mod plugin;
 pub mod projection;
+pub mod rollover;
 pub mod state;
 
 pub use checkpoint::{Checkpoint, CheckpointSummary, LoadedCheckpoint, Phase, Staleness};
 pub use config::OrchestrationConfig;
+pub use context_governor::{
+    ContextGovernorConfig, ContextObservation, GovernorAction, GovernorDecision, GovernorState,
+    ModelMetadata, TelemetryProvenance, TokenUsage,
+};
 pub use controller::{
-    BuildDecision, BuildOutcome, Controller, ExploreDigest, HandoffOutcome, LeadContext,
+    BuildDecision, BuildOutcome, ContextGovernanceResult, Controller, ExploreDigest,
+    HandoffOutcome, LeadContext,
 };
 pub use handoff::{
     HandoffFinding, HandoffVerification, ModelHandoffCapsule, ProjectionInput, Role, Severity,
     Transition,
 };
 pub use mission::{
-    Mission, MissionEvent, MissionEventKind, MissionStatus, MissionSummary, NextAction,
-    MISSION_SCHEMA_VERSION,
+    Mission, MissionEvent, MissionEventKind, MissionRolloverState, MissionRolloverStatus,
+    MissionStatus, MissionSummary, NextAction, MISSION_SCHEMA_VERSION,
+};
+pub use rollover::{
+    ContinuationPacket, LeadBinding, RolloverArtifact, RolloverStatus, ROLLOVER_SCHEMA_VERSION,
 };
 pub use state::{
     Attempts, OrchestrationPhase, OrchestrationState, RepositoryBaseline, SessionState,

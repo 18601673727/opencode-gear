@@ -12,7 +12,7 @@ use crate::config;
 use crate::context::{self, ContextConfig, ContextEngine};
 use crate::defaults::{load_defaults, GearSource};
 use crate::error::GearError;
-use crate::http::{GithubToken, HttpTransport, NoHttp, ProcessHttpEnv, ReqwestHttp};
+use crate::http::{GithubToken, HttpTransport, NoHttp, ProcessHttpEnv, ReqwestHttp, Secret};
 use crate::model;
 use crate::observability;
 use crate::orchestration::checkpoint::{self, Phase};
@@ -37,6 +37,7 @@ use crate::yaml;
 use semver::Version;
 use serde_json::{json, Value};
 use std::ffi::OsString;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// Printed by `version` and embedded in the help header.
@@ -45,7 +46,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const THROTTLE_LEVELS: [&str; 3] = ["low", "mid", "high"];
 
 /// Process environment, resolved once so the rest of the code stays pure.
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct Env {
     pub home: Option<PathBuf>,
     pub throttle: Option<String>,
@@ -65,8 +66,50 @@ pub struct Env {
     pub telemetry: Option<String>,
     /// `OPENCODE_GEAR_ORCHESTRATION` on/off escape hatch.
     pub orchestration: Option<String>,
+    /// Invocation-scoped OpenCode V2 endpoint exported to the generated
+    /// bridge. It is never persisted in Gear artifacts.
+    pub v2_server_url: Option<String>,
+    /// Invocation-scoped local service password. `Secret` keeps Debug/Display
+    /// redacted while the child process receives the raw value through env.
+    pub v2_server_password: Option<Secret>,
+    /// The session selected by the launch preflight. It is a target identity,
+    /// not a Mission identity.
+    pub v2_target_session: Option<String>,
+    /// Exact directory used to create the invocation's V2 sessions.
+    pub v2_directory: Option<String>,
+    /// Resolved Lead contract exported to the generated bridge.
+    pub v2_lead: Option<LeadSelection>,
     /// `GH_TOKEN` (preferred) then `GITHUB_TOKEN` for OCG-owned GitHub calls.
     pub github_token: Option<GithubToken>,
+}
+
+impl fmt::Debug for Env {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Env")
+            .field("home", &self.home)
+            .field("throttle", &self.throttle)
+            .field("user_config", &self.user_config)
+            .field("project_config", &self.project_config)
+            .field("opencode_bin", &self.opencode_bin)
+            .field("trace", &self.trace)
+            .field("xdg_config_home", &self.xdg_config_home)
+            .field("home_dir", &self.home_dir)
+            .field("api_base", &self.api_base.as_ref().map(|_| "<redacted>"))
+            .field("cache_dir", &self.cache_dir)
+            .field("telemetry", &self.telemetry)
+            .field("orchestration", &self.orchestration)
+            .field(
+                "v2_server_url",
+                &self.v2_server_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field("v2_server_password", &self.v2_server_password)
+            .field("v2_target_session", &self.v2_target_session)
+            .field("v2_directory", &self.v2_directory)
+            .field("v2_lead", &self.v2_lead)
+            .field("github_token", &self.github_token)
+            .finish()
+    }
 }
 
 impl Env {
@@ -92,6 +135,12 @@ impl Env {
             cache_dir: env_path(&["OPENCODE_GEAR_CACHE_DIR"]),
             telemetry: env_string(&["OPENCODE_GEAR_TELEMETRY", "OC_GEAR_TELEMETRY"]),
             orchestration: env_string(&["OPENCODE_GEAR_ORCHESTRATION", "OC_GEAR_ORCHESTRATION"]),
+            v2_server_url: env_string(&["OPENCODE_GEAR_V2_SERVER_URL"]),
+            v2_server_password: env_string(&["OPENCODE_GEAR_V2_SERVER_PASSWORD"]).map(Secret::new),
+            v2_target_session: env_string(&["OPENCODE_GEAR_V2_TARGET_SESSION"]),
+            v2_directory: env_string(&["OPENCODE_GEAR_V2_DIRECTORY"]),
+            v2_lead: env_string(&["OPENCODE_GEAR_LEAD_CONTRACT"])
+                .and_then(|raw| serde_json::from_str(&raw).ok()),
             github_token: crate::http::github_token_from_env(&ProcessHttpEnv),
         }
     }
@@ -937,6 +986,7 @@ fn launch(
     })?;
 
     let mut v2_runtime = None;
+    let mut runtime_target_session: Option<String> = None;
     if coding_session {
         match adapter.lead_selection() {
             // v1 enforces the Lead on the mutable request message; the runtime
@@ -1009,6 +1059,7 @@ fn launch(
                     session.session_id,
                     crate::runtime::effective::render_effective(&observed)
                 );
+                runtime_target_session = Some(session.session_id);
                 v2_runtime = Some(runtime);
             }
         }
@@ -1024,11 +1075,35 @@ fn launch(
         Vec::new()
     };
     if let Some(runtime) = v2_runtime {
-        let private_args = private_server_args(args, runtime.url());
+        let target_session = runtime_target_session.as_deref().unwrap_or_default();
+        let private_args = private_server_args(args, runtime.url(), target_session);
         let mut private_env = extra_env;
         private_env.push((
             OsString::from("OPENCODE_SERVER_PASSWORD"),
             OsString::from(runtime.password()),
+        ));
+        // These values exist only in this invocation's child environment. The
+        // generated plugin passes them to the bridge for context observation;
+        // none is written to Mission, telemetry, rollover or continuation
+        // artifacts. The target id also makes the launched OpenCode client
+        // select the session whose Lead was verified above.
+        private_env.push((
+            OsString::from("OPENCODE_GEAR_V2_SERVER_URL"),
+            OsString::from(runtime.url()),
+        ));
+        private_env.push((
+            OsString::from("OPENCODE_GEAR_V2_SERVER_PASSWORD"),
+            OsString::from(runtime.password()),
+        ));
+        if !target_session.is_empty() {
+            private_env.push((
+                OsString::from("OPENCODE_GEAR_V2_TARGET_SESSION"),
+                OsString::from(target_session),
+            ));
+        }
+        private_env.push((
+            OsString::from("OPENCODE_GEAR_V2_DIRECTORY"),
+            invocation_dir.as_os_str().to_os_string(),
         ));
         // Keep `runtime` alive until its client exits. Its Drop implementation
         // terminates and reaps the private server on every return path.
@@ -1051,16 +1126,24 @@ fn launch(
 /// `--server` is accepted by OpenCode 2.0.11's `run` command, but not before
 /// the subcommand. Interactive launch has no subcommand, where it remains a
 /// root flag.
-fn private_server_args(args: &[OsString], url: &str) -> Vec<OsString> {
-    let mut result = Vec::with_capacity(args.len() + 2);
+fn private_server_args(args: &[OsString], url: &str, target_session: &str) -> Vec<OsString> {
+    let mut result = Vec::with_capacity(args.len() + 4);
     if let Some((first, rest)) = args.split_first() {
         result.push(first.clone());
         result.push(OsString::from("--server"));
         result.push(OsString::from(url));
+        if !target_session.is_empty() {
+            result.push(OsString::from("--session"));
+            result.push(OsString::from(target_session));
+        }
         result.extend(rest.iter().cloned());
     } else {
         result.push(OsString::from("--server"));
         result.push(OsString::from(url));
+        if !target_session.is_empty() {
+            result.push(OsString::from("--session"));
+            result.push(OsString::from(target_session));
+        }
     }
     result
 }
@@ -1187,6 +1270,12 @@ fn runtime_plugin_env(
         } else {
             "0"
         }),
+    ));
+    let governor =
+        crate::orchestration::OrchestrationConfig::from_config(&effective.data)?.context_governor;
+    env.push((
+        OsString::from("OPENCODE_GEAR_CONTEXT_GOVERNOR_ENABLED"),
+        OsString::from(if governor.enabled { "1" } else { "0" }),
     ));
     if adapter.major() == compat::Major::V2 {
         env.push((
@@ -2187,6 +2276,33 @@ fn doctor_command(
                         "context.enabled=false; orchestration runs with an empty dynamic context"
                     },
                 );
+                let governor = &config.context_governor;
+                let artifact_count = |directory: PathBuf| {
+                    std::fs::read_dir(directory)
+                        .map(|entries| {
+                            entries
+                                .flatten()
+                                .filter(|entry| {
+                                    entry.path().extension().and_then(|ext| ext.to_str())
+                                        == Some("json")
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0)
+                };
+                doctor.line(
+                    if governor.enabled { "ok" } else { "info" },
+                    "context governor",
+                    &format!(
+                        "{}; warning {}%; rollover {}%; telemetry artifact(s) {}; rollover artifact(s) {}; continuation packet(s) {}",
+                        if governor.enabled { "enabled" } else { "disabled" },
+                        governor.approaching_percent,
+                        governor.rollover_percent,
+                        artifact_count(crate::orchestration::context_governor::telemetry_dir(project_root)),
+                        artifact_count(crate::orchestration::context_governor::rollover_dir(project_root)),
+                        artifact_count(crate::orchestration::context_governor::continuation_dir(project_root)),
+                    ),
+                );
                 let verification_ready = VerificationConfig::from_config(&effective.data)
                     .map(|verification| {
                         verification.enabled
@@ -3064,9 +3180,38 @@ fn bridge_payload(
         Ok(config) => config,
         Err(error) => return json!({"ok": false, "error": error.to_string()}),
     };
-    let bridge =
+    let mut bridge =
         crate::orchestration::bridge::BridgeContext::new(&controller, &runner, telemetry_config)
             .with_reports(reports);
+    // Only the context observation path needs a live V2 client. Ordinary
+    // bridge events remain entirely local, so an unavailable UI/client cannot
+    // manufacture a Mission failure or write a misleading rollover.
+    if matches!(
+        event,
+        "context.observe" | "session.context.observe" | "context-observation"
+    ) {
+        if let (Some(url), Some(password), Some(lead)) = (
+            env.v2_server_url.as_deref(),
+            env.v2_server_password.as_ref(),
+            env.v2_lead.clone(),
+        ) {
+            let registration = compat::v2_client::ServiceRegistration::new(url, password.expose());
+            let directory = env
+                .v2_directory
+                .clone()
+                .unwrap_or_else(|| project_root.to_string_lossy().into_owned());
+            match compat::v2_client::V2SessionClient::connect(&registration, directory) {
+                Ok(client) => {
+                    bridge = bridge.with_rollover_runtime(client, lead);
+                }
+                Err(_) => {
+                    // The bridge will record an explicit unknown observation;
+                    // do not turn a client startup failure into Mission
+                    // failure or expose the credential in the reply.
+                }
+            }
+        }
+    }
     bridge.dispatch(event, &payload)
 }
 
@@ -3717,6 +3862,43 @@ mod tests {
     }
 
     #[test]
+    fn invocation_v2_credentials_are_redacted_from_environment_debug() {
+        let env = Env {
+            v2_server_url: Some("http://127.0.0.1:45678".to_string()),
+            v2_server_password: Some(Secret::new("local-secret")),
+            ..Env::default()
+        };
+        let debug = format!("{env:?}");
+        assert!(!debug.contains("127.0.0.1"));
+        assert!(!debug.contains("local-secret"));
+    }
+
+    #[test]
+    fn the_private_v2_launch_targets_the_verified_session() {
+        let args = vec![OsString::from("run"), OsString::from("--print-logs")];
+        let actual = private_server_args(&args, "http://127.0.0.1:1234", "ses_target");
+        assert_eq!(
+            actual,
+            vec![
+                OsString::from("run"),
+                OsString::from("--server"),
+                OsString::from("http://127.0.0.1:1234"),
+                OsString::from("--session"),
+                OsString::from("ses_target"),
+                OsString::from("--print-logs"),
+            ]
+        );
+        let empty = private_server_args(&[], "http://127.0.0.1:1234", "");
+        assert_eq!(
+            empty,
+            vec![
+                OsString::from("--server"),
+                OsString::from("http://127.0.0.1:1234")
+            ]
+        );
+    }
+
+    #[test]
     fn the_plugin_environment_carries_the_latest_lead_output_switch() {
         let dir = tempfile::tempdir().unwrap();
         let mut effective = effective_for(dir.path());
@@ -3728,13 +3910,29 @@ mod tests {
             Some("1"),
             "the capture is enabled by default"
         );
+        assert_eq!(
+            env_value(&env, "OPENCODE_GEAR_CONTEXT_GOVERNOR_ENABLED").as_deref(),
+            Some("1"),
+            "the context governor is enabled by default"
+        );
 
-        // Disabling the switch is exported exactly; the adapter then registers
-        // no event subscription at all.
+        // Disabling output reporting is independent: the context governor can
+        // still subscribe to the event surface and observe safe boundaries.
         effective.data["reports"]["latestLeadOutput"]["enabled"] = Value::Bool(false);
         let env = runtime_plugin_env(&effective, dir.path(), "high", adapter).unwrap();
         assert_eq!(
             env_value(&env, "OPENCODE_GEAR_REPORTS_LATEST_LEAD_OUTPUT").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            env_value(&env, "OPENCODE_GEAR_CONTEXT_GOVERNOR_ENABLED").as_deref(),
+            Some("1")
+        );
+
+        effective.data["orchestration"] = json!({"contextGovernor": {"enabled": false}});
+        let env = runtime_plugin_env(&effective, dir.path(), "high", adapter).unwrap();
+        assert_eq!(
+            env_value(&env, "OPENCODE_GEAR_CONTEXT_GOVERNOR_ENABLED").as_deref(),
             Some("0")
         );
     }

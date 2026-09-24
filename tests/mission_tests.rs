@@ -609,6 +609,24 @@ fn mission_listing_is_read_only_and_does_not_create_state() {
 }
 
 #[test]
+fn an_invalid_revision_is_quarantined_instead_of_being_adopted() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FixedClock::new(1_000);
+    let git = FakeGitHost::new();
+    let controller = new_controller(dir.path(), &git, &clock);
+    let mission_id = controller.admit_user_task("s", TASK).unwrap().task_id;
+    let path = mission::mission_path(dir.path(), &mission_id).unwrap();
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    value["revision"] = json!(0);
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(mission::load(dir.path(), &mission_id).is_err());
+    assert!(path
+        .with_file_name(format!("{mission_id}.corrupt.json"))
+        .is_file());
+}
+
+#[test]
 fn unsafe_mission_identity_cannot_escape_the_mission_directory() {
     let dir = tempfile::tempdir().unwrap();
     assert!(mission::mission_path(dir.path(), "../../etc/passwd").is_err());

@@ -311,9 +311,10 @@ fn doctor_effective_reports_configured_resolved_and_effective_from_the_live_runt
         "the effective state must come from the live session: {text}"
     );
     assert!(
-        text.contains("ocg-managed-invocation http://127.0.0.1:"),
-        "the runtime endpoint must be identified: {text}"
+        text.contains("ocg-managed-invocation (pid "),
+        "the invocation-owned runtime must be identified without exposing its endpoint: {text}"
     );
+    assert!(!text.contains("http://127.0.0.1:"), "{text}");
     // The fake runtime really was used: OCG read the session back.
     assert!(
         fake.state
@@ -436,9 +437,10 @@ fn a_switch_activates_and_reports_the_effective_provider_model_and_variant() {
     assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
     assert!(text.contains("Lead for throttle 'high' updated"), "{text}");
     assert!(
-        text.contains("effective: verified on http://127.0.0.1:"),
+        text.contains("effective: verified on the invocation-owned runtime"),
         "a successful switch must report the effective state: {text}"
     );
+    assert!(!text.contains("http://127.0.0.1:"), "{text}");
     assert!(
         text.contains("lead-high on openai/gpt-6-astra (variant xhigh)"),
         "{text}"

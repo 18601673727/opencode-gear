@@ -16,7 +16,10 @@
 //! GET  /api/session?directory=&limit=1       (newest root sessions first)   -> {data:[{id},...], cursor}
 //! POST /api/session/{id}/agent               {agent}                        -> 204
 //! POST /api/session/{id}/model               {model:{id, providerID[, variant]}} -> 204
-//! GET  /api/session/{id}                     -> {data:{agent, model:{id, providerID[, variant]}}}
+//! GET  /api/session/{id}                     -> {data:{id, agent, model:{id, providerID[, variant]}, ...}}
+//! GET  /api/session/{id}/context             -> {data:[message records]}
+//! GET  /api/model?directory=...               -> {data:[{providerID,id,limit:{context,input,output}}]}
+//! POST /api/session/{id}/synthetic            {id,text,description,metadata,resume} -> {data:{id}}
 //! ```
 //!
 //! The variant key is written **only** when the Rust-resolved contract carries
@@ -37,7 +40,7 @@
 
 use crate::error::{GearError, Result};
 use crate::http::Secret;
-use crate::runtime::compat::{EffectiveLead, SessionClient};
+use crate::runtime::compat::{EffectiveLead, SessionClient, SessionLifecycleClient};
 use serde_json::{json, Map, Value};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -130,7 +133,7 @@ impl fmt::Debug for ServiceRegistration {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ServiceRegistration")
-            .field("url", &self.url)
+            .field("url", &"<redacted>")
             .field("password", &"<redacted>")
             .finish()
     }
@@ -261,14 +264,23 @@ impl V2Transport for ReqwestV2Transport {
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(encoded);
         }
-        let response = builder
-            .send()
-            .map_err(|error| GearError::config(format!("cannot reach {}: {error}", request.url)))?;
+        let response = builder.send().map_err(|error| {
+            let detail = error
+                .to_string()
+                .replace(&request.url, "<redacted-endpoint>")
+                .replace(self.password.expose(), "<redacted-credential>");
+            GearError::config(format!(
+                "cannot reach the local OpenCode V2 endpoint: {detail}"
+            ))
+        })?;
         let status = response.status().as_u16();
         let body = response.text().map_err(|error| {
+            let detail = error
+                .to_string()
+                .replace(&request.url, "<redacted-endpoint>")
+                .replace(self.password.expose(), "<redacted-credential>");
             GearError::config(format!(
-                "cannot read the response from {}: {error}",
-                request.url
+                "cannot read the local OpenCode V2 response: {detail}"
             ))
         })?;
         Ok(V2Response { status, body })
@@ -364,7 +376,8 @@ impl V2SessionClient {
             })
             .map_err(|error| {
                 GearError::config(format!(
-                    "OpenCode V2 session transport to {url} failed: {error}"
+                    "OpenCode V2 session transport failed: {}",
+                    error.to_string().replace(&url, "<redacted-endpoint>")
                 ))
             })?;
         if !(200..300).contains(&response.status) {
@@ -380,6 +393,189 @@ impl V2SessionClient {
             ))
         })?;
         Ok(Some(value))
+    }
+    /// Create a genuinely fresh root session for a rollover.  This is not
+    /// `resolve_session`: the latter intentionally reuses an existing project
+    /// session, which is the wrong operation for a bounded replacement.
+    pub fn create_fresh_session(&self) -> Result<String> {
+        let created = self
+            .send(
+                "POST",
+                "/api/session",
+                Some(json!({"location": {"directory": self.directory}})),
+            )?
+            .ok_or_else(|| malformed("/api/session", "empty response"))?;
+        created
+            .get("data")
+            .and_then(|data| data.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                GearError::config(
+                    "OpenCode V2 fresh session create response did not contain a session id",
+                )
+            })
+    }
+
+    /// Read the runtime's active-context message projection. The response is
+    /// intentionally retained as a value at the runtime boundary; the governor
+    /// decides which fields are safe to interpret and records provenance.
+    pub fn context_messages(&self, session: &str) -> Result<Vec<Value>> {
+        let path = format!("/api/session/{}/context", encode_component(session));
+        let body = self
+            .send("GET", &path, None)?
+            .ok_or_else(|| malformed(&path, "empty response"))?;
+        body.get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| malformed(&path, "missing the `data` array"))
+    }
+
+    /// Read the full session record for model and aggregate-token observation.
+    pub fn session_info(&self, session: &str) -> Result<Value> {
+        let path = format!("/api/session/{}", encode_component(session));
+        let body = self
+            .send("GET", &path, None)?
+            .ok_or_else(|| malformed(&path, "empty response"))?;
+        body.get("data")
+            .and_then(Value::as_object)
+            .cloned()
+            .map(Value::Object)
+            .ok_or_else(|| malformed(&path, "missing the `data` object"))
+    }
+
+    /// Read the model catalogue entry and its runtime-reported limits.
+    pub fn model_metadata(
+        &self,
+        provider_id: Option<&str>,
+        model_id: Option<&str>,
+    ) -> Result<crate::orchestration::context_governor::ModelMetadata> {
+        let path = format!("/api/model?directory={}", encode_component(&self.directory));
+        let body = self
+            .send("GET", &path, None)?
+            .ok_or_else(|| malformed(&path, "empty response"))?;
+        let data = body
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| malformed(&path, "missing the `data` array"))?;
+        let entry = data.iter().find(|entry| {
+            let entry_provider = entry.get("providerID").and_then(Value::as_str);
+            let entry_model = entry
+                .get("id")
+                .or_else(|| entry.get("modelID"))
+                .and_then(Value::as_str);
+            provider_id.is_none_or(|wanted| entry_provider == Some(wanted))
+                && model_id.is_none_or(|wanted| entry_model == Some(wanted))
+        });
+        let Some(entry) = entry else {
+            // A valid catalogue response with no matching model is an
+            // observation with unknown limits, not permission to invent one.
+            return Ok(crate::orchestration::context_governor::ModelMetadata {
+                source: Some("opencode-v2:/api/model".to_string()),
+                ..Default::default()
+            });
+        };
+        Ok(crate::orchestration::context_governor::ModelMetadata::from_v2_value(entry))
+    }
+
+    /// Inject a durable synthetic continuation. The normal prompt route is
+    /// intentionally not used: it is a user-task admission boundary and could
+    /// re-admit the task under a new identity.
+    pub fn inject_continuation(
+        &self,
+        session: &str,
+        message_id: &str,
+        text: &str,
+        description: &str,
+        metadata: &Value,
+    ) -> Result<()> {
+        self.inject_continuation_with_resume(session, message_id, text, description, metadata, true)
+    }
+
+    fn inject_continuation_with_resume(
+        &self,
+        session: &str,
+        message_id: &str,
+        text: &str,
+        description: &str,
+        metadata: &Value,
+        resume: bool,
+    ) -> Result<()> {
+        let path = format!("/api/session/{}/synthetic", encode_component(session));
+        self.send(
+            "POST",
+            &path,
+            Some(json!({
+                "id": message_id,
+                "text": text,
+                "description": description,
+                "metadata": metadata,
+                "resume": resume,
+            })),
+        )?;
+        Ok(())
+    }
+}
+
+impl SessionLifecycleClient for V2SessionClient {
+    fn create_fresh_session(&self) -> Result<String> {
+        Self::create_fresh_session(self)
+    }
+
+    fn context_messages(&self, session: &str) -> Result<Vec<Value>> {
+        Self::context_messages(self, session)
+    }
+
+    fn session_info(&self, session: &str) -> Result<Value> {
+        Self::session_info(self, session)
+    }
+
+    fn model_metadata(
+        &self,
+        provider_id: Option<&str>,
+        model_id: Option<&str>,
+    ) -> Result<crate::orchestration::context_governor::ModelMetadata> {
+        Self::model_metadata(self, provider_id, model_id)
+    }
+
+    fn inject_continuation(
+        &self,
+        session: &str,
+        message_id: &str,
+        text: &str,
+        description: &str,
+        metadata: &Value,
+    ) -> Result<()> {
+        Self::inject_continuation(self, session, message_id, text, description, metadata)
+    }
+
+    fn stage_continuation(
+        &self,
+        session: &str,
+        message_id: &str,
+        text: &str,
+        description: &str,
+        metadata: &Value,
+    ) -> Result<()> {
+        self.inject_continuation_with_resume(
+            session,
+            message_id,
+            text,
+            description,
+            metadata,
+            false,
+        )
+    }
+
+    fn resume_continuation(
+        &self,
+        session: &str,
+        message_id: &str,
+        text: &str,
+        description: &str,
+        metadata: &Value,
+    ) -> Result<()> {
+        self.inject_continuation_with_resume(session, message_id, text, description, metadata, true)
     }
 }
 
@@ -831,7 +1027,7 @@ mod tests {
         let error = subject.resolve_session().unwrap_err();
         let message = error.to_string();
         assert!(message.contains("connection refused"), "{message}");
-        assert!(message.contains(BASE), "{message}");
+        assert!(!message.contains(BASE), "{message}");
     }
 
     #[test]
@@ -841,6 +1037,7 @@ mod tests {
         )
         .unwrap();
         assert!(!format!("{registration:?}").contains("super-secret-token-value"));
+        assert!(!format!("{registration:?}").contains("http://"));
         assert!(!format!("{}", registration.password()).contains("super-secret-token-value"));
         assert!(!format!("{:?}", registration.password()).contains("super-secret-token-value"));
 
@@ -907,6 +1104,83 @@ mod tests {
         assert_eq!(model_body["model"]["variant"], json!("low"));
     }
 
+    #[test]
+    fn rollover_lifecycle_uses_fresh_target_and_explicit_context_routes() {
+        let fake = FakeTransport::with(vec![
+            ok(json!({"data": {"id": "ses_target"}})),
+            ok(json!({"data": [{"id": "msg", "type": "assistant"}]})),
+            ok(
+                json!({"data": {"id": SESSION, "agent": "lead-high", "model": {"id": "gpt-6-astra", "providerID": "openai"}}}),
+            ),
+            ok(
+                json!({"data": [{"providerID": "openai", "id": "gpt-6-astra", "limit": {"context": 100, "input": 90, "output": 20}}]}),
+            ),
+            no_content(),
+            no_content(),
+        ]);
+        let subject = client(&fake);
+        assert_eq!(subject.create_fresh_session().unwrap(), "ses_target");
+        assert_eq!(subject.context_messages(SESSION).unwrap().len(), 1);
+        assert_eq!(subject.session_info(SESSION).unwrap()["id"], json!(SESSION));
+        let metadata = subject
+            .model_metadata(Some("openai"), Some("gpt-6-astra"))
+            .unwrap();
+        assert_eq!(metadata.effective_limit, Some(100));
+        subject
+            .stage_continuation(
+                "ses_target",
+                "msg_ocg_test",
+                "continuation",
+                "test",
+                &json!({"mission_id": "task-test"}),
+            )
+            .unwrap();
+        subject
+            .resume_continuation(
+                "ses_target",
+                "msg_ocg_test",
+                "continuation",
+                "test",
+                &json!({"mission_id": "task-test"}),
+            )
+            .unwrap();
+        let requests = fake.requests();
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].url, format!("{BASE}/api/session"));
+        assert_eq!(
+            requests[1].url,
+            format!("{BASE}/api/session/{SESSION}/context")
+        );
+        assert_eq!(requests[2].url, format!("{BASE}/api/session/{SESSION}"));
+        assert!(requests[3]
+            .url
+            .starts_with(&format!("{BASE}/api/model?directory=")));
+        assert_eq!(requests[4].body.as_ref().unwrap()["resume"], json!(false));
+    }
+
+    #[test]
+    fn synthetic_resume_uses_the_same_stable_message_identity() {
+        let fake = FakeTransport::with(vec![no_content(), no_content()]);
+        let subject = client(&fake);
+        subject
+            .stage_continuation("ses_target", "msg_stable", "x", "d", &json!({}))
+            .unwrap();
+        subject
+            .resume_continuation("ses_target", "msg_stable", "x", "d", &json!({}))
+            .unwrap();
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert_eq!(request.method, "POST");
+            assert_eq!(
+                request.url,
+                format!("{BASE}/api/session/ses_target/synthetic")
+            );
+            assert_eq!(request.body.as_ref().unwrap()["id"], json!("msg_stable"));
+        }
+        assert_eq!(requests[0].body.as_ref().unwrap()["resume"], json!(false));
+        assert_eq!(requests[1].body.as_ref().unwrap()["resume"], json!(true));
+    }
     #[test]
     fn rejects_invalid_registration_documents() {
         assert!(ServiceRegistration::from_json("not json").is_err());

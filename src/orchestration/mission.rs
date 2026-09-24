@@ -44,7 +44,10 @@ use crate::orchestration::state::{Attempts, OrchestrationPhase, SessionState};
 use crate::verification::result::VerificationReport;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// The Mission schema version. Bumping it requires explicit migration code;
 /// unknown versions are quarantined, never silently adopted.
@@ -103,6 +106,21 @@ pub enum MissionEventKind {
     VerifyToDebug,
     /// Work returned from Debug to Build.
     DebugToBuild,
+    /// A context-pressure rollover was requested for this generation.
+    RolloverRequested,
+    /// A bounded continuation artifact was durably prepared.
+    RolloverPrepared,
+    /// A fresh target session was created and its Lead was verified.
+    RolloverTargetReady,
+    /// A verified target session became the Mission execution binding.
+    RolloverBound,
+    /// The target session acknowledged the continuation packet.
+    RolloverApplied,
+    /// A rollover attempt failed without changing the Mission owner.
+    RolloverFailed,
+    /// A rollover was abandoned because its optimistic ownership witness no
+    /// longer matched.
+    RolloverConflict,
     /// The generation completed cleanly.
     Completed,
     /// The generation was explicitly failed.
@@ -120,6 +138,13 @@ impl MissionEventKind {
             MissionEventKind::BuildToVerify => "build_to_verify",
             MissionEventKind::VerifyToDebug => "verify_to_debug",
             MissionEventKind::DebugToBuild => "debug_to_build",
+            MissionEventKind::RolloverRequested => "rollover_requested",
+            MissionEventKind::RolloverPrepared => "rollover_prepared",
+            MissionEventKind::RolloverTargetReady => "rollover_target_ready",
+            MissionEventKind::RolloverBound => "rollover_bound",
+            MissionEventKind::RolloverApplied => "rollover_applied",
+            MissionEventKind::RolloverFailed => "rollover_failed",
+            MissionEventKind::RolloverConflict => "rollover_conflict",
             MissionEventKind::Completed => "completed",
             MissionEventKind::Failed => "failed",
             MissionEventKind::Cancelled => "cancelled",
@@ -200,7 +225,84 @@ impl NextAction {
     }
 }
 
-/// The durable Mission record.
+/// Mission-local rollover lifecycle.  This is intentionally small: the
+/// detailed continuation and runtime operation state lives in a separate
+/// artifact, while the Mission records only the durable binding intent and its
+/// retry/failure boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionRolloverStatus {
+    /// No rollover is active for this generation.
+    #[default]
+    Idle,
+    /// The governor requested a rollover, but a safe boundary is not yet
+    /// confirmed.
+    Pending,
+    /// A continuation artifact is durable and target creation is in progress.
+    Preparing,
+    /// A target session has been verified by the runtime.
+    TargetReady,
+    /// Mission ownership now points at the target; continuation is awaiting
+    /// acknowledgement.
+    Active,
+    /// The target consumed the continuation packet.
+    Applied,
+    /// A retryable attempt failed while the old binding remained authoritative.
+    Failed,
+    /// A stale-owner/revision check prevented automatic cutover.
+    Conflict,
+}
+
+impl MissionRolloverStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Pending => "pending",
+            Self::Preparing => "preparing",
+            Self::TargetReady => "target_ready",
+            Self::Active => "active",
+            Self::Applied => "applied",
+            Self::Failed => "failed",
+            Self::Conflict => "conflict",
+        }
+    }
+}
+
+/// The durable Mission-side rollover checkpoint.  It never contains the
+/// continuation itself, so a corrupted artifact cannot make the Mission
+/// silently claim that a target was activated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MissionRolloverState {
+    pub status: MissionRolloverStatus,
+    pub artifact_id: Option<String>,
+    pub source_session_id: Option<String>,
+    pub target_session_id: Option<String>,
+    pub generation: u32,
+    pub reason: Option<String>,
+    pub requested_at: Option<i64>,
+    pub last_attempt_at: Option<i64>,
+    pub retry_after: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+impl Default for MissionRolloverState {
+    fn default() -> Self {
+        Self {
+            status: MissionRolloverStatus::Idle,
+            artifact_id: None,
+            source_session_id: None,
+            target_session_id: None,
+            generation: 0,
+            reason: None,
+            requested_at: None,
+            last_attempt_at: None,
+            retry_after: None,
+            last_error: None,
+        }
+    }
+}
+
 ///
 /// The task-scoped fields mirror the session's live execution view
 /// ([`SessionState`]); the controller syncs them at every mutation point.
@@ -213,6 +315,10 @@ pub struct Mission {
     /// Durable identity: the deterministic task id of the admitted task
     /// text. It never changes because a session does.
     pub mission_id: String,
+    /// A monotonically increasing mutation witness used for same-generation
+    /// rollover cutover. It is not a distributed lock; it only makes a stale
+    /// owner/artifact pair fail closed when local Mission progress changed.
+    pub revision: u64,
     /// The admission generation. Re-admitting a terminal Mission starts the
     /// next generation with fresh progress; history is retained across
     /// generations.
@@ -247,6 +353,14 @@ pub struct Mission {
     pub checkpoints: Vec<String>,
     /// The bounded durable transition history.
     pub history: Vec<MissionEvent>,
+    /// Stable event identities retained beyond the visible history window so
+    /// delayed replays cannot reapply an old transition.
+    #[serde(default)]
+    pub event_index: Vec<String>,
+    /// Same-generation session replacement state.  It is additive to schema
+    /// version 1 and old records deserialize with `Idle`.
+    #[serde(default)]
+    pub rollover: MissionRolloverState,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -256,6 +370,7 @@ impl Default for Mission {
         Self {
             schema_version: MISSION_SCHEMA_VERSION,
             mission_id: String::new(),
+            revision: 1,
             generation: 1,
             task: None,
             goal: None,
@@ -279,6 +394,8 @@ impl Default for Mission {
             last_diff_context: String::new(),
             checkpoints: Vec::new(),
             history: Vec::new(),
+            event_index: Vec::new(),
+            rollover: MissionRolloverState::default(),
             created_at: 0,
             updated_at: 0,
         }
@@ -315,6 +432,51 @@ impl Mission {
     /// Whether the Mission reached a durable terminal state.
     pub fn is_terminal(&self) -> bool {
         self.status.is_terminal()
+    }
+
+    /// Supersede a recoverable rollover when a new explicit user session
+    /// admission replaces an interrupted execution session. The old artifact
+    /// remains on disk as a conflict record; the same Mission generation and
+    /// progress continue under the new owner.
+    pub fn supersede_rollover_for_rebind(&mut self, session_key: &str, now: i64) -> Result<bool> {
+        self.ensure_rollover_mutable()?;
+        if self.rollover.status == MissionRolloverStatus::Conflict {
+            return Err(GearError::config(
+                "Mission rollover is conflicted; explicit operator recovery is required before rebinding",
+            ));
+        }
+        if self.rollover.status == MissionRolloverStatus::Idle
+            || self.rollover.status == MissionRolloverStatus::Applied
+        {
+            return Ok(false);
+        }
+        let old_artifact = self.rollover.artifact_id.clone();
+        self.rollover = MissionRolloverState::default();
+        if let Some(artifact_id) = old_artifact {
+            let event = self.event(
+                MissionEventKind::RolloverConflict,
+                &artifact_id,
+                None,
+                Some(session_key.to_string()),
+                Some(redact_reason(
+                    "explicit session admission superseded an interrupted rollover",
+                )),
+                now,
+            );
+            self.record(event);
+        }
+        self.session_id = Some(session_key.to_string());
+        let event = self.event(
+            MissionEventKind::SessionBound,
+            session_key,
+            None,
+            Some(session_key.to_string()),
+            None,
+            now,
+        );
+        self.record(event);
+        self.updated_at = now;
+        Ok(true)
     }
 
     /// The exact recoverable next semantic action, from durable state alone.
@@ -370,10 +532,22 @@ impl Mission {
     /// whether the event was appended. This is the idempotent-replay
     /// mechanism: the same transition identity never applies twice.
     pub fn record(&mut self, event: MissionEvent) -> bool {
-        if self.history.iter().any(|existing| existing.id == event.id) {
+        if self.history.iter().any(|existing| existing.id == event.id)
+            || self
+                .event_index
+                .iter()
+                .any(|existing| existing == &event.id)
+        {
             return false;
         }
+        self.event_index.push(event.id.clone());
+        const EVENT_INDEX_LIMIT: usize = MAX_MISSION_HISTORY * 2;
+        if self.event_index.len() > EVENT_INDEX_LIMIT {
+            let excess = self.event_index.len() - EVENT_INDEX_LIMIT;
+            self.event_index.drain(0..excess);
+        }
         self.history.push(event);
+        self.revision = self.revision.saturating_add(1);
         if self.history.len() > MAX_MISSION_HISTORY {
             let excess = self.history.len() - MAX_MISSION_HISTORY;
             self.history.drain(0..excess);
@@ -384,6 +558,9 @@ impl Mission {
     /// Bind a session as the Mission's current execution state. A changed
     /// binding is recorded; rebinding the same session is a no-op.
     pub fn bind_session(&mut self, session_key: &str, now: i64) -> bool {
+        if self.is_terminal() {
+            return false;
+        }
         if self.session_id.as_deref() == Some(session_key) {
             return false;
         }
@@ -403,7 +580,7 @@ impl Mission {
 
     /// Release the current binding (the session moved to another Mission).
     pub fn release_session(&mut self, now: i64) -> bool {
-        if self.session_id.is_none() {
+        if self.is_terminal() || self.session_id.is_none() {
             return false;
         }
         self.session_id = None;
@@ -420,11 +597,395 @@ impl Mission {
         true
     }
 
+    /// Request a same-generation rollover from the current execution owner.
+    /// The request never changes `generation` and never changes `session_id`.
+    pub fn request_rollover(
+        &mut self,
+        source_session_id: &str,
+        artifact_id: &str,
+        reason: &str,
+        now: i64,
+    ) -> Result<bool> {
+        self.ensure_rollover_mutable()?;
+        if source_session_id.is_empty() || artifact_id.is_empty() {
+            return Err(GearError::config(
+                "rollover request requires a source session and artifact id",
+            ));
+        }
+        if self.session_id.as_deref() != Some(source_session_id) {
+            return Err(GearError::config(format!(
+                "rollover source session {source_session_id} is not the current Mission owner"
+            )));
+        }
+        if self.rollover.artifact_id.as_deref() == Some(artifact_id) {
+            return Ok(false);
+        }
+        if self.rollover.status == MissionRolloverStatus::Failed
+            && self
+                .rollover
+                .retry_after
+                .is_some_and(|retry_after| now < retry_after)
+        {
+            return Err(GearError::config(format!(
+                "Mission {} rollover retry is cooling down until {}",
+                self.mission_id,
+                self.rollover.retry_after.unwrap_or_default()
+            )));
+        }
+        if matches!(
+            self.rollover.status,
+            MissionRolloverStatus::Pending
+                | MissionRolloverStatus::Preparing
+                | MissionRolloverStatus::TargetReady
+                | MissionRolloverStatus::Active
+        ) {
+            return Err(GearError::config(format!(
+                "Mission {} already has an active rollover artifact {}",
+                self.mission_id,
+                self.rollover.artifact_id.as_deref().unwrap_or("unknown")
+            )));
+        }
+        if self.rollover.status == MissionRolloverStatus::Conflict {
+            return Err(GearError::config(format!(
+                "Mission {} rollover is conflicted and requires operator review",
+                self.mission_id
+            )));
+        }
+        self.rollover = MissionRolloverState {
+            status: MissionRolloverStatus::Pending,
+            artifact_id: Some(artifact_id.to_string()),
+            source_session_id: Some(source_session_id.to_string()),
+            target_session_id: None,
+            generation: self.generation,
+            reason: Some(redact_reason(reason)),
+            requested_at: Some(now),
+            last_attempt_at: Some(now),
+            retry_after: None,
+            last_error: None,
+        };
+        let event = self.event(
+            MissionEventKind::RolloverRequested,
+            artifact_id,
+            None,
+            Some(source_session_id.to_string()),
+            Some(redact_reason(reason)),
+            now,
+        );
+        self.record(event);
+        self.updated_at = now;
+        Ok(true)
+    }
+
+    /// Mark a continuation artifact as durable while retaining the old owner.
+    pub fn mark_rollover_prepared(&mut self, artifact_id: &str, now: i64) -> Result<bool> {
+        self.ensure_rollover_mutable()?;
+        if self.rollover.artifact_id.as_deref() != Some(artifact_id) {
+            return Err(GearError::config(
+                "rollover artifact does not match the Mission request",
+            ));
+        }
+        if self.rollover.status == MissionRolloverStatus::Applied
+            || self.rollover.status == MissionRolloverStatus::Conflict
+        {
+            return Ok(false);
+        }
+        if !matches!(
+            self.rollover.status,
+            MissionRolloverStatus::Pending | MissionRolloverStatus::Failed
+        ) {
+            return Ok(false);
+        }
+        self.rollover.status = MissionRolloverStatus::Preparing;
+        self.rollover.last_attempt_at = Some(now);
+        self.rollover.last_error = None;
+        let event = self.event(
+            MissionEventKind::RolloverPrepared,
+            artifact_id,
+            None,
+            self.rollover.source_session_id.clone(),
+            None,
+            now,
+        );
+        let changed = self.record(event);
+        self.updated_at = now;
+        Ok(changed)
+    }
+
+    /// Record a verified target without changing Mission ownership.
+    pub fn mark_rollover_target_ready(
+        &mut self,
+        artifact_id: &str,
+        target_session_id: &str,
+        now: i64,
+    ) -> Result<bool> {
+        self.ensure_rollover_mutable()?;
+        if self.rollover.artifact_id.as_deref() != Some(artifact_id)
+            || target_session_id.is_empty()
+            || self.rollover.source_session_id.as_deref() == Some(target_session_id)
+        {
+            return Err(GearError::config(
+                "rollover target is invalid or does not match the Mission request",
+            ));
+        }
+        if !matches!(
+            self.rollover.status,
+            MissionRolloverStatus::Preparing | MissionRolloverStatus::Failed
+        ) {
+            return Err(GearError::config(format!(
+                "Mission {} rollover is {}; a target cannot be accepted",
+                self.mission_id,
+                self.rollover.status.as_str()
+            )));
+        }
+        if self.rollover.target_session_id.as_deref() == Some(target_session_id) {
+            return Ok(false);
+        }
+        self.rollover.status = MissionRolloverStatus::TargetReady;
+        self.rollover.target_session_id = Some(target_session_id.to_string());
+        self.rollover.last_attempt_at = Some(now);
+        self.rollover.last_error = None;
+        let event = self.event(
+            MissionEventKind::RolloverTargetReady,
+            artifact_id,
+            None,
+            Some(target_session_id.to_string()),
+            None,
+            now,
+        );
+        let changed = self.record(event);
+        self.updated_at = now;
+        Ok(changed)
+    }
+
+    /// Atomically switch the Mission execution binding to a verified target,
+    /// preserving identity, generation, progress and terminal semantics.
+    pub fn bind_rollover_session(
+        &mut self,
+        artifact_id: &str,
+        source_session_id: &str,
+        target_session_id: &str,
+        now: i64,
+    ) -> Result<bool> {
+        self.ensure_rollover_mutable()?;
+        let source_matches = self.rollover.source_session_id.as_deref() == Some(source_session_id)
+            || (self.session_id.as_deref() == Some(target_session_id)
+                && source_session_id == target_session_id);
+        if self.rollover.artifact_id.as_deref() != Some(artifact_id)
+            || !source_matches
+            || self.rollover.target_session_id.as_deref() != Some(target_session_id)
+        {
+            return Err(GearError::config(
+                "rollover cutover does not match the prepared Mission intent",
+            ));
+        }
+        if self.rollover.status != MissionRolloverStatus::TargetReady
+            && self.rollover.status != MissionRolloverStatus::Active
+        {
+            return Err(GearError::config(format!(
+                "Mission {} rollover is {}; target cutover is not ready",
+                self.mission_id,
+                self.rollover.status.as_str()
+            )));
+        }
+        if self.session_id.as_deref() == Some(target_session_id) {
+            // Recovery may replay the cutover after the Mission was already
+            // switched but before continuation acknowledgement was recorded.
+            // Treat that as the same transition; never emit a second owner or
+            // reset generation/terminal state.
+            if self.rollover.status == MissionRolloverStatus::TargetReady {
+                self.rollover.status = MissionRolloverStatus::Active;
+                self.rollover.last_error = None;
+                let event = self.event(
+                    MissionEventKind::RolloverBound,
+                    artifact_id,
+                    None,
+                    Some(target_session_id.to_string()),
+                    Some(redact_reason("same-generation rollover recovery")),
+                    now,
+                );
+                let _ = self.record(event);
+                self.updated_at = now;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        if self.session_id.as_deref() != Some(source_session_id) {
+            return Err(GearError::config(format!(
+                "Mission {} owner changed before rollover cutover; refusing to overwrite",
+                self.mission_id
+            )));
+        }
+        self.session_id = Some(target_session_id.to_string());
+        self.rollover.status = MissionRolloverStatus::Active;
+        self.rollover.last_error = None;
+        let event = self.event(
+            MissionEventKind::RolloverBound,
+            artifact_id,
+            None,
+            Some(target_session_id.to_string()),
+            Some(redact_reason("same-generation rollover")),
+            now,
+        );
+        let changed = self.record(event);
+        self.updated_at = now;
+        Ok(changed)
+    }
+
+    /// Mark continuation acknowledgement for the current target.
+    pub fn mark_rollover_applied(
+        &mut self,
+        artifact_id: &str,
+        target_session_id: &str,
+        now: i64,
+    ) -> Result<bool> {
+        self.ensure_rollover_mutable()?;
+        if self.rollover.artifact_id.as_deref() != Some(artifact_id)
+            || self.rollover.target_session_id.as_deref() != Some(target_session_id)
+            || self.session_id.as_deref() != Some(target_session_id)
+        {
+            return Err(GearError::config(
+                "rollover acknowledgement does not match the active target",
+            ));
+        }
+        if self.rollover.status == MissionRolloverStatus::Applied {
+            return Ok(false);
+        }
+        if self.rollover.status != MissionRolloverStatus::Active {
+            return Err(GearError::config(format!(
+                "Mission {} rollover is {}; continuation is not active",
+                self.mission_id,
+                self.rollover.status.as_str()
+            )));
+        }
+        self.rollover.status = MissionRolloverStatus::Applied;
+        self.rollover.retry_after = None;
+        self.rollover.last_error = None;
+        let event = self.event(
+            MissionEventKind::RolloverApplied,
+            artifact_id,
+            None,
+            Some(target_session_id.to_string()),
+            None,
+            now,
+        );
+        let changed = self.record(event);
+        self.updated_at = now;
+        Ok(changed)
+    }
+
+    /// Record a retryable failure without changing the old execution owner.
+    pub fn mark_rollover_failed(
+        &mut self,
+        artifact_id: &str,
+        error: &str,
+        now: i64,
+        retry_after: Option<i64>,
+    ) -> Result<bool> {
+        if self.is_terminal() {
+            return Ok(false);
+        }
+        if self.rollover.artifact_id.as_deref() != Some(artifact_id) {
+            return Err(GearError::config(
+                "rollover failure does not match the Mission request",
+            ));
+        }
+        if self.rollover.status == MissionRolloverStatus::Conflict
+            || self.rollover.status == MissionRolloverStatus::Applied
+        {
+            return Ok(false);
+        }
+        let old_status = self.rollover.status;
+        self.rollover.status = MissionRolloverStatus::Failed;
+        self.rollover.last_attempt_at = Some(now);
+        self.rollover.retry_after = retry_after;
+        self.rollover.last_error = Some(redact_reason(error));
+        if old_status == MissionRolloverStatus::Active {
+            // An acknowledgement failure after cutover is still a failure of the
+            // continuation, but the binding remains target-authoritative.  A
+            // later idempotent acknowledgement can recover it.
+            self.rollover.status = MissionRolloverStatus::Active;
+        }
+        let event = self.event(
+            MissionEventKind::RolloverFailed,
+            artifact_id,
+            None,
+            self.session_id.clone(),
+            Some(redact_reason(error)),
+            now,
+        );
+        let changed = self.record(event);
+        self.updated_at = now;
+        Ok(changed)
+    }
+
+    /// Freeze automatic rollover when its ownership witness is stale.
+    pub fn mark_rollover_conflict(
+        &mut self,
+        artifact_id: &str,
+        reason: &str,
+        now: i64,
+    ) -> Result<bool> {
+        if self.is_terminal() {
+            return Ok(false);
+        }
+        if self.rollover.artifact_id.as_deref() != Some(artifact_id) {
+            return Err(GearError::config(
+                "rollover conflict does not match the Mission request",
+            ));
+        }
+        if self.rollover.status == MissionRolloverStatus::Conflict {
+            return Ok(false);
+        }
+        self.rollover.status = MissionRolloverStatus::Conflict;
+        self.rollover.last_error = Some(redact_reason(reason));
+        let event = self.event(
+            MissionEventKind::RolloverConflict,
+            artifact_id,
+            None,
+            self.session_id.clone(),
+            Some(redact_reason(reason)),
+            now,
+        );
+        let changed = self.record(event);
+        self.updated_at = now;
+        Ok(changed)
+    }
+
+    /// Whether a failed request is outside its retry cooldown.
+    pub fn rollover_retry_allowed(&self, now: i64) -> bool {
+        match self.rollover.status {
+            MissionRolloverStatus::Failed => self
+                .rollover
+                .retry_after
+                .map(|at| now >= at)
+                .unwrap_or(true),
+            MissionRolloverStatus::Active => self.rollover.retry_after.is_some_and(|at| now >= at),
+            _ => false,
+        }
+    }
+
+    fn ensure_rollover_mutable(&self) -> Result<()> {
+        if self.is_terminal() {
+            return Err(GearError::config(format!(
+                "Mission {} is terminal; rollover cannot change its generation or owner",
+                self.mission_id
+            )));
+        }
+        if self.rollover.generation != 0 && self.rollover.generation != self.generation {
+            return Err(GearError::config(
+                "rollover state belongs to a different Mission generation",
+            ));
+        }
+        Ok(())
+    }
+
     /// Start the next generation after a terminal state: progress resets,
     /// history is retained, identity is unchanged.
     pub fn begin_new_generation(&mut self, now: i64) {
-        debug_assert!(self.is_terminal());
-        self.generation += 1;
+        if !self.is_terminal() {
+            return;
+        }
+        self.generation = self.generation.saturating_add(1);
         self.status = MissionStatus::Active;
         self.phase = OrchestrationPhase::Idle;
         self.source = Role::Lead;
@@ -444,6 +1005,7 @@ impl Mission {
         self.last_rich_bytes = 0;
         self.last_diff_context = String::new();
         self.checkpoints.clear();
+        self.rollover = MissionRolloverState::default();
         let event = self.event(
             MissionEventKind::Admitted,
             "",
@@ -518,6 +1080,7 @@ impl Mission {
         if self.is_terminal() {
             return;
         }
+        let previous = self.clone();
         self.task = session.task.clone();
         self.goal = session.goal.clone();
         self.constraints = session.constraints.clone();
@@ -537,7 +1100,29 @@ impl Mission {
         self.last_rich_bytes = session.last_rich_bytes;
         self.last_diff_context = session.last_diff_context.clone();
         self.checkpoints = session.checkpoints.clone();
-        self.updated_at = session.updated_at;
+        let changed = previous.task != self.task
+            || previous.goal != self.goal
+            || previous.constraints != self.constraints
+            || previous.phase != self.phase
+            || previous.source != self.source
+            || previous.destination != self.destination
+            || previous.last_transition != self.last_transition
+            || previous.attempts != self.attempts
+            || previous.findings != self.findings
+            || previous.files != self.files
+            || previous.symbols != self.symbols
+            || previous.failures != self.failures
+            || previous.evidence != self.evidence
+            || previous.debug_reason != self.debug_reason
+            || previous.last_verification != self.last_verification
+            || previous.last_report != self.last_report
+            || previous.last_rich_bytes != self.last_rich_bytes
+            || previous.last_diff_context != self.last_diff_context
+            || previous.checkpoints != self.checkpoints;
+        if changed {
+            self.revision = self.revision.saturating_add(1);
+            self.updated_at = session.updated_at;
+        }
     }
 
     /// Seed a fresh session's live view from this Mission. The repository
@@ -566,6 +1151,10 @@ impl Mission {
         session.checkpoints = self.checkpoints.clone();
         session
     }
+}
+
+fn redact_reason(reason: &str) -> String {
+    crate::telemetry::task::redact(reason)
 }
 
 /// A deterministic, safe event identity. Replays of the same logical
@@ -598,6 +1187,32 @@ pub fn mission_path(root: &Path, mission_id: &str) -> Result<PathBuf> {
     Ok(missions_dir(root).join(format!("{mission_id}.json")))
 }
 
+fn validate_mission(mission: &Mission) -> Result<()> {
+    if mission.schema_version != MISSION_SCHEMA_VERSION {
+        return Err(GearError::config(format!(
+            "mission {} has unsupported schema_version {}",
+            mission.mission_id, mission.schema_version
+        )));
+    }
+    if !crate::orchestration::checkpoint::is_safe_id(&mission.mission_id) {
+        return Err(GearError::config(format!(
+            "unsafe mission id '{}'",
+            mission.mission_id
+        )));
+    }
+    if mission.generation == 0 || mission.revision == 0 {
+        return Err(GearError::config(
+            "mission generation and revision must be positive",
+        ));
+    }
+    if mission.rollover.generation != 0 && mission.rollover.generation != mission.generation {
+        return Err(GearError::config(
+            "mission rollover state belongs to a different generation",
+        ));
+    }
+    Ok(())
+}
+
 /// Load one Mission by id.
 ///
 /// - `Ok(None)`: no Mission record exists (that is not corruption).
@@ -612,7 +1227,23 @@ pub fn load(root: &Path, mission_id: &str) -> Result<Option<Mission>> {
     }
     let text = fs::read_to_string(&path).map_err(|error| GearError::read(&path, error))?;
     match serde_json::from_str::<Mission>(&text) {
-        Ok(mission) if mission.schema_version == MISSION_SCHEMA_VERSION => Ok(Some(mission)),
+        Ok(mission)
+            if mission.schema_version == MISSION_SCHEMA_VERSION
+                && mission.mission_id == mission_id =>
+        {
+            match validate_mission(&mission) {
+                Ok(()) => Ok(Some(mission)),
+                Err(error) => Err(quarantine(&path, mission_id, &error.to_string())),
+            }
+        }
+        Ok(mission) if mission.mission_id != mission_id => Err(quarantine(
+            &path,
+            mission_id,
+            &format!(
+                "record identity {} does not match requested {mission_id}",
+                mission.mission_id
+            ),
+        )),
         Ok(mission) => Err(quarantine(
             &path,
             mission_id,
@@ -630,7 +1261,45 @@ pub fn load(root: &Path, mission_id: &str) -> Result<Option<Mission>> {
 }
 
 /// Persist a Mission atomically. Ensures the state tree stays git-ignored.
+///
+/// Mission writes use a small sibling lock so independent bridge processes do
+/// not interleave a read/rename sequence. The lock is an advisory local-write
+/// boundary, not a distributed consensus mechanism; the revision/CAS helper
+/// below is the final protection against overwriting newer progress.
 pub fn save(root: &Path, mission: &Mission) -> Result<PathBuf> {
+    validate_mission(mission)?;
+    let _lock = MissionLock::acquire(root, &mission.mission_id)?;
+    write_mission_unchecked(root, mission)
+}
+
+/// Compare-and-swap a Mission mutation at the durable boundary.
+///
+/// `expected_owner` may be supplied for a binding cutover. The current record
+/// is read while the sibling lock is held; a missing, changed, or stale record
+/// returns `Ok(false)` and never overwrites it. This is deliberately a local
+/// Mission CAS, not a distributed lock or a general exactly-once facility.
+pub fn save_if_revision(
+    root: &Path,
+    mission: &Mission,
+    expected_revision: u64,
+    expected_owner: Option<&str>,
+) -> Result<bool> {
+    validate_mission(mission)?;
+    let _lock = MissionLock::acquire(root, &mission.mission_id)?;
+    let Some(current) = load(root, &mission.mission_id)? else {
+        return Ok(false);
+    };
+    if current.revision != expected_revision
+        || current.generation != mission.generation
+        || expected_owner.is_some_and(|owner| current.session_id.as_deref() != Some(owner))
+    {
+        return Ok(false);
+    }
+    write_mission_unchecked(root, mission)?;
+    Ok(true)
+}
+
+fn write_mission_unchecked(root: &Path, mission: &Mission) -> Result<PathBuf> {
     crate::runtime::install::ensure_gitignore(root)?;
     let path = mission_path(root, &mission.mission_id)?;
     let value = serde_json::to_value(mission).map_err(|error| {
@@ -641,6 +1310,97 @@ pub fn save(root: &Path, mission: &Mission) -> Result<PathBuf> {
     })?;
     crate::runtime::install::write_json_atomic(&path, &value)?;
     Ok(path)
+}
+
+struct MissionLock {
+    path: PathBuf,
+}
+
+impl MissionLock {
+    fn acquire(root: &Path, mission_id: &str) -> Result<Self> {
+        let path = mission_path(root, mission_id)?.with_extension("lock");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                GearError::io(
+                    format!("cannot create Mission lock directory {}", parent.display()),
+                    error,
+                )
+            })?;
+        }
+        for attempt in 0..200u32 {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    let _ = writeln!(file, "{}", std::process::id());
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // A crashed writer must not make a Mission permanently
+                    // unrecoverable. Only remove a clearly stale lock; a live
+                    // short-lived write is retried instead.
+                    let stale = fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > Duration::from_secs(30));
+                    if stale {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    if attempt < 199 {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                Err(error) => {
+                    return Err(GearError::io(
+                        format!("cannot acquire Mission lock {}", path.display()),
+                        error,
+                    ))
+                }
+            }
+        }
+        Err(GearError::config(format!(
+            "Mission {} is busy; retry the durable write",
+            mission_id
+        )))
+    }
+}
+
+impl Drop for MissionLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Find the durable Mission currently bound to `session_id` without relying on
+/// the disposable session state file. This is the recovery seam after a state
+/// file loss or a UI/client restart.
+pub fn find_by_session(root: &Path, session_id: &str) -> Result<Option<Mission>> {
+    if session_id.is_empty() {
+        return Ok(None);
+    }
+    let dir = missions_dir(root);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(None);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if name.ends_with(".corrupt") {
+            continue;
+        }
+        let Some(mission) = load(root, name)? else {
+            continue;
+        };
+        if mission.session_id.as_deref() == Some(session_id) {
+            return Ok(Some(mission));
+        }
+    }
+    Ok(None)
 }
 
 /// A short summary used by `ocg doctor` and tests.
@@ -686,7 +1446,11 @@ pub fn list(root: &Path) -> (Vec<MissionSummary>, usize) {
             continue;
         };
         match serde_json::from_str::<Mission>(&text) {
-            Ok(mission) if mission.schema_version == MISSION_SCHEMA_VERSION => {
+            Ok(mission)
+                if mission.schema_version == MISSION_SCHEMA_VERSION
+                    && mission.mission_id == name.strip_suffix(".json").unwrap_or_default()
+                    && validate_mission(&mission).is_ok() =>
+            {
                 summaries.push(MissionSummary {
                     mission_id: mission.mission_id,
                     status: mission.status,

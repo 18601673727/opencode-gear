@@ -25,6 +25,7 @@
 //! state and makes no context decision.
 
 use crate::error::{GearError, Result};
+use crate::orchestration::context_governor::ContextGovernorConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -64,6 +65,11 @@ pub struct OrchestrationConfig {
     pub max_handoff_bytes: usize,
     /// Hand-off cap as a percentage of the rich source context.
     pub max_handoff_ratio_percent: usize,
+    /// Conversation/context rollover policy.  It is intentionally separate
+    /// from hand-off projection caps: projection bytes are not conversation
+    /// token usage.
+    #[serde(default)]
+    pub context_governor: ContextGovernorConfig,
 }
 
 impl Default for OrchestrationConfig {
@@ -74,6 +80,7 @@ impl Default for OrchestrationConfig {
             max_debug_retries: DEFAULT_MAX_DEBUG_RETRIES,
             max_handoff_bytes: DEFAULT_MAX_HANDOFF_BYTES,
             max_handoff_ratio_percent: DEFAULT_MAX_HANDOFF_RATIO_PERCENT,
+            context_governor: ContextGovernorConfig::default(),
         }
     }
 }
@@ -124,6 +131,14 @@ impl OrchestrationConfig {
                 })? as usize;
             }
         }
+        if let Some(value) = object
+            .get("contextGovernor")
+            .or_else(|| object.get("context_governor"))
+            .or_else(|| object.get("contextGovernance"))
+            .or_else(|| object.get("context_governance"))
+        {
+            config.context_governor = ContextGovernorConfig::from_value(value)?;
+        }
         config.validate_values()?;
         Ok(config)
     }
@@ -159,6 +174,7 @@ impl OrchestrationConfig {
                 "orchestration.maxHandoffRatioPercent must be between 1 and 100",
             ));
         }
+        self.context_governor.validate_values()?;
         Ok(())
     }
 
@@ -256,6 +272,36 @@ mod tests {
                 "expected rejection for {bad}"
             );
             assert!(!OrchestrationConfig::validate(&bad).is_empty());
+        }
+    }
+
+    #[test]
+    fn context_governor_is_small_backward_compatible_and_validated() {
+        let config = OrchestrationConfig::from_config(&json!({
+            "orchestration": {
+                "contextGovernor": {
+                    "approachingPercent": 60,
+                    "rolloverPercent": 75,
+                    "unknown": "continue",
+                    "retryCooldownSeconds": 0
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(config.context_governor.approaching_percent, 60);
+        assert_eq!(config.context_governor.rollover_percent, 75);
+        assert_eq!(
+            config.context_governor.unknown,
+            crate::orchestration::context_governor::GovernorAction::Continue
+        );
+        assert_eq!(config.max_build_retries, 2);
+
+        for bad in [
+            json!({"orchestration": {"contextGovernor": {"approachingPercent": 80, "rolloverPercent": 70}}}),
+            json!({"orchestration": {"contextGovernor": {"unknown": "rollover"}}}),
+            json!({"orchestration": {"contextGovernor": {"maxContinuationBytes": 0}}}),
+        ] {
+            assert!(OrchestrationConfig::from_config(&bad).is_err(), "{bad}");
         }
     }
 

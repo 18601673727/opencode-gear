@@ -12,12 +12,17 @@
 //! It is safe for tests to drive with fake payloads and a fake capture runner;
 //! no model or network is involved.
 
-use crate::orchestration::controller::{BuildDecision, Controller, HandoffOutcome};
+use crate::orchestration::context_governor::{ContextObservation, GovernorState};
+use crate::orchestration::controller::{
+    BuildDecision, ContextGovernanceResult, Controller, HandoffOutcome,
+};
 use crate::orchestration::handoff::Role;
 use crate::process::CaptureRunner;
 use crate::reports::ReportsConfig;
+use crate::runtime::compat::{LeadSelection, RolloverRuntime};
 use crate::telemetry::{self, Event, OrchestrationMetrics, Outcome, TelemetryConfig};
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::time::Instant;
 
 /// One bridge request's result plus its telemetry accounting.
@@ -37,6 +42,10 @@ pub struct BridgeContext<'a> {
     pub runner: &'a dyn CaptureRunner,
     pub telemetry: TelemetryConfig,
     pub reports: ReportsConfig,
+    /// Invocation-scoped runtime client. It is absent for ordinary bridge
+    /// calls and for tests that only exercise policy projection.
+    pub rollover_runtime: Option<RefCell<Box<dyn RolloverRuntime>>>,
+    pub rollover_lead: Option<LeadSelection>,
 }
 
 impl<'a> BridgeContext<'a> {
@@ -50,7 +59,23 @@ impl<'a> BridgeContext<'a> {
             runner,
             telemetry,
             reports: ReportsConfig::default(),
+            rollover_runtime: None,
+            rollover_lead: None,
         }
+    }
+
+    /// Attach the invocation-owned V2 client used only by `context.observe`.
+    /// The client is held inside this short-lived bridge value: a dropped
+    /// OpenCode/UI connection cannot turn into a Mission failure because the
+    /// Mission record is never stored in this object.
+    pub fn with_rollover_runtime<R: RolloverRuntime + 'static>(
+        mut self,
+        runtime: R,
+        lead: LeadSelection,
+    ) -> Self {
+        self.rollover_runtime = Some(RefCell::new(Box::new(runtime)));
+        self.rollover_lead = Some(lead);
+        self
     }
 
     /// Apply the report policy for this bridge.
@@ -73,6 +98,9 @@ impl<'a> BridgeContext<'a> {
             "chat.message" | "chat-message" => self.chat_message(payload),
             "session.prompt" => self.session_prompt(payload),
             "session.context" => self.session_context(payload),
+            "context.observe" | "session.context.observe" | "context-observation" => {
+                self.context_observe(payload)
+            }
             "tool.execute.before" | "tool.execute.before/task" | "task-before" => {
                 self.tool_before(payload)
             }
@@ -217,6 +245,304 @@ impl<'a> BridgeContext<'a> {
             },
             Err(error) => self.error_outcome(error.to_string(), Some(Role::Lead), Some(session_id)),
         }
+    }
+
+    fn context_observe(&self, payload: &Value) -> BridgeOutcome {
+        let session = session_id(payload);
+        if session.is_empty() {
+            return BridgeOutcome {
+                value: json!({"ok": false, "error": "context.observe requires session_id"}),
+                metrics: OrchestrationMetrics::default(),
+                outcome: Outcome::Unknown,
+                role: Some(Role::Lead.as_str().to_string()),
+                session_id: None,
+                task_type: "context".to_string(),
+            };
+        }
+        let Some(agent) = payload.get("agent").and_then(Value::as_str) else {
+            return BridgeOutcome {
+                value: json!({
+                    "ok": true,
+                    "event": "context.observe",
+                    "ignored": true,
+                    "reason": "context pressure is observed only for a root Lead session",
+                }),
+                metrics: OrchestrationMetrics::default(),
+                outcome: Outcome::Unknown,
+                role: Some(Role::Lead.as_str().to_string()),
+                session_id: Some(session),
+                task_type: "context".to_string(),
+            };
+        };
+        if !agent.starts_with("lead-") {
+            return BridgeOutcome {
+                value: json!({
+                    "ok": true,
+                    "event": "context.observe",
+                    "ignored": true,
+                    "reason": "context pressure is observed only for a root Lead session",
+                }),
+                metrics: OrchestrationMetrics::default(),
+                outcome: Outcome::Unknown,
+                role: Some(agent.to_string()),
+                session_id: Some(session),
+                task_type: "context".to_string(),
+            };
+        }
+        if !self.controller.config().context_governor.enabled {
+            let observation = ContextObservation {
+                session_id: session.clone(),
+                ..ContextObservation::default()
+            };
+            let decision = crate::orchestration::context_governor::GovernorDecision {
+                state: GovernorState::Disabled,
+                action: crate::orchestration::context_governor::GovernorAction::Continue,
+                utilization_percent: None,
+                rollover_allowed: false,
+                deferred_for_boundary: false,
+                reason: "context governor is disabled".to_string(),
+            };
+            return BridgeOutcome {
+                value: context_governance_value(&observation, &decision, None),
+                metrics: OrchestrationMetrics::default(),
+                outcome: Outcome::Success,
+                role: Some(Role::Lead.as_str().to_string()),
+                session_id: Some(session),
+                task_type: "context".to_string(),
+            };
+        }
+        let now = self.controller.now_unix();
+        let event_id = payload
+            .get("event_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                crate::orchestration::context_governor::event_identity(
+                    &session,
+                    payload.get("assistant_message_id").and_then(Value::as_str),
+                    payload.get("finish").and_then(Value::as_str),
+                    payload.get("observed_at").and_then(Value::as_i64),
+                )
+            });
+        let finish = payload
+            .get("finish")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let assistant_message_id = payload
+            .get("assistant_message_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        // A step is a rollover boundary only after the event adapter has
+        // durably handed its completed output to the bridge. A caller cannot
+        // simply set a boolean in an arbitrary payload and skip that ordering.
+        let safe_boundary = payload
+            .get("safe_boundary")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && payload
+                .get("output_persisted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            && finish.as_deref() == Some("stop");
+        let step_tokens = payload
+            .get("tokens")
+            .or_else(|| payload.get("data").and_then(|data| data.get("tokens")))
+            .cloned();
+
+        let (observation, decision, rollover) = if let Some(runtime_cell) =
+            self.rollover_runtime.as_ref()
+        {
+            let mut runtime_cell = runtime_cell.borrow_mut();
+            let runtime: &mut dyn RolloverRuntime = runtime_cell.as_mut();
+            match self.collect_v2_observation(
+                runtime,
+                &session,
+                &event_id,
+                now,
+                finish.clone(),
+                safe_boundary,
+                assistant_message_id.clone(),
+                step_tokens.as_ref(),
+                payload,
+            ) {
+                Ok(observation) => match self.controller.observe_context(
+                    &session,
+                    observation.clone(),
+                    runtime,
+                    self.rollover_lead
+                        .as_ref()
+                        .expect("runtime implies a Lead contract"),
+                ) {
+                    Ok(result) => {
+                        let decision = result.decision.clone();
+                        (observation, decision, Some(result))
+                    }
+                    Err(error) => {
+                        return self.error_outcome(
+                            safe_error(&error.to_string()),
+                            Some(Role::Lead),
+                            Some(session),
+                        )
+                    }
+                },
+                Err(reason) => {
+                    let observation =
+                        ContextObservation::unknown(&session, &event_id, now, safe_error(&reason));
+                    let decision = self
+                        .controller
+                        .evaluate_context(&session, observation.clone())
+                        .unwrap_or_else(|error| {
+                            crate::orchestration::context_governor::GovernorDecision {
+                                state: GovernorState::Unknown,
+                                action:
+                                    crate::orchestration::context_governor::GovernorAction::Warn,
+                                utilization_percent: None,
+                                rollover_allowed: false,
+                                deferred_for_boundary: false,
+                                reason: safe_error(&error.to_string()),
+                            }
+                        });
+                    (observation, decision, None)
+                }
+            }
+        } else {
+            let observation = ContextObservation::unknown(
+                &session,
+                &event_id,
+                now,
+                "no invocation-scoped OpenCode V2 client is available; context telemetry is unknown",
+            );
+            let decision = self
+                .controller
+                .evaluate_context(&session, observation.clone())
+                .unwrap_or_else(
+                    |error| crate::orchestration::context_governor::GovernorDecision {
+                        state: GovernorState::Unknown,
+                        action: crate::orchestration::context_governor::GovernorAction::Warn,
+                        utilization_percent: None,
+                        rollover_allowed: false,
+                        deferred_for_boundary: false,
+                        reason: safe_error(&error.to_string()),
+                    },
+                );
+            (observation, decision, None)
+        };
+
+        let value = context_governance_value(&observation, &decision, rollover.as_ref());
+        BridgeOutcome {
+            value,
+            metrics: OrchestrationMetrics::default(),
+            outcome: if decision.state == GovernorState::Unknown {
+                Outcome::Unknown
+            } else {
+                Outcome::Success
+            },
+            role: Some(Role::Lead.as_str().to_string()),
+            session_id: Some(session),
+            task_type: "context".to_string(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_v2_observation(
+        &self,
+        runtime: &dyn RolloverRuntime,
+        session: &str,
+        event_id: &str,
+        now: i64,
+        finish: Option<String>,
+        safe_boundary: bool,
+        assistant_message_id: Option<String>,
+        step_tokens: Option<&Value>,
+        payload: &Value,
+    ) -> Result<ContextObservation, String> {
+        let messages = runtime.context_messages(session).map_err(|error| {
+            format!(
+                "V2 context query unavailable: {}",
+                safe_error(&error.to_string())
+            )
+        })?;
+        let info = runtime.session_info(session).map_err(|error| {
+            format!(
+                "V2 session query unavailable: {}",
+                safe_error(&error.to_string())
+            )
+        })?;
+        if info.get("id").and_then(Value::as_str) != Some(session) {
+            return Err("V2 session query returned a different session identity".to_string());
+        }
+        let model = info.get("model").and_then(Value::as_object);
+        let provider_id = payload
+            .get("provider_id")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                model
+                    .and_then(|model| model.get("providerID"))
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_string);
+        let model_id = payload
+            .get("model_id")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                model
+                    .and_then(|model| model.get("id").or_else(|| model.get("modelID")))
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_string);
+        let mut metadata = if provider_id.is_some() || model_id.is_some() {
+            runtime
+                .model_metadata(provider_id.as_deref(), model_id.as_deref())
+                .map_err(|error| {
+                    format!(
+                        "V2 model metadata unavailable: {}",
+                        safe_error(&error.to_string())
+                    )
+                })?
+        } else {
+            crate::orchestration::context_governor::ModelMetadata::default()
+        };
+        // If the runtime reports a smaller effective budget on the session
+        // record, prefer it over the broader catalogue value. This is still a
+        // runtime observation, not a guessed provider limit.
+        let runtime_limit = info
+            .get("limit")
+            .and_then(|limit| limit.get("context").or_else(|| limit.get("contextLimit")))
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                model.and_then(|model| {
+                    model
+                        .get("limit")
+                        .and_then(|limit| {
+                            limit.get("context").or_else(|| limit.get("contextLimit"))
+                        })
+                        .and_then(Value::as_u64)
+                })
+            })
+            .or_else(|| info.get("contextLimit").and_then(Value::as_u64))
+            .or_else(|| model.and_then(|model| model.get("contextLimit").and_then(Value::as_u64)))
+            .filter(|limit| *limit > 0);
+        if let Some(runtime_limit) = runtime_limit {
+            metadata.effective_limit = Some(
+                metadata
+                    .effective_limit
+                    .map(|limit| limit.min(runtime_limit))
+                    .unwrap_or(runtime_limit),
+            );
+            metadata.source = Some("opencode-v2:/api/session+model".to_string());
+        }
+        Ok(ContextObservation::from_v2(
+            session,
+            event_id,
+            now,
+            finish,
+            safe_boundary,
+            assistant_message_id,
+            step_tokens,
+            &messages,
+            metadata,
+        ))
     }
 
     fn tool_before(&self, payload: &Value) -> BridgeOutcome {
@@ -455,6 +781,63 @@ impl<'a> BridgeContext<'a> {
     }
 }
 
+fn context_governance_value(
+    observation: &ContextObservation,
+    decision: &crate::orchestration::context_governor::GovernorDecision,
+    result: Option<&ContextGovernanceResult>,
+) -> Value {
+    let mut value = json!({
+        "ok": true,
+        "event": "context.observe",
+        "session_id": observation.session_id,
+        "event_id": observation.event_id,
+        "observation": observation,
+        "decision": decision,
+    });
+    if let Some(result) = result {
+        value["rollover_status"] = result
+            .rollover_status
+            .map(|status| json!(status.as_str()))
+            .unwrap_or(Value::Null);
+        value["artifact_status"] = result
+            .artifact_status
+            .map(|status| json!(status.as_str()))
+            .unwrap_or(Value::Null);
+        value["artifact_id"] = result
+            .artifact_id
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+        value["source_session_id"] = result
+            .source_session_id
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+        value["target_session_id"] = result
+            .target_session_id
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+        value["note"] = result
+            .note
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+    } else {
+        value["rollover_status"] = Value::Null;
+        value["artifact_status"] = Value::Null;
+        value["artifact_id"] = Value::Null;
+        value["source_session_id"] = json!(observation.session_id);
+        value["target_session_id"] = Value::Null;
+        value["note"] = if decision.state == GovernorState::Disabled {
+            json!("context governor is disabled; no telemetry or rollover was attempted")
+        } else {
+            json!("runtime context was unknown; no rollover was attempted")
+        };
+    }
+    value
+}
+
 fn handoff_value(event: &str, handoff: &HandoffOutcome) -> Value {
     json!({
         "ok": true,
@@ -682,6 +1065,37 @@ mod tests {
         reports: ReportsConfig,
     ) -> BridgeContext<'a> {
         BridgeContext::new(controller, runner, TelemetryConfig::disabled()).with_reports(reports)
+    }
+
+    #[test]
+    fn context_observation_without_a_runtime_is_unknown_and_fail_soft() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = FakeGitHost::new();
+        let clock = FixedClock::new(1);
+        let controller = controller(dir.path(), &git, &clock, VerificationConfig::default());
+        let runner = FakeCaptureRunner::new();
+        let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+        let admitted = bridge.dispatch(
+            "session.prompt",
+            &json!({"session_id": "ses_source", "text": "keep this Mission durable"}),
+        );
+        assert_eq!(admitted["ok"], json!(true));
+        let value = bridge.dispatch(
+            "context.observe",
+            &json!({
+                "session_id": "ses_source",
+                "event_id": "event-unknown",
+                "agent": "lead-high",
+                "finish": "stop",
+                "safe_boundary": true,
+                "output_persisted": true,
+                "tokens": {"input": 90, "cache": {"read": 0}},
+            }),
+        );
+        assert_eq!(value["ok"], json!(true));
+        assert_eq!(value["decision"]["state"], json!("unknown"));
+        assert_eq!(value["decision"]["rollover_allowed"], json!(false));
+        assert_eq!(value["artifact_id"], json!(null));
     }
 
     #[test]

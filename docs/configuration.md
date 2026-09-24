@@ -458,6 +458,18 @@ orchestration:
   maxDebugRetries: 1
   maxHandoffBytes: 16384
   maxHandoffRatioPercent: 60
+  contextGovernor:
+    enabled: true
+    approachingPercent: 70
+    rolloverPercent: 80
+    # Optional safety budget when a model limit is unavailable.
+    # absoluteCapTokens: 120000
+    normal: continue
+    approaching: warn
+    rolloverRequired: rollover
+    unknown: warn
+    maxContinuationBytes: 16384
+    retryCooldownSeconds: 60
 ```
 
 | Field | Default | Bounds | Meaning |
@@ -467,6 +479,16 @@ orchestration:
 | `maxDebugRetries` | `1` | `0`–`5` | Debug hand-offs before the controller reports escalation. |
 | `maxHandoffBytes` | `16384` | `512`–`65536` | Absolute cap on a projected hand-off capsule. |
 | `maxHandoffRatioPercent` | `60` | `1`–`100` | Hand-off cap as a percentage of the rich source context. |
+| `contextGovernor.enabled` | `true` | boolean | Enable bounded context telemetry and the same-Mission rollover coordinator. `false` is inert. |
+| `contextGovernor.approachingPercent` | `70` | `1`–`100` | Warning threshold; must be below `rolloverPercent`. |
+| `contextGovernor.rolloverPercent` | `80` | greater than approaching, at most `100` | Rollover-request threshold. It is only actionable at a verified safe boundary. |
+| `contextGovernor.absoluteCapTokens` | unset | positive integer | Optional internal cap used when the runtime has no trustworthy model limit; it is not a provider-limit claim. |
+| `contextGovernor.normal` | `continue` | `continue`, `warn`, `rollover` | Action in the normal band; an explicit `rollover` is honored conservatively at a safe boundary. |
+| `contextGovernor.approaching` | `warn` | `continue`, `warn`, `rollover` | Action in the approaching band; an explicit `rollover` is honored conservatively at a safe boundary. |
+| `contextGovernor.rolloverRequired` | `rollover` | `continue`, `warn`, `rollover` | Action after the rollover threshold. `rollover` requests replacement; it never fires on unknown telemetry. |
+| `contextGovernor.unknown` | `warn` | `continue`, `warn` | Diagnostic action when usage, model limits or the runtime query is unavailable. Rollover is rejected. |
+| `contextGovernor.maxContinuationBytes` | `16384` | `1`–`1048576` | Hard cap for a Mission-derived continuation packet. |
+| `contextGovernor.retryCooldownSeconds` | `60` | non-negative integer | Cooldown after a failed rollover attempt; the old owner remains authoritative. |
 
 `maxHandoffBytes` / `maxHandoffRatioPercent` are a **runtime size envelope**,
 not a correctness rule: required evidence (goal, hard constraints, critical
@@ -474,6 +496,20 @@ findings, changed files, failing locations) is never dropped to satisfy them,
 and an overage is recorded in the capsule's `omitted` notes. The deterministic
 release fixture configures a much tighter `4096` / `40%` gate explicitly to
 catch projection regressions; that gate is not the default.
+
+The context governor is intentionally conservative. V2 token telemetry is
+read from one completed message and projects `input + cache.read` for that
+message; it never sums a transcript, counts `cache.write` as active input, or
+invents a percentage when `/api/model` did not report a real limit. A failed
+context/session/model query is recorded as `unknown` and cannot request a
+rollover. An unsafe boundary records a pending request only. A safe rollover
+creates a fresh V2 session, verifies its Lead and session identity, stages a
+bounded Mission-derived continuation, and commits the replacement with a
+Mission revision/owner CAS. The old session is retained. Credentials, service
+URLs and provider data are invocation-scoped and never written to these
+artifacts. A disconnected TUI, bridge or OpenCode client is an execution-messenger
+failure, not a Mission failure: the durable Mission remains recoverable and
+can be resumed by a replacement session.
 
 `OPENCODE_GEAR_ORCHESTRATION=0` (legacy `OC_GEAR_ORCHESTRATION`) force-disables
 orchestration for one process. It is also the explicit no-hook path: no plugin
@@ -551,7 +587,16 @@ fallbacks.
 
 `OPENCODE_GEAR_OCG` and `OPENCODE_GEAR_PROJECT` are exported *to OpenCode* by
 `ocg` at launch so the generated adapter can find the bridge and the project;
-they are not read from the ambient environment.
+they are not read from the ambient environment. For an OpenCode 2 coding launch,
+`OPENCODE_GEAR_V2_SERVER_URL`, `OPENCODE_GEAR_V2_SERVER_PASSWORD`,
+`OPENCODE_GEAR_V2_TARGET_SESSION` and `OPENCODE_GEAR_V2_DIRECTORY` are also
+exported only to that invocation's child process. The bridge uses them to query
+the invocation-owned V2 API and verify the selected target; they are never
+configuration defaults, telemetry, logs or artifacts. The generated adapter
+also receives the resolved `OPENCODE_GEAR_CONTEXT_GOVERNOR_ENABLED` switch so a
+disabled governor remains inert even when output reporting is separately
+enabled. `OPENCODE_SERVER_PASSWORD` remains the runtime's own short-lived child
+credential.
 
 ## Proxy policy
 

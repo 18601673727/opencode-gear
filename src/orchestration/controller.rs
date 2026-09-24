@@ -33,13 +33,22 @@ use crate::context::gitdiff::{snapshot_fingerprint, GitSnapshot};
 use crate::error::{GearError, Result};
 use crate::orchestration::checkpoint::{self, Checkpoint, Phase};
 use crate::orchestration::config::OrchestrationConfig;
+use crate::orchestration::context_governor::{
+    self, ContextObservation, GovernorAction, GovernorDecision, GovernorState,
+};
 use crate::orchestration::handoff::{
     HandoffFinding, HandoffVerification, ModelHandoffCapsule, ProjectionInput, Role, Severity,
 };
-use crate::orchestration::mission::{self, Mission, MissionEventKind, MissionStatus};
+use crate::orchestration::mission::{
+    self, Mission, MissionEventKind, MissionRolloverStatus, MissionStatus,
+};
 use crate::orchestration::projection::{self, ProjectionLimits};
+use crate::orchestration::rollover::{
+    self, ContinuationPacket, LeadBinding, RolloverArtifact, RolloverStatus,
+};
 use crate::orchestration::state::{self, Attempts, OrchestrationPhase, SessionState};
 use crate::process::{CaptureRunner, GitHost};
+use crate::runtime::compat::{select_existing_session_lead, LeadSelection, RolloverRuntime};
 use crate::telemetry::OrchestrationMetrics;
 use crate::verification::config::VerificationConfig;
 use crate::verification::distill;
@@ -206,6 +215,24 @@ pub struct BuildOutcome {
     pub metrics: OrchestrationMetrics,
 }
 
+/// The result of one context-pressure observation and any same-Mission
+/// rollover that was durably attempted.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ContextGovernanceResult {
+    pub observation: ContextObservation,
+    pub decision: GovernorDecision,
+    /// The Mission-side lifecycle state, when a rollover artifact exists.
+    pub rollover_status: Option<MissionRolloverStatus>,
+    /// The artifact state, useful to diagnostics and recovery callers.
+    pub artifact_status: Option<RolloverStatus>,
+    pub artifact_id: Option<String>,
+    pub source_session_id: Option<String>,
+    pub target_session_id: Option<String>,
+    /// A bounded, non-sensitive explanation of a deferred/failed/conflict
+    /// outcome. It is never a provider transcript.
+    pub note: Option<String>,
+}
+
 /// The controller for one project root.
 pub struct Controller<'a> {
     root: PathBuf,
@@ -311,6 +338,21 @@ impl<'a> Controller<'a> {
             // genuine re-admission starts a new generation instead.
             mission.begin_new_generation(now);
         }
+        if mission.session_id.as_deref() != Some(session_key) {
+            let interrupted_artifact = mission.rollover.artifact_id.clone();
+            let superseded = mission.supersede_rollover_for_rebind(session_key, now)?;
+            if superseded {
+                if let Some(artifact_id) = interrupted_artifact {
+                    if let Some(mut artifact) = rollover::load(&self.root, &artifact_id)? {
+                        artifact.mark_conflict(
+                            "explicit session admission superseded the interrupted rollover",
+                            now,
+                        );
+                        rollover::save(&self.root, &artifact)?;
+                    }
+                }
+            }
+        }
         mission.bind_session(session_key, now);
         if mission.task.is_none() {
             mission.task = Some(Self::stored_task_text(message));
@@ -335,6 +377,1286 @@ impl<'a> Controller<'a> {
         loaded.state.upsert(session, now);
         let _ = state::save(&self.root, &loaded.state);
         Ok(())
+    }
+
+    /// Observe one root-Lead context boundary and, when policy and the runtime
+    /// contract agree, replace only the disposable execution session.
+    ///
+    /// The method deliberately owns the whole side-effect sequence. A caller
+    /// cannot mark a Mission as rolled over merely by observing a large number:
+    /// the continuation is staged, the target Lead is read back, the Mission
+    /// witness is checked again, and only then is ownership cut over. Failures
+    /// before cutover leave the old binding authoritative; a failure after
+    /// cutover is recorded as an active-but-unacknowledged rollover so recovery
+    /// can finish it without touching Mission identity or generation.
+    pub fn observe_context(
+        &self,
+        session_id: &str,
+        mut observation: ContextObservation,
+        runtime: &mut dyn RolloverRuntime,
+        lead: &LeadSelection,
+    ) -> Result<ContextGovernanceResult> {
+        let source_session_id = state::safe_id(session_id);
+        if source_session_id.is_empty() {
+            return Err(GearError::config(
+                "context observation requires a session id",
+            ));
+        }
+        if observation.session_id.is_empty() {
+            observation.session_id = source_session_id.clone();
+        } else if state::safe_id(&observation.session_id) != source_session_id {
+            return Err(GearError::config(
+                "context observation session does not match the runtime event session",
+            ));
+        }
+        if !self.config.context_governor.enabled {
+            if observation.event_id.is_empty() {
+                observation.event_id = context_governor::event_identity(
+                    &source_session_id,
+                    observation.assistant_message_id.as_deref(),
+                    observation.finish.as_deref(),
+                    Some(observation.observed_at),
+                );
+            }
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::Disabled,
+                    action: GovernorAction::Continue,
+                    utilization_percent: None,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason: "context governor is disabled".to_string(),
+                },
+                rollover_status: None,
+                artifact_status: None,
+                artifact_id: None,
+                source_session_id: Some(source_session_id),
+                target_session_id: None,
+                note: Some(
+                    "context governor is disabled; no telemetry or Mission mutation was performed"
+                        .to_string(),
+                ),
+            });
+        }
+        let now = self.now();
+        if observation.event_id.is_empty() {
+            observation.event_id = context_governor::event_identity(
+                &source_session_id,
+                observation.assistant_message_id.as_deref(),
+                observation.finish.as_deref(),
+                Some(observation.observed_at),
+            );
+        }
+        let decision = context_governor::decide(&self.config.context_governor, &observation);
+        // Telemetry is written before any runtime mutation. A crash after this
+        // point leaves an inspectable reason and cannot make the artifact the
+        // only source of truth.
+        context_governor::save_observation(&self.root, &observation)?;
+
+        let mut loaded = state::load(&self.root);
+        let session = if let Some(session) = loaded.state.session(&source_session_id).cloned() {
+            session
+        } else if let Some(mission) = mission::find_by_session(&self.root, &source_session_id)? {
+            // The disposable state file may be lost with a TUI/client. Rebuild
+            // only the session view from the authoritative Mission; no
+            // progress, generation or terminal state is inferred from chat.
+            let seeded = mission.seed_session(&source_session_id, now);
+            loaded.state.upsert(seeded.clone(), now);
+            let _ = state::save(&self.root, &loaded.state);
+            seeded
+        } else {
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::Unknown,
+                    action: self.config.context_governor.unknown,
+                    utilization_percent: None,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason: "no admitted Mission/session state is available for rollover"
+                        .to_string(),
+                },
+                rollover_status: None,
+                artifact_status: None,
+                artifact_id: None,
+                source_session_id: Some(source_session_id),
+                target_session_id: None,
+                note: Some(
+                    "context observation was recorded without an admitted session".to_string(),
+                ),
+            });
+        };
+        let Some(mut mission) = self.ensure_mission(&session, now)? else {
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::Unknown,
+                    action: self.config.context_governor.unknown,
+                    utilization_percent: None,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason: "the session has no admitted Mission".to_string(),
+                },
+                rollover_status: None,
+                artifact_status: None,
+                artifact_id: None,
+                source_session_id: Some(source_session_id),
+                target_session_id: None,
+                note: Some("context observation was recorded without a Mission".to_string()),
+            });
+        };
+        if mission.is_terminal() {
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::Unknown,
+                    action: GovernorAction::Continue,
+                    utilization_percent: None,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason: "terminal Missions are frozen against session rollover".to_string(),
+                },
+                rollover_status: Some(mission.rollover.status),
+                artifact_status: None,
+                artifact_id: mission.rollover.artifact_id.clone(),
+                source_session_id: Some(source_session_id),
+                target_session_id: mission.session_id.clone(),
+                note: Some("Mission is terminal; no generation or owner was changed".to_string()),
+            });
+        }
+        if mission.session_id.as_deref() != Some(source_session_id.as_str()) {
+            return Err(GearError::config(format!(
+                "Mission {} is owned by another session; refusing stale context rollover",
+                mission.mission_id
+            )));
+        }
+        // An acknowledgement failure after cutover is a durable recovery job,
+        // not a reason to wait for another high-pressure observation. Recover
+        // it at the next verified safe boundary even when the new observation
+        // itself is now Normal; an unsafe boundary still only defers.
+        if mission.rollover.status == MissionRolloverStatus::Active
+            && mission.rollover.target_session_id.as_deref() == Some(source_session_id.as_str())
+            && mission
+                .rollover
+                .retry_after
+                .is_some_and(|retry_after| now < retry_after)
+        {
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::RolloverRequired,
+                    action: decision.action,
+                    utilization_percent: decision.utilization_percent,
+                    rollover_allowed: false,
+                    deferred_for_boundary: true,
+                    reason: "rollover recovery is cooling down; the target owner is retained"
+                        .to_string(),
+                },
+                rollover_status: Some(mission.rollover.status),
+                artifact_status: None,
+                artifact_id: mission.rollover.artifact_id.clone(),
+                source_session_id: Some(source_session_id),
+                target_session_id: mission.session_id,
+                note: mission.rollover.last_error.clone(),
+            });
+        }
+        if mission.rollover.status == MissionRolloverStatus::Active
+            && mission.rollover.target_session_id.as_deref() == Some(source_session_id.as_str())
+        {
+            let pending = rollover::latest_for_mission(&self.root, &mission.mission_id)?;
+            if let Some(artifact) = pending.filter(|artifact| {
+                artifact.generation == mission.generation
+                    && artifact.target_session_id.as_deref() == Some(source_session_id.as_str())
+                    && matches!(
+                        artifact.status,
+                        RolloverStatus::Failed
+                            | RolloverStatus::CutoverIntent
+                            | RolloverStatus::Active
+                    )
+            }) {
+                if !observation.safe_boundary {
+                    return Ok(ContextGovernanceResult {
+                        observation,
+                        decision: GovernorDecision {
+                            state: GovernorState::RolloverRequired,
+                            action: GovernorAction::Continue,
+                            utilization_percent: decision.utilization_percent,
+                            rollover_allowed: false,
+                            deferred_for_boundary: true,
+                            reason:
+                                "active rollover recovery is waiting for a safe semantic boundary"
+                                    .to_string(),
+                        },
+                        rollover_status: Some(MissionRolloverStatus::Active),
+                        artifact_status: Some(artifact.status),
+                        artifact_id: Some(artifact.artifact_id),
+                        source_session_id: Some(source_session_id.clone()),
+                        target_session_id: Some(source_session_id),
+                        note: Some("continuation acknowledgement remains pending".to_string()),
+                    });
+                }
+                return self.recover_active_rollover(
+                    observation,
+                    decision,
+                    source_session_id,
+                    artifact,
+                    runtime,
+                    lead,
+                    now,
+                );
+            }
+        }
+        if !decision.rollover_allowed {
+            let expected_revision = mission.revision;
+            let expected_owner = mission.session_id.clone();
+            if mission::load(&self.root, &mission.mission_id)?.is_none() {
+                mission::save(&self.root, &mission)?;
+            } else {
+                let _ = mission::save_if_revision(
+                    &self.root,
+                    &mission,
+                    expected_revision,
+                    expected_owner.as_deref(),
+                )?;
+            }
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision,
+                rollover_status: Some(mission.rollover.status),
+                artifact_status: None,
+                artifact_id: mission.rollover.artifact_id.clone(),
+                source_session_id: Some(source_session_id),
+                target_session_id: mission.session_id,
+                note: None,
+            });
+        }
+        if matches!(
+            mission.rollover.status,
+            MissionRolloverStatus::Failed | MissionRolloverStatus::Active
+        ) && mission
+            .rollover
+            .retry_after
+            .is_some_and(|retry_after| now < retry_after)
+        {
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::RolloverRequired,
+                    action: decision.action,
+                    utilization_percent: decision.utilization_percent,
+                    rollover_allowed: false,
+                    deferred_for_boundary: true,
+                    reason: "rollover retry is cooling down; the Mission owner is unchanged"
+                        .to_string(),
+                },
+                rollover_status: Some(mission.rollover.status),
+                artifact_status: None,
+                artifact_id: mission.rollover.artifact_id.clone(),
+                source_session_id: Some(source_session_id),
+                target_session_id: mission.session_id,
+                note: mission.rollover.last_error.clone(),
+            });
+        }
+
+        if mission.rollover.status == MissionRolloverStatus::Conflict {
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::RolloverRequired,
+                    action: GovernorAction::Continue,
+                    utilization_percent: decision.utilization_percent,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason: "rollover is conflicted and requires operator review; the Mission owner is unchanged"
+                        .to_string(),
+                },
+                rollover_status: Some(mission.rollover.status),
+                artifact_status: Some(RolloverStatus::Conflict),
+                artifact_id: mission.rollover.artifact_id.clone(),
+                source_session_id: Some(source_session_id),
+                target_session_id: mission.session_id,
+                note: mission.rollover.last_error.clone(),
+            });
+        }
+
+        // Synchronize the current session view before freezing a continuation
+        // packet. This is the semantic boundary guarantee: the packet cannot
+        // describe an older Mission revision than the one being replaced.
+        let before_sync_revision = mission.revision;
+        let before_sync_owner = mission.session_id.clone();
+        mission.sync_from_session(&session);
+        if mission.revision != before_sync_revision
+            && !mission::save_if_revision(
+                &self.root,
+                &mission,
+                before_sync_revision,
+                before_sync_owner.as_deref(),
+            )?
+        {
+            return Err(GearError::config(
+                "Mission changed while synchronizing the safe rollover boundary; retry later",
+            ));
+        }
+        let existing = rollover::latest_for_mission(&self.root, &mission.mission_id)?;
+        if existing.as_ref().is_some_and(|artifact| {
+            artifact.generation == mission.generation && artifact.status == RolloverStatus::Conflict
+        }) {
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::RolloverRequired,
+                    action: GovernorAction::Continue,
+                    utilization_percent: decision.utilization_percent,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason: "the latest rollover artifact is conflicted; automatic replacement is frozen"
+                        .to_string(),
+                },
+                rollover_status: Some(MissionRolloverStatus::Conflict),
+                artifact_status: Some(RolloverStatus::Conflict),
+                artifact_id: existing.map(|artifact| artifact.artifact_id),
+                source_session_id: Some(source_session_id),
+                target_session_id: mission.session_id,
+                note: Some("operator review is required before another rollover".to_string()),
+            });
+        }
+        let can_reuse = existing.as_ref().is_some_and(|existing| {
+            let source_matches = existing.source_session_id == source_session_id
+                || (mission.rollover.status == MissionRolloverStatus::Active
+                    && mission.rollover.target_session_id.as_deref()
+                        == Some(source_session_id.as_str())
+                    && existing.target_session_id.as_deref() == Some(source_session_id.as_str()));
+            existing.generation == mission.generation
+                && source_matches
+                && !existing.status.is_terminal()
+                && existing.status != RolloverStatus::Conflict
+        });
+        let new_artifact = !can_reuse;
+        let mut artifact = if can_reuse {
+            existing.expect("can_reuse implies an existing artifact")
+        } else {
+            RolloverArtifact::prepare_with_debug_retries(
+                &mission,
+                &source_session_id,
+                observation.clone(),
+                decision.reason.clone(),
+                Some(LeadBinding::from_selection(lead)),
+                now,
+                &self.config.context_governor,
+                self.config.max_debug_retries,
+            )?
+        };
+        if artifact.artifact_id.is_empty() {
+            return Err(GearError::config("rollover artifact has an empty id"));
+        }
+        if artifact.continuation.mission_id != mission.mission_id
+            || artifact.continuation.generation != mission.generation
+        {
+            return Err(GearError::config(
+                "existing rollover continuation belongs to a different Mission generation",
+            ));
+        }
+        let orphan_prepared = !new_artifact
+            && mission.rollover.status == MissionRolloverStatus::Idle
+            && mission.rollover.artifact_id.is_none()
+            && matches!(
+                artifact.status,
+                RolloverStatus::Prepared
+                    | RolloverStatus::Failed
+                    | RolloverStatus::TargetReady
+                    | RolloverStatus::CutoverIntent
+            );
+        if new_artifact
+            || orphan_prepared
+            || matches!(
+                mission.rollover.status,
+                MissionRolloverStatus::Idle | MissionRolloverStatus::Applied
+            )
+        {
+            rollover::save(&self.root, &artifact)?;
+            let expected_revision = mission.revision;
+            let expected_owner = mission.session_id.clone();
+            mission.request_rollover(
+                &source_session_id,
+                &artifact.artifact_id,
+                &decision.reason,
+                now,
+            )?;
+            mission.mark_rollover_prepared(&artifact.artifact_id, now)?;
+            if !mission::save_if_revision(
+                &self.root,
+                &mission,
+                expected_revision,
+                expected_owner.as_deref(),
+            )? {
+                let conflict_reason = "Mission changed while recording rollover intent";
+                artifact.mark_conflict(conflict_reason, now);
+                rollover::save(&self.root, &artifact)?;
+                self.persist_rollover_conflict(
+                    &artifact.mission_id,
+                    &artifact.artifact_id,
+                    conflict_reason,
+                    now,
+                );
+                return Err(GearError::config(
+                    "Mission changed while recording rollover intent; the prior owner is unchanged",
+                ));
+            }
+        } else {
+            let source_is_owner = mission.rollover.source_session_id.as_deref()
+                == Some(source_session_id.as_str())
+                || (mission.rollover.status == MissionRolloverStatus::Active
+                    && mission.rollover.target_session_id.as_deref()
+                        == Some(source_session_id.as_str()));
+            if !source_is_owner || mission.rollover.generation != mission.generation {
+                return Err(GearError::config(
+                    "Mission rollover state does not match the current source session",
+                ));
+            }
+            if mission.rollover.status == MissionRolloverStatus::Failed {
+                // Re-open a retryable artifact explicitly. The event identity
+                // is stable, so a crash/replay does not manufacture another
+                // attempt.
+                if let Some(artifact_id) = mission.rollover.artifact_id.clone() {
+                    let expected_revision = mission.revision;
+                    let expected_owner = mission.session_id.clone();
+                    mission.mark_rollover_prepared(&artifact_id, now)?;
+                    if !mission::save_if_revision(
+                        &self.root,
+                        &mission,
+                        expected_revision,
+                        expected_owner.as_deref(),
+                    )? {
+                        let conflict_reason =
+                            "Mission changed while reopening a retryable rollover";
+                        artifact.mark_conflict(conflict_reason, now);
+                        rollover::save(&self.root, &artifact)?;
+                        self.persist_rollover_conflict(
+                            &artifact.mission_id,
+                            &artifact.artifact_id,
+                            conflict_reason,
+                            now,
+                        );
+                        return Err(GearError::config(
+                            "Mission changed while reopening rollover; retry later",
+                        ));
+                    }
+                }
+            }
+        }
+        // Refresh a not-yet-targeted packet after a later safe boundary. This
+        // keeps newly committed findings/checkpoints while retaining the same
+        // deterministic artifact identity.
+        if !matches!(
+            artifact.status,
+            RolloverStatus::TargetReady | RolloverStatus::CutoverIntent | RolloverStatus::Active
+        ) {
+            let continuation = ContinuationPacket::from_mission(
+                &mission,
+                self.config.max_debug_retries,
+                self.config.context_governor.max_continuation_bytes,
+            )?;
+            artifact.continuation_digest = continuation.digest.clone();
+            artifact.continuation_bytes = continuation.bytes;
+            artifact.continuation = continuation;
+            artifact.observation = observation.clone();
+            artifact.reason = crate::telemetry::task::redact(&decision.reason);
+            artifact.set_base_mission(&mission);
+            artifact.updated_at = now;
+            rollover::save(&self.root, &artifact)?;
+        }
+        if mission.rollover.status == MissionRolloverStatus::Active
+            && mission.session_id.as_deref() == Some(source_session_id.as_str())
+            && mission.rollover.target_session_id.as_deref() == Some(source_session_id.as_str())
+            && artifact.target_session_id.as_deref() == Some(source_session_id.as_str())
+            && matches!(
+                artifact.status,
+                RolloverStatus::Failed | RolloverStatus::CutoverIntent | RolloverStatus::Active
+            )
+        {
+            return self.recover_active_rollover(
+                observation,
+                decision,
+                source_session_id,
+                artifact,
+                runtime,
+                lead,
+                now,
+            );
+        }
+        if decision.deferred_for_boundary {
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision,
+                rollover_status: Some(mission.rollover.status),
+                artifact_status: Some(artifact.status),
+                artifact_id: Some(artifact.artifact_id),
+                source_session_id: Some(source_session_id),
+                target_session_id: artifact.target_session_id,
+                note: Some(
+                    "rollover request is durable and waiting for a safe semantic boundary"
+                        .to_string(),
+                ),
+            });
+        }
+
+        let target_session_id = if let Some(target) = artifact.target_session_id.clone() {
+            target
+        } else {
+            match runtime.create_fresh_session() {
+                Ok(target) => target,
+                Err(error) => {
+                    artifact.mark_failed(
+                        &error.to_string(),
+                        now,
+                        Some(
+                            now.saturating_add(self.config.context_governor.retry_cooldown_seconds),
+                        ),
+                    );
+                    rollover::save(&self.root, &artifact)?;
+                    self.persist_rollover_failure(
+                        &mut mission,
+                        &artifact.artifact_id,
+                        &error.to_string(),
+                        now,
+                        Some(
+                            now.saturating_add(self.config.context_governor.retry_cooldown_seconds),
+                        ),
+                    )?;
+                    return Ok(ContextGovernanceResult {
+                        observation,
+                        decision: GovernorDecision {
+                            state: GovernorState::RolloverRequired,
+                            action: GovernorAction::Rollover,
+                            utilization_percent: decision.utilization_percent,
+                            rollover_allowed: false,
+                            deferred_for_boundary: false,
+                            reason:
+                                "fresh target session creation failed; the old owner is unchanged"
+                                    .to_string(),
+                        },
+                        rollover_status: Some(mission.rollover.status),
+                        artifact_status: Some(artifact.status),
+                        artifact_id: Some(artifact.artifact_id),
+                        source_session_id: Some(source_session_id),
+                        target_session_id: None,
+                        note: Some(crate::telemetry::task::redact(&error.to_string())),
+                    });
+                }
+            }
+        };
+        let recovering_current_target = mission.rollover.status == MissionRolloverStatus::Active
+            && artifact.target_session_id.as_deref() == Some(target_session_id.as_str());
+        if target_session_id.is_empty()
+            || (target_session_id == source_session_id && !recovering_current_target)
+        {
+            let error = "rollover runtime returned an invalid target session";
+            artifact.mark_failed(
+                error,
+                now,
+                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
+            );
+            rollover::save(&self.root, &artifact)?;
+            self.persist_rollover_failure(
+                &mut mission,
+                &artifact.artifact_id,
+                error,
+                now,
+                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
+            )?;
+            return Err(GearError::config(error));
+        }
+
+        if let Err(error) = select_existing_session_lead(runtime, &target_session_id, lead) {
+            artifact.mark_failed(
+                &error.to_string(),
+                now,
+                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
+            );
+            rollover::save(&self.root, &artifact)?;
+            self.persist_rollover_failure(
+                &mut mission,
+                &artifact.artifact_id,
+                &error.to_string(),
+                now,
+                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
+            )?;
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::RolloverRequired,
+                    action: GovernorAction::Rollover,
+                    utilization_percent: decision.utilization_percent,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason: "target Lead verification failed; the old owner is unchanged"
+                        .to_string(),
+                },
+                rollover_status: Some(mission.rollover.status),
+                artifact_status: Some(artifact.status),
+                artifact_id: Some(artifact.artifact_id),
+                source_session_id: Some(source_session_id),
+                target_session_id: Some(target_session_id),
+                note: Some(crate::telemetry::task::redact(&error.to_string())),
+            });
+        }
+        // The target identity is a runtime fact, not merely a string returned
+        // by the create call. Session info is read back before staging.
+        if let Err(error) = verify_target_session(runtime, &target_session_id) {
+            artifact.mark_failed(
+                &error.to_string(),
+                now,
+                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
+            );
+            rollover::save(&self.root, &artifact)?;
+            self.persist_rollover_failure(
+                &mut mission,
+                &artifact.artifact_id,
+                &error.to_string(),
+                now,
+                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
+            )?;
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::RolloverRequired,
+                    action: GovernorAction::Rollover,
+                    utilization_percent: decision.utilization_percent,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason:
+                        "target session identity could not be verified; the old owner is unchanged"
+                            .to_string(),
+                },
+                rollover_status: Some(mission.rollover.status),
+                artifact_status: Some(artifact.status),
+                artifact_id: Some(artifact.artifact_id),
+                source_session_id: Some(source_session_id),
+                target_session_id: Some(target_session_id),
+                note: Some(crate::telemetry::task::redact(&error.to_string())),
+            });
+        }
+
+        let continuation_text = artifact.continuation.render();
+        let continuation_description = "OCG same-generation Mission continuation";
+        let continuation_metadata = rollover::continuation_metadata(&artifact.continuation);
+        if let Err(error) = runtime.stage_continuation(
+            &target_session_id,
+            &artifact.prompt_id(),
+            &continuation_text,
+            continuation_description,
+            &continuation_metadata,
+        ) {
+            artifact.mark_failed(
+                &error.to_string(),
+                now,
+                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
+            );
+            rollover::save(&self.root, &artifact)?;
+            self.persist_rollover_failure(
+                &mut mission,
+                &artifact.artifact_id,
+                &error.to_string(),
+                now,
+                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
+            )?;
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::RolloverRequired,
+                    action: GovernorAction::Rollover,
+                    utilization_percent: decision.utilization_percent,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason: "continuation staging failed; the old owner is unchanged".to_string(),
+                },
+                rollover_status: Some(mission.rollover.status),
+                artifact_status: Some(artifact.status),
+                artifact_id: Some(artifact.artifact_id),
+                source_session_id: Some(source_session_id),
+                target_session_id: Some(target_session_id),
+                note: Some(crate::telemetry::task::redact(&error.to_string())),
+            });
+        }
+        if artifact.status == RolloverStatus::Prepared || artifact.status == RolloverStatus::Failed
+        {
+            artifact.mark_target_ready(
+                &target_session_id,
+                LeadBinding::from_selection(lead),
+                now,
+            )?;
+            rollover::save(&self.root, &artifact)?;
+        }
+        if mission.rollover.target_session_id.is_none() {
+            let expected_revision = mission.revision;
+            let expected_owner = mission.session_id.clone();
+            mission.mark_rollover_target_ready(&artifact.artifact_id, &target_session_id, now)?;
+            if !mission::save_if_revision(
+                &self.root,
+                &mission,
+                expected_revision,
+                expected_owner.as_deref(),
+            )? {
+                let conflict_reason = "Mission changed while recording the verified target";
+                artifact.mark_conflict(conflict_reason, now);
+                rollover::save(&self.root, &artifact)?;
+                self.persist_rollover_conflict(
+                    &artifact.mission_id,
+                    &artifact.artifact_id,
+                    conflict_reason,
+                    now,
+                );
+                return Ok(ContextGovernanceResult {
+                    observation,
+                    decision: GovernorDecision {
+                        state: GovernorState::RolloverRequired,
+                        action: GovernorAction::Continue,
+                        utilization_percent: decision.utilization_percent,
+                        rollover_allowed: false,
+                        deferred_for_boundary: false,
+                        reason:
+                            "Mission changed while recording the target; the old owner is unchanged"
+                                .to_string(),
+                    },
+                    rollover_status: Some(MissionRolloverStatus::Conflict),
+                    artifact_status: Some(artifact.status),
+                    artifact_id: Some(artifact.artifact_id),
+                    source_session_id: Some(source_session_id),
+                    target_session_id: Some(target_session_id),
+                    note: Some(
+                        "target verification was not committed; operator review is required"
+                            .to_string(),
+                    ),
+                });
+            }
+        }
+        artifact.set_base_mission(&mission);
+        artifact.updated_at = now;
+        rollover::save(&self.root, &artifact)?;
+
+        // Re-read the durable Mission immediately before cutover. This is a
+        // fail-closed optimistic CAS: a concurrent progress update or a
+        // different owner makes the rollover a conflict, never an overwrite.
+        let mut current = mission::load(&self.root, &mission.mission_id)?
+            .ok_or_else(|| GearError::config("Mission disappeared during rollover cutover"))?;
+        let witness_ok = current.mission_id == artifact.mission_id
+            && current.generation == artifact.generation
+            && current.revision == artifact.base_mission_revision
+            && current.session_id.as_deref() == Some(source_session_id.as_str())
+            && current.rollover.artifact_id.as_deref() == Some(artifact.artifact_id.as_str())
+            && current.rollover.target_session_id.as_deref() == Some(target_session_id.as_str());
+        if !witness_ok {
+            let conflict_reason = "Mission ownership witness changed before cutover";
+            artifact.mark_conflict(conflict_reason, now);
+            rollover::save(&self.root, &artifact)?;
+            self.persist_rollover_conflict(
+                &artifact.mission_id,
+                &artifact.artifact_id,
+                conflict_reason,
+                now,
+            );
+            // Do not rewrite a Mission that another worker may have advanced;
+            // the conflict artifact is sufficient to freeze automatic retry.
+            let _ = current.mark_rollover_conflict(
+                &artifact.artifact_id,
+                "Mission ownership witness changed before cutover",
+                now,
+            );
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::RolloverRequired,
+                    action: GovernorAction::Rollover,
+                    utilization_percent: decision.utilization_percent,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason: "rollover conflict; the old owner remains authoritative".to_string(),
+                },
+                rollover_status: Some(MissionRolloverStatus::Conflict),
+                artifact_status: Some(artifact.status),
+                artifact_id: Some(artifact.artifact_id),
+                source_session_id: Some(source_session_id),
+                target_session_id: Some(target_session_id),
+                note: Some(
+                    "Mission changed after rollover preparation; operator review is required"
+                        .to_string(),
+                ),
+            });
+        }
+        artifact.mark_cutover_intent(now)?;
+        rollover::save(&self.root, &artifact)?;
+        let expected_revision = current.revision;
+        let expected_owner = current.session_id.clone();
+        current.bind_rollover_session(
+            &artifact.artifact_id,
+            &artifact.source_session_id,
+            &target_session_id,
+            now,
+        )?;
+        if !mission::save_if_revision(
+            &self.root,
+            &current,
+            expected_revision,
+            expected_owner.as_deref(),
+        )? {
+            let conflict_reason = "Mission changed during the final rollover cutover";
+            artifact.mark_conflict(conflict_reason, now);
+            rollover::save(&self.root, &artifact)?;
+            self.persist_rollover_conflict(
+                &artifact.mission_id,
+                &artifact.artifact_id,
+                conflict_reason,
+                now,
+            );
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::RolloverRequired,
+                    action: GovernorAction::Continue,
+                    utilization_percent: decision.utilization_percent,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason: "Mission changed during cutover; the prior owner was not overwritten"
+                        .to_string(),
+                },
+                rollover_status: Some(MissionRolloverStatus::Conflict),
+                artifact_status: Some(artifact.status),
+                artifact_id: Some(artifact.artifact_id),
+                source_session_id: Some(source_session_id),
+                target_session_id: Some(target_session_id),
+                note: Some("optimistic Mission CAS rejected the cutover".to_string()),
+            });
+        }
+        artifact.mark_active(now)?;
+        rollover::save(&self.root, &artifact)?;
+
+        // Seed a new disposable session view from the durable Mission. The old
+        // view is intentionally retained for diagnostics/transcript recovery.
+        let mut state_after = state::load(&self.root);
+        let seeded = current.seed_session(&target_session_id, now);
+        state_after.state.upsert(seeded, now);
+        let state_error = state::save(&self.root, &state_after.state).err();
+
+        if let Err(error) = runtime.resume_continuation(
+            &target_session_id,
+            &artifact.prompt_id(),
+            &continuation_text,
+            continuation_description,
+            &continuation_metadata,
+        ) {
+            let retry_after =
+                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds));
+            artifact.mark_failed(&error.to_string(), now, retry_after);
+            rollover::save(&self.root, &artifact)?;
+            let expected_revision = current.revision;
+            let expected_owner = current.session_id.clone();
+            let _ = current.mark_rollover_failed(
+                &artifact.artifact_id,
+                &error.to_string(),
+                now,
+                retry_after,
+            );
+            let _ = mission::save_if_revision(
+                &self.root,
+                &current,
+                expected_revision,
+                expected_owner.as_deref(),
+            )?;
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::RolloverRequired,
+                    action: GovernorAction::Rollover,
+                    utilization_percent: decision.utilization_percent,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason:
+                        "continuation acknowledgement failed after cutover; recovery is pending"
+                            .to_string(),
+                },
+                rollover_status: Some(current.rollover.status),
+                artifact_status: Some(artifact.status),
+                artifact_id: Some(artifact.artifact_id),
+                source_session_id: Some(source_session_id),
+                target_session_id: Some(target_session_id),
+                note: Some(crate::telemetry::task::redact(&error.to_string())),
+            });
+        }
+        let expected_revision = current.revision;
+        let expected_owner = current.session_id.clone();
+        current.mark_rollover_applied(&artifact.artifact_id, &target_session_id, now)?;
+        if !mission::save_if_revision(
+            &self.root,
+            &current,
+            expected_revision,
+            expected_owner.as_deref(),
+        )? {
+            let conflict_reason = "Mission changed before continuation acknowledgement";
+            artifact.mark_conflict(conflict_reason, now);
+            rollover::save(&self.root, &artifact)?;
+            self.persist_rollover_conflict(
+                &artifact.mission_id,
+                &artifact.artifact_id,
+                conflict_reason,
+                now,
+            );
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::RolloverRequired,
+                    action: GovernorAction::Continue,
+                    utilization_percent: decision.utilization_percent,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason: "Mission changed before acknowledgement; the target owner is retained"
+                        .to_string(),
+                },
+                rollover_status: Some(MissionRolloverStatus::Conflict),
+                artifact_status: Some(artifact.status),
+                artifact_id: Some(artifact.artifact_id),
+                source_session_id: Some(source_session_id),
+                target_session_id: Some(target_session_id),
+                note: Some("optimistic Mission CAS rejected acknowledgement".to_string()),
+            });
+        }
+        artifact.mark_applied(now)?;
+        rollover::save(&self.root, &artifact)?;
+        Ok(ContextGovernanceResult {
+            observation,
+            decision: GovernorDecision {
+                rollover_allowed: false,
+                deferred_for_boundary: false,
+                ..decision
+            },
+            rollover_status: Some(current.rollover.status),
+            artifact_status: Some(artifact.status),
+            artifact_id: Some(artifact.artifact_id),
+            source_session_id: Some(source_session_id),
+            target_session_id: Some(target_session_id),
+            note: state_error
+                .map(|error| crate::telemetry::task::redact(&error.to_string()))
+                .or(Some("same-generation session rollover applied".to_string())),
+        })
+    }
+
+    fn persist_rollover_failure(
+        &self,
+        mission: &mut Mission,
+        artifact_id: &str,
+        error: &str,
+        now: i64,
+        retry_after: Option<i64>,
+    ) -> Result<()> {
+        let expected_revision = mission.revision;
+        let expected_owner = mission.session_id.clone();
+        let _ = mission.mark_rollover_failed(artifact_id, error, now, retry_after);
+        let _ = mission::save_if_revision(
+            &self.root,
+            mission,
+            expected_revision,
+            expected_owner.as_deref(),
+        )?;
+        Ok(())
+    }
+
+    fn persist_rollover_conflict(
+        &self,
+        mission_id: &str,
+        artifact_id: &str,
+        reason: &str,
+        now: i64,
+    ) {
+        let Ok(Some(mut mission)) = mission::load(&self.root, mission_id) else {
+            return;
+        };
+        if mission.rollover.artifact_id.as_deref() != Some(artifact_id) {
+            return;
+        }
+        let expected_revision = mission.revision;
+        let expected_owner = mission.session_id.clone();
+        if mission
+            .mark_rollover_conflict(artifact_id, reason, now)
+            .is_ok()
+        {
+            let _ = mission::save_if_revision(
+                &self.root,
+                &mission,
+                expected_revision,
+                expected_owner.as_deref(),
+            );
+        }
+    }
+
+    fn persist_active_failure(
+        &self,
+        artifact: &RolloverArtifact,
+        error: &str,
+        now: i64,
+        retry_after: Option<i64>,
+    ) {
+        let Ok(Some(mut current)) = mission::load(&self.root, &artifact.mission_id) else {
+            return;
+        };
+        if current.session_id.as_deref() == artifact.target_session_id.as_deref() {
+            let _ = self.persist_rollover_failure(
+                &mut current,
+                &artifact.artifact_id,
+                error,
+                now,
+                retry_after,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recover_active_rollover(
+        &self,
+        observation: ContextObservation,
+        decision: GovernorDecision,
+        source_session_id: String,
+        mut artifact: RolloverArtifact,
+        runtime: &mut dyn RolloverRuntime,
+        lead: &LeadSelection,
+        now: i64,
+    ) -> Result<ContextGovernanceResult> {
+        let target_session_id = artifact
+            .target_session_id
+            .clone()
+            .ok_or_else(|| GearError::config("active rollover has no target session"))?;
+        if let Err(error) = select_existing_session_lead(runtime, &target_session_id, lead) {
+            artifact.mark_failed(
+                &error.to_string(),
+                now,
+                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
+            );
+            rollover::save(&self.root, &artifact)?;
+            self.persist_active_failure(
+                &artifact,
+                &error.to_string(),
+                now,
+                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
+            );
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::RolloverRequired,
+                    action: GovernorAction::Continue,
+                    utilization_percent: decision.utilization_percent,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason:
+                        "active target Lead could not be reverified; the target owner is retained"
+                            .to_string(),
+                },
+                rollover_status: Some(MissionRolloverStatus::Active),
+                artifact_status: Some(artifact.status),
+                artifact_id: Some(artifact.artifact_id),
+                source_session_id: Some(source_session_id),
+                target_session_id: Some(target_session_id),
+                note: Some(crate::telemetry::task::redact(&error.to_string())),
+            });
+        }
+        if let Err(error) = verify_target_session(runtime, &target_session_id) {
+            artifact.mark_failed(
+                &error.to_string(),
+                now,
+                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
+            );
+            rollover::save(&self.root, &artifact)?;
+            self.persist_active_failure(
+                &artifact,
+                &error.to_string(),
+                now,
+                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
+            );
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::RolloverRequired,
+                    action: GovernorAction::Continue,
+                    utilization_percent: decision.utilization_percent,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason: "active target identity could not be reverified; the target owner is retained"
+                        .to_string(),
+                },
+                rollover_status: Some(MissionRolloverStatus::Active),
+                artifact_status: Some(artifact.status),
+                artifact_id: Some(artifact.artifact_id),
+                source_session_id: Some(source_session_id),
+                target_session_id: Some(target_session_id),
+                note: Some(crate::telemetry::task::redact(&error.to_string())),
+            });
+        }
+        let continuation_text = artifact.continuation.render();
+        let description = "OCG same-generation Mission continuation";
+        let metadata = rollover::continuation_metadata(&artifact.continuation);
+        if let Err(error) = runtime.resume_continuation(
+            &target_session_id,
+            &artifact.prompt_id(),
+            &continuation_text,
+            description,
+            &metadata,
+        ) {
+            let retry_after =
+                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds));
+            artifact.mark_failed(&error.to_string(), now, retry_after);
+            rollover::save(&self.root, &artifact)?;
+            self.persist_active_failure(&artifact, &error.to_string(), now, retry_after);
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::RolloverRequired,
+                    action: GovernorAction::Continue,
+                    utilization_percent: decision.utilization_percent,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason:
+                        "active continuation could not be resumed; the target owner is retained"
+                            .to_string(),
+                },
+                rollover_status: Some(MissionRolloverStatus::Active),
+                artifact_status: Some(artifact.status),
+                artifact_id: Some(artifact.artifact_id),
+                source_session_id: Some(source_session_id),
+                target_session_id: Some(target_session_id),
+                note: Some(crate::telemetry::task::redact(&error.to_string())),
+            });
+        }
+        artifact.mark_active(now)?;
+        rollover::save(&self.root, &artifact)?;
+        let Some(mut current) = mission::load(&self.root, &artifact.mission_id)? else {
+            return Err(GearError::config(
+                "Mission disappeared while acknowledging active rollover",
+            ));
+        };
+        if current.session_id.as_deref() != Some(target_session_id.as_str())
+            || current.rollover.artifact_id.as_deref() != Some(artifact.artifact_id.as_str())
+            || current.rollover.target_session_id.as_deref() != Some(target_session_id.as_str())
+            || current.generation != artifact.generation
+        {
+            artifact.mark_conflict(
+                "active target owner changed before continuation acknowledgement",
+                now,
+            );
+            rollover::save(&self.root, &artifact)?;
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::RolloverRequired,
+                    action: GovernorAction::Continue,
+                    utilization_percent: decision.utilization_percent,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason: "active target owner changed; no Mission was overwritten".to_string(),
+                },
+                rollover_status: Some(MissionRolloverStatus::Conflict),
+                artifact_status: Some(artifact.status),
+                artifact_id: Some(artifact.artifact_id),
+                source_session_id: Some(source_session_id),
+                target_session_id: Some(target_session_id),
+                note: Some("operator review is required for the changed active owner".to_string()),
+            });
+        }
+        let expected_revision = current.revision;
+        let expected_owner = current.session_id.clone();
+        current.mark_rollover_applied(&artifact.artifact_id, &target_session_id, now)?;
+        if !mission::save_if_revision(
+            &self.root,
+            &current,
+            expected_revision,
+            expected_owner.as_deref(),
+        )? {
+            artifact.mark_conflict(
+                "Mission changed before active continuation acknowledgement",
+                now,
+            );
+            rollover::save(&self.root, &artifact)?;
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::RolloverRequired,
+                    action: GovernorAction::Continue,
+                    utilization_percent: decision.utilization_percent,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason:
+                        "Mission changed before active acknowledgement; no owner was overwritten"
+                            .to_string(),
+                },
+                rollover_status: Some(MissionRolloverStatus::Conflict),
+                artifact_status: Some(artifact.status),
+                artifact_id: Some(artifact.artifact_id),
+                source_session_id: Some(source_session_id),
+                target_session_id: Some(target_session_id),
+                note: Some("optimistic Mission CAS rejected the acknowledgement".to_string()),
+            });
+        }
+        let mut state_after = state::load(&self.root);
+        state_after
+            .state
+            .upsert(current.seed_session(&target_session_id, now), now);
+        let state_error = state::save(&self.root, &state_after.state).err();
+        artifact.mark_applied(now)?;
+        rollover::save(&self.root, &artifact)?;
+        Ok(ContextGovernanceResult {
+            observation,
+            decision: GovernorDecision {
+                rollover_allowed: false,
+                deferred_for_boundary: false,
+                ..decision
+            },
+            rollover_status: Some(current.rollover.status),
+            artifact_status: Some(artifact.status),
+            artifact_id: Some(artifact.artifact_id),
+            source_session_id: Some(source_session_id),
+            target_session_id: Some(target_session_id),
+            note: state_error
+                .map(|error| crate::telemetry::task::redact(&error.to_string()))
+                .or(Some(
+                    "active same-generation rollover recovered".to_string(),
+                )),
+        })
+    }
+
+    /// Convenience policy-only observation for callers that do not have a
+    /// runtime lifecycle client. It records telemetry and returns the decision
+    /// without creating a session.
+    pub fn evaluate_context(
+        &self,
+        session_id: &str,
+        observation: ContextObservation,
+    ) -> Result<GovernorDecision> {
+        if !self.config.context_governor.enabled {
+            return Ok(GovernorDecision {
+                state: GovernorState::Disabled,
+                action: GovernorAction::Continue,
+                utilization_percent: None,
+                rollover_allowed: false,
+                deferred_for_boundary: false,
+                reason: "context governor is disabled".to_string(),
+            });
+        }
+        let now = self.now();
+        let mut observation = observation;
+        let session_id = state::safe_id(session_id);
+        if observation.session_id.is_empty() {
+            observation.session_id = session_id.clone();
+        }
+        if observation.event_id.is_empty() {
+            observation.event_id = context_governor::event_identity(
+                &session_id,
+                observation.assistant_message_id.as_deref(),
+                observation.finish.as_deref(),
+                Some(now),
+            );
+        }
+        context_governor::save_observation(&self.root, &observation)?;
+        Ok(context_governor::decide(
+            &self.config.context_governor,
+            &observation,
+        ))
     }
 
     /// The controller clock's current instant. Exposed so the bridge records a
@@ -2521,6 +3843,22 @@ pub fn diff_reference(block: &str) -> Option<String> {
         "sha256:{}",
         crate::runtime::hash::sha256_hex(block.as_bytes())
     ))
+}
+
+fn verify_target_session(runtime: &dyn RolloverRuntime, target_session_id: &str) -> Result<()> {
+    let info = runtime.session_info(target_session_id)?;
+    let reported = info
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            GearError::config("target session identity was not reported by the runtime")
+        })?;
+    if reported != target_session_id {
+        return Err(GearError::config(format!(
+            "runtime reported target session {reported}, expected {target_session_id}"
+        )));
+    }
+    Ok(())
 }
 
 /// A public summary of an existing hand-off for diagnostics.

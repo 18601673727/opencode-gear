@@ -9,9 +9,10 @@
 //!
 //! [`OwnedV2Server`] is the only place that knows how an OpenCode 2 server is
 //! spawned and how its startup handshake is read. Ownership is explicit:
-//! [`RuntimeIdentity`] names the endpoint OCG is talking to and
+//! [`RuntimeIdentity`] keeps the endpoint in invocation memory and
 //! [`RuntimeOwnership`] records who started it, so a stale service can never be
-//! mistaken for this invocation's runtime.
+//! mistaken for this invocation's runtime. User-facing identity and Debug
+//! output deliberately omit the endpoint and password.
 //!
 //! Startup is a handshake followed by a *real* readiness check. The server
 //! prints `server listening on <url>` and `server password <password>` and only
@@ -30,6 +31,7 @@ use crate::proxy::ChildProxyEnv;
 use crate::runtime::compat::v2_client::{wait_ready, ServiceRegistration, V2SessionClient};
 use std::collections::VecDeque;
 use std::ffi::OsString;
+use std::fmt;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -83,21 +85,33 @@ impl RuntimeOwnership {
 }
 
 /// The deterministic identity of the runtime endpoint OCG resolved.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RuntimeIdentity {
     pub ownership: RuntimeOwnership,
-    /// Loopback base URL without a trailing slash.
+    /// Loopback base URL without a trailing slash. It is invocation-scoped
+    /// and deliberately omitted from user-facing diagnostics and Debug output.
     pub endpoint: String,
     /// Owning process id, when OCG started it.
     pub pid: Option<u32>,
+}
+
+impl fmt::Debug for RuntimeIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeIdentity")
+            .field("ownership", &self.ownership)
+            .field("endpoint", &"<redacted>")
+            .field("pid", &self.pid)
+            .finish()
+    }
 }
 
 impl RuntimeIdentity {
     /// A concise, credential-free description for reports.
     pub fn describe(&self) -> String {
         match self.pid {
-            Some(pid) => format!("{} {} (pid {pid})", self.ownership.as_str(), self.endpoint),
-            None => format!("{} {}", self.ownership.as_str(), self.endpoint),
+            Some(pid) => format!("{} (pid {pid})", self.ownership.as_str()),
+            None => self.ownership.as_str().to_string(),
         }
     }
 }
@@ -238,8 +252,7 @@ impl OwnedV2Server {
         )
         .map_err(|error| {
             GearError::config(format!(
-                "the private OpenCode V2 server at {} never became ready: {error}",
-                self.identity.endpoint
+                "the private OpenCode V2 server never became ready: {error}"
             ))
         })
     }
@@ -313,10 +326,13 @@ fn stderr_detail(tail: &Arc<Mutex<VecDeque<u8>>>) -> String {
 fn sanitize_startup_stderr(text: &str) -> String {
     text.lines()
         .map(|line| {
-            if line.to_ascii_lowercase().contains("password")
-                || line.to_ascii_lowercase().contains("api_key")
-                || line.to_ascii_lowercase().contains("apikey")
-                || line.to_ascii_lowercase().contains("secret")
+            let lower = line.to_ascii_lowercase();
+            if lower.contains("password")
+                || lower.contains("api_key")
+                || lower.contains("apikey")
+                || lower.contains("secret")
+                || lower.contains("http://")
+                || lower.contains("https://")
             {
                 "[redacted startup diagnostic]"
             } else {
@@ -422,10 +438,9 @@ mod tests {
             endpoint: "http://127.0.0.1:1".to_string(),
             pid: Some(42),
         };
-        assert_eq!(
-            identity.describe(),
-            "ocg-managed-invocation http://127.0.0.1:1 (pid 42)"
-        );
+        assert_eq!(identity.describe(), "ocg-managed-invocation (pid 42)");
+        assert!(!identity.describe().contains("127.0.0.1"));
+        assert!(!format!("{identity:?}").contains("127.0.0.1"));
         assert_eq!(
             RuntimeOwnership::RegisteredService.as_str(),
             "registered-service"

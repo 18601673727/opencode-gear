@@ -214,13 +214,14 @@ pub trait RuntimeAdapter: Send + Sync {
 
 /// The exact Lead selection Gear resolved for one throttle level, in the shape
 /// a runtime adapter needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LeadSelection {
     pub level: String,
     pub agent: String,
     pub provider_id: String,
     pub model_id: String,
     /// Present only when the Lead contract declares one. Never fabricated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
 }
 
@@ -253,6 +254,69 @@ pub struct EffectiveLead {
 /// The session-level operations a v2 runtime exposes. Gear keeps no HTTP or SSE
 /// details here; implementations are injected, so tests use a deterministic
 /// in-memory client and production can bind an HTTP client.
+/// Runtime operations needed for an explicit, artifact-backed rollover.
+///
+/// This is deliberately separate from [`SessionClient`]: `resolve_session`
+/// may reuse the newest project session, while a rollover must create a known
+/// fresh target.  Implementations are invocation-scoped; no operation here
+/// restarts a runtime or reads provider credentials.
+pub trait SessionLifecycleClient {
+    /// Create a new root session in the already configured project directory.
+    fn create_fresh_session(&self) -> Result<String>;
+    /// Read the active context messages exposed by the runtime.
+    fn context_messages(&self, session: &str) -> Result<Vec<serde_json::Value>>;
+    /// Read the complete session record, including the runtime model/token
+    /// aggregate when that version exposes it.
+    fn session_info(&self, session: &str) -> Result<serde_json::Value>;
+    /// Read model limits from the runtime catalogue. Missing model data is
+    /// represented by a metadata value with no denominator, not by an invented
+    /// limit.
+    fn model_metadata(
+        &self,
+        provider_id: Option<&str>,
+        model_id: Option<&str>,
+    ) -> Result<crate::orchestration::context_governor::ModelMetadata>;
+    /// Add a durable synthetic continuation message. Synthetic input is used
+    /// instead of a normal prompt so it cannot be mistaken for a new user task
+    /// and cannot reset Mission identity.
+    fn inject_continuation(
+        &self,
+        session: &str,
+        message_id: &str,
+        text: &str,
+        description: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<()>;
+
+    /// Stage a synthetic continuation without scheduling model execution.
+    /// Implementations predating the explicit staging contract may use the
+    /// ordinary injection method as a compatibility fallback.
+    fn stage_continuation(
+        &self,
+        session: &str,
+        message_id: &str,
+        text: &str,
+        description: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<()> {
+        self.inject_continuation(session, message_id, text, description, metadata)
+    }
+
+    /// Resume a previously staged synthetic continuation. A client that has no
+    /// separate staging operation may make this a no-op after its compatibility
+    /// injection has already scheduled the message.
+    fn resume_continuation(
+        &self,
+        _session: &str,
+        _message_id: &str,
+        _text: &str,
+        _description: &str,
+        _metadata: &serde_json::Value,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
 pub trait SessionClient {
     /// Create a fresh session or resolve the project's active one.
     fn resolve_session(&mut self) -> Result<String>;
@@ -270,6 +334,57 @@ pub trait SessionClient {
     /// Read the effective Lead back. Unavailable is an error: Gear refuses to
     /// rely on a Lead it cannot verify.
     fn effective_lead(&self, session: &str) -> Result<EffectiveLead>;
+}
+
+/// A runtime that can perform an explicit same-Mission session replacement.
+///
+/// This is a supertrait rather than a wider `SessionClient`: ordinary session
+/// resolution does not need lifecycle or continuation privileges, and test
+/// clients can keep their existing small implementations. The blanket impl
+/// means any real client that implements both narrow contracts automatically
+/// satisfies the coordinator.
+pub trait RolloverRuntime: SessionClient + SessionLifecycleClient {}
+
+impl<T> RolloverRuntime for T where T: SessionClient + SessionLifecycleClient {}
+
+/// Apply and verify a Lead contract to an already-created session.
+///
+/// Rollover must never call `resolve_session` after creating a target: that
+/// operation is allowed to return an older/newest unrelated session. Keeping
+/// this operation explicit makes the target identity part of the rollover
+/// contract.
+pub fn select_existing_session_lead(
+    client: &mut dyn SessionClient,
+    session_id: &str,
+    lead: &LeadSelection,
+) -> Result<SessionLeadSelection> {
+    if session_id.is_empty() {
+        return Err(GearError::config(
+            "cannot select a Lead for an empty session id",
+        ));
+    }
+    client.select_agent(session_id, &lead.agent)?;
+    client.select_model(
+        session_id,
+        &lead.provider_id,
+        &lead.model_id,
+        lead.variant.as_deref(),
+    )?;
+    let effective = client.effective_lead(session_id)?;
+    verify_effective_lead(lead, &effective)?;
+    Ok(SessionLeadSelection {
+        session_id: session_id.to_string(),
+        lead: lead.clone(),
+        steps: vec![
+            format!("select_agent={}", lead.agent),
+            format!("select_model={}", lead.full_model_id()),
+            format!(
+                "variant={}",
+                lead.variant.as_deref().unwrap_or("provider-default")
+            ),
+            "verify_effective_lead".to_string(),
+        ],
+    })
 }
 
 /// A deterministic, offline [`SessionClient`] used by tests and by callers that

@@ -34,6 +34,7 @@ use crate::validate;
 use crate::yaml;
 use serde_json::{json, Map, Value};
 use std::ffi::OsString;
+use std::fmt;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -130,12 +131,14 @@ pub struct Context<'a> {
 pub type ProbeFn<'a> = dyn Fn(&Effective, &str) -> Option<ModelPreflight> + 'a;
 
 /// The outcome of the activation step — the last stage of a switch.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Activation {
     /// An OCG-owned runtime accepted the resolved contract and its session
     /// reports the effective Lead back. This is the only proof that the switch
     /// reached an actual runtime.
     Verified {
+        /// Invocation-scoped endpoint retained for API compatibility; reports
+        /// and Debug output intentionally omit it.
         endpoint: String,
         session_id: String,
         lead: EffectiveLead,
@@ -145,6 +148,25 @@ pub enum Activation {
     /// No session-level runtime could be activated (a v1 runtime, no runtime,
     /// or the user passed `--no-activate`).
     NotAvailable(String),
+}
+
+impl fmt::Debug for Activation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Verified {
+                session_id, lead, ..
+            } => formatter
+                .debug_struct("Verified")
+                .field("endpoint", &"<redacted>")
+                .field("session_id", session_id)
+                .field("lead", lead)
+                .finish(),
+            Self::Failed(reason) => formatter.debug_tuple("Failed").field(reason).finish(),
+            Self::NotAvailable(reason) => {
+                formatter.debug_tuple("NotAvailable").field(reason).finish()
+            }
+        }
+    }
 }
 
 /// The activation probe, injected by the CLI. It starts an OCG-owned runtime
@@ -1045,13 +1067,13 @@ fn report_lead(
     // an unobserved state is never presented as verified.
     match activation {
         Activation::Verified {
-            endpoint,
+            endpoint: _endpoint,
             session_id,
             lead,
         } => {
             emit!(
                 output,
-                "  effective: verified on {endpoint} (session {session_id})"
+                "  effective: verified on the invocation-owned runtime (session {session_id})"
             )?;
             emit!(
                 output,
