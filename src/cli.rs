@@ -2121,6 +2121,35 @@ fn doctor_command(
                         ),
                     );
                 }
+                let (missions, corrupt_missions) =
+                    crate::orchestration::mission::list(project_root);
+                if missions.is_empty() && corrupt_missions == 0 {
+                    doctor.line(
+                        "info",
+                        "orchestration missions",
+                        "not present (created by the bridge on first task admission)",
+                    );
+                } else if corrupt_missions > 0 {
+                    doctor.line(
+                        "warn",
+                        "orchestration missions",
+                        &format!(
+                            "{} mission(s); {} unreadable record(s) (quarantined on load, never silently reset)",
+                            missions.len(),
+                            corrupt_missions
+                        ),
+                    );
+                } else {
+                    let active = missions
+                        .iter()
+                        .filter(|mission| !mission.status.is_terminal())
+                        .count();
+                    doctor.line(
+                        "ok",
+                        "orchestration missions",
+                        &format!("{} mission(s) ({active} active)", missions.len()),
+                    );
+                }
                 let limits = crate::orchestration::projection::ProjectionLimits {
                     max_bytes: config.max_handoff_bytes,
                     ratio_percent: config.max_handoff_ratio_percent,

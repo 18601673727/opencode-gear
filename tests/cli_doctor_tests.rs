@@ -88,6 +88,7 @@ fn doctor_reports_the_new_sections_and_creates_nothing() {
         "orchestration",
         "orchestration plugin",
         "orchestration state",
+        "orchestration missions",
         "projection",
         "context activation",
         "verification integration",
@@ -132,6 +133,45 @@ fn doctor_warns_on_a_corrupt_index_without_failing_or_creating_state() {
         !project.join(".opencode-gear/telemetry").exists(),
         "doctor must not create telemetry"
     );
+}
+
+#[test]
+fn doctor_reports_missions_and_warns_on_a_corrupt_record_without_quarantining() {
+    let dir = TestDir::new();
+    let project = dir.project();
+    write_project_file(
+        &project,
+        ".opencode-gear/orchestration/missions/task-0123456789abcdef.json",
+        r#"{"schema_version":1,"mission_id":"task-0123456789abcdef","generation":1,
+            "status":"active","phase":"build","session_id":"s"}"#,
+    );
+    write_project_file(
+        &project,
+        ".opencode-gear/orchestration/missions/task-fedcba9876543210.json",
+        "{not valid json",
+    );
+    let project_arg = project.to_string_lossy().into_owned();
+    let output = run(
+        dir.path(),
+        dir.path(),
+        &["--project", &project_arg, "doctor"],
+    );
+    assert!(output.status.success(), "{}", stdout(&output));
+    let text = stdout(&output);
+    assert!(text.contains("orchestration missions"), "{text}");
+    assert!(text.contains("1 mission(s)"), "{text}");
+    assert!(text.contains("1 unreadable record(s)"), "{text}");
+    // Doctor stays read-only: it reports the unreadable record, it never
+    // quarantines or replaces it.
+    assert!(
+        project
+            .join(".opencode-gear/orchestration/missions/task-fedcba9876543210.json")
+            .is_file(),
+        "doctor must not move durable Mission records"
+    );
+    assert!(!project
+        .join(".opencode-gear/orchestration/missions/task-fedcba9876543210.corrupt.json")
+        .exists());
 }
 
 #[test]

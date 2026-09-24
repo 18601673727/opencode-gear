@@ -30,12 +30,13 @@ use crate::context::config::ContextConfig;
 use crate::context::engine::{ContextEngine, PlanOutcome};
 use crate::context::freshness::{Provenance, ENGINE_VERSION, SCHEMA_VERSION};
 use crate::context::gitdiff::{snapshot_fingerprint, GitSnapshot};
-use crate::error::Result;
+use crate::error::{GearError, Result};
 use crate::orchestration::checkpoint::{self, Checkpoint, Phase};
 use crate::orchestration::config::OrchestrationConfig;
 use crate::orchestration::handoff::{
     HandoffFinding, HandoffVerification, ModelHandoffCapsule, ProjectionInput, Role, Severity,
 };
+use crate::orchestration::mission::{self, Mission, MissionEventKind, MissionStatus};
 use crate::orchestration::projection::{self, ProjectionLimits};
 use crate::orchestration::state::{self, Attempts, OrchestrationPhase, SessionState};
 use crate::process::{CaptureRunner, GitHost};
@@ -253,6 +254,89 @@ impl<'a> Controller<'a> {
         state::load(&self.root)
     }
 
+    /// Load the Mission for `session.task_id`, creating one from the session
+    /// when the record is absent (sessions admitted before Missions existed
+    /// adopt one lazily, keeping their progress). A corrupt record fails
+    /// explicitly: the store quarantines it and it is never silently replaced
+    /// with a fresh Mission. Returns `None` only for a session with no task.
+    fn ensure_mission(&self, session: &SessionState, now: i64) -> Result<Option<Mission>> {
+        if session.task_id.is_empty() {
+            return Ok(None);
+        }
+        match mission::load(&self.root, &session.task_id)? {
+            Some(mission) => Ok(Some(mission)),
+            None => {
+                let mut mission = Mission::admit(
+                    &session.task_id,
+                    session.task.as_deref().unwrap_or(""),
+                    &session.session_id,
+                    now,
+                );
+                mission.sync_from_session(session);
+                Ok(Some(mission))
+            }
+        }
+    }
+
+    /// Resolve the Mission for a task admission: load the durable record for
+    /// `task_id` (creating it when absent), start a new generation when the
+    /// previous one reached a terminal state, and bind this session as the
+    /// Mission's replaceable execution state. The session's previous Mission
+    /// binding (a different admitted task) is released. The Mission identity
+    /// never changes because a session does.
+    fn admit_or_resume(
+        &self,
+        session_key: &str,
+        task_id: &str,
+        message: &str,
+        previous: Option<&SessionState>,
+        now: i64,
+    ) -> Result<Mission> {
+        if let Some(previous) = previous {
+            if !previous.task_id.is_empty() && previous.task_id != task_id {
+                if let Some(mut old) = mission::load(&self.root, &previous.task_id)? {
+                    if old.session_id.as_deref() == Some(session_key) {
+                        old.release_session(now);
+                        mission::save(&self.root, &old)?;
+                    }
+                }
+            }
+        }
+        let mut mission = match mission::load(&self.root, task_id)? {
+            Some(mission) => mission,
+            None => Mission::admit(task_id, &Self::stored_task_text(message), session_key, now),
+        };
+        if mission.is_terminal() {
+            // A terminal Mission is durable: it is never silently reset. A
+            // genuine re-admission starts a new generation instead.
+            mission.begin_new_generation(now);
+        }
+        mission.bind_session(session_key, now);
+        if mission.task.is_none() {
+            mission.task = Some(Self::stored_task_text(message));
+        }
+        Ok(mission)
+    }
+
+    /// Persist the Mission (durable product state, strict) before the session
+    /// state (disposable execution state, fail-soft as before). The Mission
+    /// is authoritative: a Mission write failure fails the call rather than
+    /// letting the session view run ahead of the durable record.
+    fn persist(
+        &self,
+        loaded: &mut state::LoadedState,
+        session: SessionState,
+        mission: Option<Mission>,
+        now: i64,
+    ) -> Result<()> {
+        if let Some(mission) = mission {
+            mission::save(&self.root, &mission)?;
+        }
+        loaded.state.upsert(session, now);
+        let _ = state::save(&self.root, &loaded.state);
+        Ok(())
+    }
+
     /// The controller clock's current instant. Exposed so the bridge records a
     /// deterministic timestamp under a fixed clock in tests.
     pub fn now_unix(&self) -> i64 {
@@ -413,28 +497,36 @@ impl<'a> Controller<'a> {
     /// Lead on an ordinary user message (the V1 persisted-prompt path).
     ///
     /// With [`Self::admit_user_task`] (the V2 prompt-admission path) this is
-    /// one of the two places the overall task is defined or reset. When the
-    /// user message hashes to a different task id, prior findings, retry
-    /// counters and checkpoint references are cleared; a repeated message keeps
-    /// the running session. Delegated subagent prompts never reset it.
+    /// one of the two places the overall task is defined or reset. Task
+    /// identity is resolved through the durable Mission: a repeated message
+    /// keeps the running session, a genuinely new message binds the session
+    /// to a different Mission (a prior Mission is never destroyed by it), and
+    /// a message whose Mission already exists — for example after a session
+    /// rollover — seeds the fresh session from the Mission instead of
+    /// restarting committed work. Delegated subagent prompts never reset it.
     pub fn prepare_lead_context(&self, session_id: &str, message: &str) -> Result<LeadContext> {
         let now = self.now();
         let session_key = state::safe_id(session_id);
         let task_id = Self::task_id(message);
         let mut loaded = state::load(&self.root);
         let existing = loaded.state.session(&session_key).cloned();
-        let mut session = match existing {
-            Some(session) if session.task_id == task_id => session,
+        let (mut session, mut mission) = match existing {
+            Some(session) if session.task_id == task_id => {
+                let mission = self.ensure_mission(&session, now)?;
+                (session, mission)
+            }
             previous => {
-                // A new task resets task-scoped state (findings, retries,
-                // checkpoints), but the repository baseline identity is session-
-                // scoped and derived from indexed content, not the task wording.
-                let generation_id =
+                // A new task boundary for this session (or a brand-new
+                // session): resolve the durable Mission and seed the session
+                // from it. The repository baseline identity is session-scoped
+                // and derived from indexed content, not the task wording, so
+                // it carries over the task switch.
+                let mission =
+                    self.admit_or_resume(&session_key, &task_id, message, previous.as_ref(), now)?;
+                let mut fresh = mission.seed_session(&session_key, now);
+                fresh.repository_generation_id =
                     previous.and_then(|session| session.repository_generation_id.clone());
-                let mut fresh = SessionState::new(&session_key, &task_id, now);
-                fresh.task = Some(Self::stored_task_text(message));
-                fresh.repository_generation_id = generation_id;
-                fresh
+                (fresh, Some(mission))
             }
         };
         session.session_id = session_key.clone();
@@ -472,8 +564,10 @@ impl<'a> Controller<'a> {
             session.last_rich_bytes = baseline.rich_bytes;
         }
         session.updated_at = now;
-        loaded.state.upsert(session.clone(), now);
-        let _ = state::save(&self.root, &loaded.state);
+        if let Some(mission) = &mut mission {
+            mission.sync_from_session(&session);
+        }
+        self.persist(&mut loaded, session, mission, now)?;
 
         Ok(LeadContext {
             session_id: session_key,
@@ -504,10 +598,16 @@ impl<'a> Controller<'a> {
     /// A re-admitted prompt whose task id matches the running session leaves
     /// every piece of task-scoped state (findings, retry budgets, checkpoint
     /// references, phase, destination) exactly as the worker orchestration
-    /// path left it. A genuinely new prompt resets task-scoped state but
-    /// carries the repository baseline identity and retained body over: the
-    /// baseline is keyed by the task-independent repository generation, never
-    /// by task wording.
+    /// path left it. A re-delivered prompt therefore also never reopens a
+    /// terminal Mission: a completed/failed/cancelled generation stays the
+    /// durable record of how it ended, and new work belongs to a new
+    /// generation. A genuinely new prompt resolves the durable Mission for
+    /// its task id and seeds the session from it: a Mission admitted earlier
+    /// — including by a session that has since died or rolled over — resumes
+    /// with its committed progress; a terminal Mission starts a new
+    /// generation. The repository baseline identity and retained body carry
+    /// over: the baseline is keyed by the task-independent repository
+    /// generation, never by task wording.
     pub fn admit_user_task(&self, session_id: &str, message: &str) -> Result<TaskAdmission> {
         let now = self.now();
         let session_key = state::safe_id(session_id);
@@ -518,10 +618,22 @@ impl<'a> Controller<'a> {
             Some(session) if session.task_id == task_id => {
                 // The running task was re-admitted. Nothing resets; only the
                 // stored task text may need backfilling (e.g. the session was
-                // first observed by a pre-admission model dispatch).
+                // first observed by a pre-admission model dispatch), and a
+                // Mission file may need adopting for a session that predates
+                // Missions.
+                let mut mission = self.ensure_mission(&session, now)?;
+                let mut session = session;
+                let mut touched = false;
                 if session.task.is_none() {
-                    let mut session = session;
                     session.task = Some(Self::stored_task_text(message));
+                    touched = true;
+                }
+                if let Some(mission) = &mut mission {
+                    mission.sync_from_session(&session);
+                    mission::save(&self.root, mission)?;
+                }
+                if touched {
+                    session.updated_at = now;
                     loaded.state.upsert(session, now);
                     let _ = state::save(&self.root, &loaded.state);
                 }
@@ -535,14 +647,16 @@ impl<'a> Controller<'a> {
                 let generation_id = previous
                     .as_ref()
                     .and_then(|session| session.repository_generation_id.clone());
-                let baseline = previous.and_then(|session| session.repository_baseline);
-                let mut fresh = SessionState::new(&session_key, &task_id, now);
-                fresh.task = Some(Self::stored_task_text(message));
+                let baseline = previous
+                    .as_ref()
+                    .and_then(|session| session.repository_baseline.clone());
+                let mut mission =
+                    self.admit_or_resume(&session_key, &task_id, message, previous.as_ref(), now)?;
+                let mut fresh = mission.seed_session(&session_key, now);
                 fresh.repository_generation_id = generation_id;
                 fresh.repository_baseline = baseline;
-                fresh.destination = Some(Role::Lead);
-                loaded.state.upsert(fresh, now);
-                let _ = state::save(&self.root, &loaded.state);
+                mission.sync_from_session(&fresh);
+                self.persist(&mut loaded, fresh, Some(mission), now)?;
                 Ok(TaskAdmission {
                     session_id: session_key,
                     task_id,
@@ -760,6 +874,7 @@ impl<'a> Controller<'a> {
             session.task = Some(Self::stored_task_text(task));
         }
         let overall_task_id = session.task_id.clone();
+        let mut mission = self.ensure_mission(&session, now)?;
 
         let previous = session.source;
         session.phase = phase_for(role);
@@ -915,11 +1030,24 @@ impl<'a> Controller<'a> {
             if let Some(id) = &checkpoint_id {
                 session.push_checkpoint(id);
             }
+            if let Some(mission) = &mut mission {
+                let event = mission.event(
+                    MissionEventKind::DebugToBuild,
+                    checkpoint_id.as_deref().unwrap_or(""),
+                    checkpoint_id.clone(),
+                    Some(session_key.clone()),
+                    None,
+                    now,
+                );
+                mission.record(event);
+            }
         }
 
         session.source = role;
-        loaded.state.upsert(session.clone(), now);
-        let _ = state::save(&self.root, &loaded.state);
+        if let Some(mission) = &mut mission {
+            mission.sync_from_session(&session);
+        }
+        self.persist(&mut loaded, session, mission, now)?;
 
         let mut metrics = OrchestrationMetrics {
             phase: Some(phase_for(role).as_str().to_string()),
@@ -965,6 +1093,7 @@ impl<'a> Controller<'a> {
             .session(&session_key)
             .cloned()
             .unwrap_or_else(|| SessionState::new(&session_key, "", now));
+        let mut mission = self.ensure_mission(&session, now)?;
         let parsed = parse_explore_output(output);
         for finding in &parsed.findings {
             session.push_finding(finding.clone());
@@ -1005,10 +1134,21 @@ impl<'a> Controller<'a> {
         if let Some(id) = &checkpoint_id {
             session.push_checkpoint(id);
         }
+        if let Some(mission) = &mut mission {
+            let event = mission.event(
+                MissionEventKind::ExploreToBuild,
+                checkpoint_id.as_deref().unwrap_or(""),
+                checkpoint_id.clone(),
+                Some(session_key.clone()),
+                None,
+                now,
+            );
+            mission.record(event);
+            mission.sync_from_session(&session);
+        }
 
         let task_id = session.task_id.clone();
-        loaded.state.upsert(session.clone(), now);
-        let _ = state::save(&self.root, &loaded.state);
+        self.persist(&mut loaded, session, mission, now)?;
 
         let metrics = OrchestrationMetrics {
             phase: Some(OrchestrationPhase::Build.as_str().to_string()),
@@ -1046,6 +1186,7 @@ impl<'a> Controller<'a> {
             .cloned()
             .unwrap_or_else(|| SessionState::new(&session_key, "", now));
         session.attempts.build += 1;
+        let mut mission = self.ensure_mission(&session, now)?;
         let stage = stage
             .map(str::to_string)
             .unwrap_or_else(|| self.verification.default_stage.clone());
@@ -1056,8 +1197,10 @@ impl<'a> Controller<'a> {
             let note = format!(
                 "no trusted verification command is configured for stage '{stage}'; nothing was run"
             );
-            loaded.state.upsert(session.clone(), now);
-            let _ = state::save(&self.root, &loaded.state);
+            if let Some(mission) = &mut mission {
+                mission.sync_from_session(&session);
+            }
+            self.persist(&mut loaded, session.clone(), mission, now)?;
             return Ok(BuildOutcome {
                 session_id: session_key,
                 task_id,
@@ -1089,8 +1232,10 @@ impl<'a> Controller<'a> {
                 session.phase = OrchestrationPhase::Verify;
                 let task_id = session.task_id.clone();
                 let note = format!("verification could not run: {error}");
-                loaded.state.upsert(session.clone(), now);
-                let _ = state::save(&self.root, &loaded.state);
+                if let Some(mission) = &mut mission {
+                    mission.sync_from_session(&session);
+                }
+                self.persist(&mut loaded, session.clone(), mission, now)?;
                 return Ok(BuildOutcome {
                     session_id: session_key,
                     task_id,
@@ -1126,13 +1271,33 @@ impl<'a> Controller<'a> {
         if let Some(id) = &checkpoint_id {
             session.push_checkpoint(id);
         }
+        if let Some(mission) = &mut mission {
+            let event = mission.event(
+                MissionEventKind::BuildToVerify,
+                checkpoint_id.as_deref().unwrap_or(""),
+                checkpoint_id.clone(),
+                Some(session_key.clone()),
+                None,
+                now,
+            );
+            mission.record(event);
+        }
         let task_id = session.task_id.clone();
 
         if report.passed() {
             session.attempts.verify += 1;
             session.phase = OrchestrationPhase::Done;
-            loaded.state.upsert(session.clone(), now);
-            let _ = state::save(&self.root, &loaded.state);
+            if let Some(mission) = &mut mission {
+                mission.sync_from_session(&session);
+                // Durable completion. Replaying an already-recorded completion
+                // is a no-op; the terminal state survives every later session.
+                mission.complete(
+                    &session_key,
+                    Some(format!("verification stage '{}' passed", report.stage)),
+                    now,
+                )?;
+            }
+            self.persist(&mut loaded, session.clone(), mission, now)?;
             return Ok(BuildOutcome {
                 session_id: session_key,
                 task_id,
@@ -1161,8 +1326,10 @@ impl<'a> Controller<'a> {
         if session.attempts.build <= self.config.max_build_retries {
             session.phase = OrchestrationPhase::Build;
             let attempt = session.attempts.build;
-            loaded.state.upsert(session.clone(), now);
-            let _ = state::save(&self.root, &loaded.state);
+            if let Some(mission) = &mut mission {
+                mission.sync_from_session(&session);
+            }
+            self.persist(&mut loaded, session.clone(), mission, now)?;
             return Ok(BuildOutcome {
                 session_id: session_key,
                 task_id,
@@ -1201,8 +1368,22 @@ impl<'a> Controller<'a> {
         if let Some(id) = &debug_checkpoint {
             session.push_checkpoint(id);
         }
-        loaded.state.upsert(session.clone(), now);
-        let _ = state::save(&self.root, &loaded.state);
+        if let Some(mission) = &mut mission {
+            let event = mission.event(
+                MissionEventKind::VerifyToDebug,
+                debug_checkpoint
+                    .as_deref()
+                    .or(checkpoint_id.as_deref())
+                    .unwrap_or(""),
+                debug_checkpoint.clone().or(checkpoint_id.clone()),
+                Some(session_key.clone()),
+                Some(reason.clone()),
+                now,
+            );
+            mission.record(event);
+            mission.sync_from_session(&session);
+        }
+        self.persist(&mut loaded, session.clone(), mission, now)?;
         let mut metrics = orchestration_metrics(
             OrchestrationPhase::Debug,
             Role::Verify,
@@ -1255,6 +1436,7 @@ impl<'a> Controller<'a> {
             .unwrap_or_else(|| SessionState::new(&session_key, "", now));
         session.attempts.debug += 1;
         session.phase = OrchestrationPhase::Debug;
+        let mut mission = self.ensure_mission(&session, now)?;
         let mut handoff = self.debug_handoff_from_session(&session, &session_key);
         if let Some(escalation) = self.debug_escalation(session.attempts.debug) {
             handoff.capsule.omitted.push(escalation.clone());
@@ -1265,9 +1447,90 @@ impl<'a> Controller<'a> {
         }
         handoff.metrics.attempt = Some(session.attempts.debug);
         handoff.metrics.retry = Some(session.attempts.debug.saturating_sub(1));
-        loaded.state.upsert(session.clone(), now);
-        let _ = state::save(&self.root, &loaded.state);
+        if let Some(mission) = &mut mission {
+            mission.sync_from_session(&session);
+        }
+        self.persist(&mut loaded, session, mission, now)?;
         Ok(handoff)
+    }
+
+    /// Load the durable Mission for `mission_id`.
+    ///
+    /// Unlike the disposable session state, a corrupt record fails explicitly
+    /// (it is quarantined by the store, never silently read as "no Mission").
+    pub fn load_mission(&self, mission_id: &str) -> Result<Option<Mission>> {
+        mission::load(&self.root, mission_id)
+    }
+
+    /// The durable Mission currently bound to a session, when that session
+    /// has an admitted task.
+    pub fn session_mission(&self, session_id: &str) -> Result<Option<Mission>> {
+        let session_key = state::safe_id(session_id);
+        let Some(session) = state::load(&self.root).state.session(&session_key).cloned() else {
+            return Ok(None);
+        };
+        if session.task_id.is_empty() {
+            return Ok(None);
+        }
+        mission::load(&self.root, &session.task_id)
+    }
+
+    /// Durably fail the Mission bound to a session, with an inspectable
+    /// reason. Replaying the same failure (same generation) is a no-op;
+    /// failing a Mission that already reached another terminal state fails
+    /// explicitly instead of overwriting it. Re-admitting the task starts a
+    /// new generation.
+    pub fn fail_mission(&self, session_id: &str, reason: &str) -> Result<Mission> {
+        self.terminate_mission(session_id, MissionStatus::Failed, reason)
+    }
+
+    /// Durably cancel the Mission bound to a session. Same semantics as
+    /// [`Self::fail_mission`].
+    pub fn cancel_mission(&self, session_id: &str, reason: &str) -> Result<Mission> {
+        self.terminate_mission(session_id, MissionStatus::Cancelled, reason)
+    }
+
+    fn terminate_mission(
+        &self,
+        session_id: &str,
+        status: MissionStatus,
+        reason: &str,
+    ) -> Result<Mission> {
+        let now = self.now();
+        let session_key = state::safe_id(session_id);
+        let session = state::load(&self.root)
+            .state
+            .session(&session_key)
+            .cloned()
+            .ok_or_else(|| {
+                GearError::config(format!(
+                    "cannot mark a mission {}: session '{session_key}' has no admitted task",
+                    status.as_str()
+                ))
+            })?;
+        let mut mission = self.ensure_mission(&session, now)?.ok_or_else(|| {
+            GearError::config(format!(
+                "cannot mark a mission {}: the session has no admitted task",
+                status.as_str()
+            ))
+        })?;
+        let note = Self::stored_task_text(reason);
+        match status {
+            MissionStatus::Failed => {
+                mission.fail(&session_key, Some(note), now)?;
+            }
+            MissionStatus::Cancelled => {
+                mission.cancel(&session_key, Some(note), now)?;
+            }
+            other => {
+                return Err(GearError::config(format!(
+                    "terminate_mission requires a terminal state, not {}",
+                    other.as_str()
+                )))
+            }
+        }
+        mission::save(&self.root, &mission)?;
+        Ok(mission)
     }
 
     fn debug_handoff_from_session(

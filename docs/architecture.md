@@ -273,6 +273,7 @@ split so policy cannot drift into the wrong language:
 ```text
 Rust (authority)
   controller/state   phases, attempts/retries, freshness, retry/Debug policy
+  mission            durable per-task record: identity, generation, lifecycle
   projection         typed ModelHandoffCapsule, caps, secret defense
   bridge             `ocg __bridge <event>` JSON translation + telemetry
   plugin generator   materialize the adapter, inject the file:// URL
@@ -340,10 +341,45 @@ JavaScript (transport only)
   against; Build/Verify/Debug hand-offs render a bounded, deterministic view of
   its retained entries and hunks, filtered for sensitive paths and secret-shaped
   content, with structural truncation stated.
-- **Fail-soft.** Corrupt state, checkpoint or cache recovers; a disabled
-  orchestration emits no plugin, writes no state and records nothing.
+- **Fail-soft caches, strict product state.** Corrupt session state, checkpoint
+  or cache recovers (session state falls back to empty); a disabled
+  orchestration emits no plugin, writes no state and records nothing. A corrupt
+  or unsupported **Mission** record is never recovered that way: it is
+  quarantined for inspection and the call fails explicitly, so committed work
+  cannot silently restart from zero.
 - **Capabilities stay advisory.** Capability narrowing is included as advice in
   the dynamic context; runtime permission enforcement remains OpenCode's job.
+
+### Mission and session
+
+**Session is disposable execution state. Mission is durable product state.**
+
+A session (`state.json`, keyed by the OpenCode session id) is bounded, evicted
+and recoverable-to-empty: it may die, be compacted, replaced or rolled over at
+any time. A Mission is the versioned record of one admitted task and lives
+outside that lifetime:
+
+- **Identity.** `mission_id` is the existing deterministic task id, derived
+  from the admitted task text and never from a session, so the same Mission
+  identity is recovered across session changes, restarts and rebinds.
+- **Binding.** The current OpenCode session is `session_id` on the Mission:
+  replaceable execution metadata, not identity. A fresh session that admits the
+  same task binds to the same Mission and is seeded from it, keeping findings,
+  attempts, checkpoint references and the exact next action.
+- **Lifecycle.** `Active` is the only non-terminal status; `Completed`,
+  `Failed` and `Cancelled` are unambiguous terminal states with a persisted
+  reason. A conflicting transition fails explicitly; re-admitting a terminal
+  task starts the next `generation` with fresh progress and retained history.
+- **Idempotency.** A bounded history records consequential transitions
+  (admission, binding, `ExploreToBuild`, `BuildToVerify`, `VerifyToDebug`,
+  `DebugToBuild`, terminal states). Each event has a deterministic identity, so
+  replaying the same transition is a no-op instead of a duplicate effect.
+- **Persistence.** One atomically written file per Mission under
+  `.opencode-gear/orchestration/missions/<mission_id>.json`, with an explicit
+  `schema_version`; unknown versions are quarantined, never silently adopted.
+  Checkpoints stay the shared evidence store — Missions store references to
+  them, not copies. Sessions predate Missions and adopt one lazily on their
+  next touch, keeping their progress.
 
 > **Refresh policy.** OCG injects the full repository context snapshot on the
 > first Lead prompt of a session. On OpenCode v1 the snapshot is persisted into
@@ -358,8 +394,9 @@ JavaScript (transport only)
 > verification state), the new snapshot is supplied at the next injection point
 > and becomes the new session baseline.
 
-State lives under `.opencode-gear/orchestration/` and the adapter under
-`.opencode-gear/orchestration/plugin/`; both are ignored local state.
+State lives under `.opencode-gear/orchestration/` (sessions in `state.json`,
+Missions in `missions/`) and the adapter under
+`.opencode-gear/orchestration/plugin/`; all of it is ignored local state.
 
 ## Verification, distillation and checkpoints
 

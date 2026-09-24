@@ -1042,7 +1042,8 @@ State layout, alongside the managed runtime:
   cache/context/*.json        fine-grained plan cache
   logs/*.log                  raw verification logs (never swept by cache clean)
   checkpoints/*.json          phase checkpoints (inspectable JSON)
-  orchestration/state.json    bounded controller state (phases, attempts, findings)
+  orchestration/state.json    disposable session execution state
+  orchestration/missions/     durable Mission product state (per task)
   orchestration/plugin/       generated OpenCode JS adapter (file:// plugin)
   telemetry/events.jsonl      local-only telemetry events (inspectable JSONL)
 ```

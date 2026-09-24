@@ -8,12 +8,22 @@
 //!
 //! State lives under `.opencode-gear/orchestration/` (ignored local state) and
 //! checkpoints stay under `.opencode-gear/checkpoints/`.
+//!
+//! Two different lifetimes share that directory:
+//!
+//! - **Sessions are disposable execution state** (`state.json`): bounded,
+//!   evicted, keyed by the OpenCode session id, recoverable-to-empty on
+//!   corruption.
+//! - **Missions are durable product state** (`missions/<mission_id>.json`):
+//!   the versioned record of one admitted task, independent of any session,
+//!   strictly versioned and quarantined on corruption.
 
 pub mod bridge;
 pub mod checkpoint;
 pub mod config;
 pub mod controller;
 pub mod handoff;
+pub mod mission;
 pub mod plugin;
 pub mod projection;
 pub mod state;
@@ -26,6 +36,10 @@ pub use controller::{
 pub use handoff::{
     HandoffFinding, HandoffVerification, ModelHandoffCapsule, ProjectionInput, Role, Severity,
     Transition,
+};
+pub use mission::{
+    Mission, MissionEvent, MissionEventKind, MissionStatus, MissionSummary, NextAction,
+    MISSION_SCHEMA_VERSION,
 };
 pub use state::{
     Attempts, OrchestrationPhase, OrchestrationState, RepositoryBaseline, SessionState,
