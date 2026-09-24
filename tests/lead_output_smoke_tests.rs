@@ -21,8 +21,9 @@ mod common;
 
 use common::TestDir;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn node_or_skip(test: &str) -> bool {
     let available = Command::new("node")
@@ -122,6 +123,46 @@ fn project(dir: &TestDir) -> PathBuf {
     project
 }
 
+fn admit_root(dir: &TestDir, project: &Path, session_id: &str) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ocg"))
+        .args(["__bridge", "session.prompt", "--project"])
+        .arg(project)
+        .env("OPENCODE_GEAR_PROJECT", project)
+        .env("OPENCODE_GEAR_ORCHESTRATION_ENABLED", "1")
+        .env("OPENCODE_GEAR_REPORTS_LATEST_LEAD_OUTPUT", "1")
+        .env("OPENCODE_GEAR_USER_CONFIG", dir.join("no-user.yaml"))
+        .env(
+            "OPENCODE_GEAR_PROJECT_CONFIG",
+            project.join(".opencode-gear.yaml"),
+        )
+        .env("HOME", dir.join("home"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn session.prompt bridge");
+    child
+        .stdin
+        .as_mut()
+        .expect("session.prompt stdin")
+        .write_all(
+            &serde_json::to_vec(&serde_json::json!({
+                "session_id": session_id,
+                "text": "capture the current root execution"
+            }))
+            .expect("serialize session.prompt"),
+        )
+        .expect("write session.prompt");
+    let output = child.wait_with_output().expect("wait for session.prompt");
+    assert!(
+        output.status.success(),
+        "session.prompt bridge failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("parse admission");
+    assert_eq!(value["ok"], serde_json::json!(true), "{value}");
+}
+
 #[test]
 fn the_generated_v2_adapter_produces_the_raw_latest_lead_output_file() {
     if !node_or_skip("the_generated_v2_adapter_produces_the_raw_latest_lead_output_file") {
@@ -129,6 +170,7 @@ fn the_generated_v2_adapter_produces_the_raw_latest_lead_output_file() {
     }
     let dir = TestDir::new();
     let project = project(&dir);
+    admit_root(&dir, &project, "root");
 
     // Materialize the real adapter through the exact launch path.
     let plugin_path = opencode_gear::orchestration::plugin::materialize_v2_with(
@@ -286,6 +328,7 @@ fn only_a_completed_root_lead_response_replaces_the_latest_output() {
     }
     let dir = TestDir::new();
     let project = project(&dir);
+    admit_root(&dir, &project, "ses_root");
     let plugin_path = opencode_gear::orchestration::plugin::materialize_v2_with(
         &project,
         opencode_gear::runtime::compat::v2_adapter().plugin_source(),
@@ -387,7 +430,7 @@ stream.push(stepStarted("ses_root", "msg_failed", "lead-low"));
 stream.push(textEnded("ses_root", "msg_failed", 0, "FAILED"));
 stream.push(executionFailed("ses_root"));
 // Turn 4: a worker and an unrelated agent complete but must never report.
-stream.push(stepStarted("ses_worker", "msg_worker", "ocg-explore"));
+stream.push(stepStarted("ses_worker", "msg_worker", "build"));
 stream.push(textEnded("ses_worker", "msg_worker", 0, "WORKER"));
 stream.push(stepEnded("ses_worker", "msg_worker", "stop"));
 stream.push(stepStarted("ses_other", "msg_other", "general"));
@@ -398,7 +441,7 @@ await new Promise((resolve) => setTimeout(resolve, 500));
 const afterBad = readTarget();
 
 // Turn 5: the next genuinely completed root Lead response replaces it.
-stream.push(stepStarted("ses_root", "msg_good2", "lead-mid"));
+stream.push(stepStarted("ses_root", "msg_good2", "build"));
 stream.push(textEnded("ses_root", "msg_good2", 0, "GOOD-TWO"));
 stream.push(stepEnded("ses_root", "msg_good2", "stop"));
 const second = await waitFor("GOOD-TWO");

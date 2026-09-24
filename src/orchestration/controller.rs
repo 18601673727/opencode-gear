@@ -275,6 +275,17 @@ impl<'a> Controller<'a> {
         &self.root
     }
 
+    /// Whether `execution_id` is the Mission's current durable runtime
+    /// execution binding. Raw runtime agent names are deliberately not part of
+    /// this decision: an OpenCode session may legitimately change its selected
+    /// agent while remaining the same root execution.
+    pub fn is_current_execution(&self, execution_id: &RuntimeExecutionId) -> Result<bool> {
+        let Some(mission) = mission::find_by_session(&self.root, execution_id.as_str())? else {
+            return Ok(false);
+        };
+        Ok(mission.runtime_execution_id().as_ref() == Some(execution_id))
+    }
+
     pub fn config(&self) -> &OrchestrationConfig {
         &self.config
     }

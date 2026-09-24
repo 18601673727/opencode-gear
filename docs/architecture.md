@@ -442,10 +442,10 @@ outside that lifetime:
 ### Context pressure and same-generation rollover
 
 The context governor is a small, artifact-backed layer above the Mission. It
-observes one runtime message at the completed root-Lead boundary, after the
-output event has been handled and the disposable execution view has been
-synchronized. The OpenCode V2 adapter supplies the normalized observation; the
-policy layer does not know its HTTP or JSON shape:
+observes one runtime message at the completed current-root-execution boundary,
+after the output event has been handled and the disposable execution view has
+been synchronized. The OpenCode V2 adapter supplies the normalized observation;
+the policy layer does not know its HTTP or JSON shape:
 
 ```text
 session.step.ended(stop)
@@ -467,10 +467,15 @@ session.step.ended(stop)
   request. Thresholds require a trustworthy runtime model limit reported by the
   adapter; an optional absolute cap can operate without one. No percentage is
   fabricated.
+- Latest Lead Output is a replaceable projection of the latest completed
+  assistant text from the Mission's current durable runtime execution. The raw
+  OpenCode agent name is diagnostic only: a root execution that reports `build`
+  is eligible, while a worker session or stale pre-cutover execution is not.
+  The projection is atomic and fail-soft; it never changes Mission state.
 - A required observation at an unsafe boundary is durably marked pending. Only
-  a completed root-Lead `stop` after output handling is a safe boundary. Tool
-  errors, partial output, missing clients and `tool-calls` steps do not claim
-  safety.
+  a completed current-root-execution `stop` after output handling is a safe
+  boundary. Tool errors, partial output, missing clients and `tool-calls` steps
+  do not claim safety.
 - The target is created explicitly rather than through `resolve_session`. Its
   agent/model/variant are selected and read back, the target session identity
   is verified, and the launched V2 client is given that `--session` target.

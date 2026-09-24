@@ -20,7 +20,7 @@ use crate::orchestration::handoff::Role;
 use crate::process::CaptureRunner;
 use crate::reports::ReportsConfig;
 use crate::runtime::lifecycle::{
-    RuntimeAdapter, RuntimeContextEvent, RuntimeContextUsage, RuntimeProfile,
+    RuntimeAdapter, RuntimeContextEvent, RuntimeContextUsage, RuntimeExecutionId, RuntimeProfile,
 };
 use crate::telemetry::{self, Event, OrchestrationMetrics, Outcome, TelemetryConfig};
 use serde_json::{json, Value};
@@ -276,20 +276,39 @@ impl<'a> BridgeContext<'a> {
                 task_type: "context".to_string(),
             };
         };
-        if !agent.starts_with("lead-") {
-            return BridgeOutcome {
-                value: json!({
-                    "ok": true,
-                    "event": "context.observe",
-                    "ignored": true,
-                    "reason": "context pressure is observed only for a root Lead session",
-                }),
-                metrics: OrchestrationMetrics::default(),
-                outcome: Outcome::Unknown,
-                role: Some(agent.to_string()),
-                session_id: Some(session),
-                task_type: "context".to_string(),
-            };
+        let execution_id = RuntimeExecutionId::new(session.clone());
+        match self.controller.is_current_execution(&execution_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                return BridgeOutcome {
+                    value: json!({
+                        "ok": true,
+                        "event": "context.observe",
+                        "ignored": true,
+                        "reason": "context pressure is observed only for the current Mission execution",
+                    }),
+                    metrics: OrchestrationMetrics::default(),
+                    outcome: Outcome::Unknown,
+                    role: Some(agent.to_string()),
+                    session_id: Some(session),
+                    task_type: "context".to_string(),
+                }
+            }
+            Err(_) => {
+                return BridgeOutcome {
+                    value: json!({
+                        "ok": true,
+                        "event": "context.observe",
+                        "ignored": true,
+                        "reason": "current Mission execution identity is unavailable",
+                    }),
+                    metrics: OrchestrationMetrics::default(),
+                    outcome: Outcome::Unknown,
+                    role: Some(agent.to_string()),
+                    session_id: Some(session),
+                    task_type: "context".to_string(),
+                }
+            }
         }
         if !self.controller.config().context_governor.enabled {
             let observation = ContextObservation {
@@ -613,16 +632,16 @@ impl<'a> BridgeContext<'a> {
     }
 
     /// `lead.output` (OpenCode V2 event stream): persist the raw user-visible
-    /// text of one *completed* root Lead assistant message.
+    /// text of one completed assistant step from the Mission's current root
+    /// execution. The raw OpenCode agent name is diagnostic metadata, not the
+    /// authority for root-ness; the durable Mission binding decides that.
+    /// Worker sessions and stale pre-cutover executions are therefore rejected
+    /// without confusing an OpenCode agent name with an OCG role.
     ///
-    /// The adapter decides completion and only ever reports OCG Lead agents, but
-    /// the bridge re-checks both: a worker (`ocg-*`), an unknown agent and an
-    /// empty payload are refused, so no other session can overwrite the file.
     /// The write itself is atomic and every failure is soft — a broken report
     /// must never break a session.
     fn lead_output(&self, payload: &Value) -> BridgeOutcome {
         let session_id = session_id(payload);
-        let agent = payload.get("agent").and_then(Value::as_str).unwrap_or("");
         let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
         let reject = |message: &str, outcome: Outcome| BridgeOutcome {
             value: json!({"ok": false, "error": message}),
@@ -642,14 +661,19 @@ impl<'a> BridgeContext<'a> {
                 task_type: "report".to_string(),
             };
         }
-        if !agent.starts_with("lead-") {
-            return reject(
-                "lead.output is only accepted from a root Lead agent",
-                Outcome::Unknown,
-            );
-        }
         if text.trim().is_empty() {
             return reject("empty lead.output payload", Outcome::Unknown);
+        }
+        let execution_id = RuntimeExecutionId::new(session_id.clone());
+        match self.controller.is_current_execution(&execution_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                return reject(
+                    "lead.output is not associated with the current Mission execution",
+                    Outcome::Unknown,
+                )
+            }
+            Err(error) => return reject(&safe_error(&error.to_string()), Outcome::Failure),
         }
         match crate::reports::write_latest_lead_output(self.controller.root(), text) {
             Ok(path) => BridgeOutcome {
@@ -919,6 +943,7 @@ mod tests {
     use crate::clock::FixedClock;
     use crate::context::ContextConfig;
     use crate::orchestration::config::OrchestrationConfig;
+    use crate::orchestration::mission;
     use crate::process::{FakeCaptureRunner, FakeGitHost};
     use crate::verification::config::VerificationConfig;
 
@@ -994,6 +1019,13 @@ mod tests {
         BridgeContext::new(controller, runner, TelemetryConfig::disabled()).with_reports(reports)
     }
 
+    fn admit_report_mission<'a>(controller: &Controller<'a>, session: &str) -> String {
+        controller
+            .admit_user_task(session, "latest output identity regression")
+            .expect("admit report Mission")
+            .task_id
+    }
+
     #[test]
     fn context_observation_without_a_runtime_is_unknown_and_fail_soft() {
         let dir = tempfile::tempdir().unwrap();
@@ -1026,6 +1058,31 @@ mod tests {
     }
 
     #[test]
+    fn context_observation_uses_the_current_mission_binding_for_a_build_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = FakeGitHost::new();
+        let clock = FixedClock::new(1);
+        let controller = controller(dir.path(), &git, &clock, VerificationConfig::default());
+        let runner = FakeCaptureRunner::new();
+        let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+        admit_report_mission(&controller, "root");
+        let value = bridge.dispatch(
+            "context.observe",
+            &json!({
+                "session_id": "root",
+                "event_id": "build-context",
+                "agent": "build",
+                "finish": "stop",
+                "safe_boundary": true,
+                "output_persisted": true,
+                "tokens": {"input": 10, "cache": {"read": 0}},
+            }),
+        );
+        assert_eq!(value["ok"], json!(true), "{value}");
+        assert_eq!(value["ignored"], json!(null));
+    }
+
+    #[test]
     fn lead_output_persists_the_raw_text_byte_verbatim() {
         let dir = tempfile::tempdir().unwrap();
         let git = FakeGitHost::new();
@@ -1033,6 +1090,7 @@ mod tests {
         let controller = controller(dir.path(), &git, &clock, VerificationConfig::default());
         let runner = FakeCaptureRunner::new();
         let bridge = bridge_with_reports(&controller, &runner, ReportsConfig::default());
+        admit_report_mission(&controller, "s");
         let text = "# Final answer\n\n- one\n- two\n\n```rust\nfn done() {}\n```\n";
         let value = bridge.dispatch(
             "lead.output",
@@ -1045,24 +1103,137 @@ mod tests {
     }
 
     #[test]
-    fn lead_output_refuses_worker_and_non_ocg_agents() {
+    fn lead_output_accepts_the_current_root_even_when_its_agent_is_build() {
         let dir = tempfile::tempdir().unwrap();
         let git = FakeGitHost::new();
         let clock = FixedClock::new(1);
         let controller = controller(dir.path(), &git, &clock, VerificationConfig::default());
         let runner = FakeCaptureRunner::new();
         let bridge = bridge_with_reports(&controller, &runner, ReportsConfig::default());
-        for agent in ["ocg-build", "ocg-verify", "build", ""] {
+        admit_report_mission(&controller, "root");
+        let value = bridge.dispatch(
+            "lead.output",
+            &json!({"session_id": "root", "agent": "build", "text": "root build output\n"}),
+        );
+        assert_eq!(value["ok"], json!(true), "{value}");
+        assert_eq!(
+            std::fs::read_to_string(crate::reports::latest_lead_output_path(dir.path())).unwrap(),
+            "root build output\n"
+        );
+    }
+
+    #[test]
+    fn lead_output_follows_the_current_mission_binding_across_rollover_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = FakeGitHost::new();
+        let clock = FixedClock::new(1);
+        let controller = controller(dir.path(), &git, &clock, VerificationConfig::default());
+        let runner = FakeCaptureRunner::new();
+        let bridge = bridge_with_reports(&controller, &runner, ReportsConfig::default());
+        let mission_id = admit_report_mission(&controller, "execution-a");
+
+        let first = bridge.dispatch(
+            "lead.output",
+            &json!({"session_id": "execution-a", "agent": "lead-mid", "text": "A good\n"}),
+        );
+        assert_eq!(first["ok"], json!(true), "{first}");
+
+        let mut mission = mission::load(dir.path(), &mission_id).unwrap().unwrap();
+        mission
+            .request_rollover("execution-a", "report-rollover", "context", 2)
+            .unwrap();
+        mission
+            .mark_rollover_prepared("report-rollover", 3)
+            .unwrap();
+        mission
+            .mark_rollover_target_ready("report-rollover", "execution-b", 4)
+            .unwrap();
+        // Before cutover, A is still the authoritative current execution.
+        mission::save(dir.path(), &mission).unwrap();
+        let before_cutover = bridge.dispatch(
+            "lead.output",
+            &json!({"session_id": "execution-a", "agent": "build", "text": "A still current\n"}),
+        );
+        assert_eq!(before_cutover["ok"], json!(true), "{before_cutover}");
+        assert_eq!(
+            std::fs::read_to_string(crate::reports::latest_lead_output_path(dir.path())).unwrap(),
+            "A still current\n"
+        );
+
+        let mut mission = mission::load(dir.path(), &mission.mission_id)
+            .unwrap()
+            .unwrap();
+        mission
+            .bind_rollover_session("report-rollover", "execution-a", "execution-b", 5)
+            .unwrap();
+        mission::save(dir.path(), &mission).unwrap();
+
+        let stale = bridge.dispatch(
+            "lead.output",
+            &json!({"session_id": "execution-a", "agent": "lead-mid", "text": "stale A\n"}),
+        );
+        assert_eq!(stale["ok"], json!(false), "{stale}");
+        assert_eq!(
+            std::fs::read_to_string(crate::reports::latest_lead_output_path(dir.path())).unwrap(),
+            "A still current\n"
+        );
+
+        let current = bridge.dispatch(
+            "lead.output",
+            &json!({"session_id": "execution-b", "agent": "build", "text": "B current\n"}),
+        );
+        assert_eq!(current["ok"], json!(true), "{current}");
+        assert_eq!(
+            std::fs::read_to_string(crate::reports::latest_lead_output_path(dir.path())).unwrap(),
+            "B current\n"
+        );
+
+        // A fresh bridge/controller instance reads the durable Mission binding;
+        // no disposable state or raw agent name is needed for recovery.
+        let clock_after_restart = FixedClock::new(6);
+        let controller_after_restart = Controller::new(
+            dir.path(),
+            OrchestrationConfig::default(),
+            ContextConfig::default(),
+            CapabilityConfig::default(),
+            VerificationConfig::default(),
+            &git,
+            &clock_after_restart,
+        );
+        let bridge_after_restart =
+            bridge_with_reports(&controller_after_restart, &runner, ReportsConfig::default());
+        let recovered = bridge_after_restart.dispatch(
+            "lead.output",
+            &json!({"session_id": "execution-b", "agent": "build", "text": "B recovered\n"}),
+        );
+        assert_eq!(recovered["ok"], json!(true), "{recovered}");
+        assert_eq!(
+            std::fs::read_to_string(crate::reports::latest_lead_output_path(dir.path())).unwrap(),
+            "B recovered\n"
+        );
+    }
+
+    #[test]
+    fn lead_output_refuses_non_current_worker_sessions_even_when_agent_is_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = FakeGitHost::new();
+        let clock = FixedClock::new(1);
+        let controller = controller(dir.path(), &git, &clock, VerificationConfig::default());
+        let runner = FakeCaptureRunner::new();
+        let bridge = bridge_with_reports(&controller, &runner, ReportsConfig::default());
+        admit_report_mission(&controller, "root");
+        for (session, agent) in [("worker", "build"), ("worker", "ocg-build"), ("other", "")] {
             let value = bridge.dispatch(
                 "lead.output",
-                &json!({"session_id": "s", "agent": agent, "text": "worker text\n"}),
+                &json!({"session_id": session, "agent": agent, "text": "worker text\n"}),
             );
-            assert_eq!(value["ok"], json!(false), "agent {agent}");
+            assert_eq!(
+                value["ok"],
+                json!(false),
+                "session {session}, agent {agent}"
+            );
         }
-        assert!(
-            !crate::reports::latest_lead_output_path(dir.path()).exists(),
-            "a worker must never create the report"
-        );
+        assert!(!crate::reports::latest_lead_output_path(dir.path()).exists());
     }
 
     #[test]
@@ -1113,6 +1284,7 @@ mod tests {
         let controller = controller(dir.path(), &git, &clock, VerificationConfig::default());
         let runner = FakeCaptureRunner::new();
         let bridge = bridge_with_reports(&controller, &runner, ReportsConfig::default());
+        admit_report_mission(&controller, "s");
         let value = bridge.dispatch(
             "lead.output",
             &json!({"session_id": "s", "agent": "lead-high", "text": "cannot land\n"}),

@@ -1,17 +1,19 @@
 //! Raw persistence of the latest completed root Lead output.
 //!
 //! This is deliberately not a report *subsystem*: it is one small, fixed
-//! artifact. When OpenCode V2 finishes a root Lead assistant message, the
-//! generated adapter reports the raw user-visible text to the bridge and this
-//! module writes exactly that text — no headers, timestamps, ids, metadata,
-//! summaries or wrapper prose — to
+//! artifact. When OpenCode V2 finishes an assistant step in the current
+//! Mission execution, the generated adapter reports the raw user-visible text
+//! to the bridge and this module writes exactly that text — no headers,
+//! timestamps, ids, metadata, summaries or wrapper prose — to
 //! `<project>/.opencode-gear/reports/latest-lead-output.md`.
 //!
 //! Rules:
 //!
-//! - only a *completed* root Lead message is written (the adapter decides
-//!   completion; a streaming partial, an errored/interrupted message and every
-//!   worker or non-OCG agent are never reported);
+//! - only a *completed* assistant step from the Mission's current durable
+//!   root execution is written (the OpenCode adapter decides completion and
+//!   the bridge checks the current execution binding; a streaming partial, an
+//!   errored/interrupted message, a stale execution and every worker session
+//!   are never reported);
 //! - the text is stored byte-verbatim, so a reader can diff it directly;
 //! - the file is replaced atomically (temp file + rename) and an interrupted
 //!   write never truncates the previous completed output;
