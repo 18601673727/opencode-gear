@@ -47,6 +47,36 @@ impl From<&str> for RuntimeExecutionId {
     }
 }
 
+/// A stable, credential-free identity for one durable control-plane recovery
+/// operation.
+///
+/// The key is deliberately separate from [`RuntimeExecutionId`]: it names the
+/// logical create/reuse attempt, not the runtime object that the attempt may
+/// create.  Adapters that can recover an interrupted create can use this key
+/// to find the already-created object; adapters that cannot must return an
+/// explicit unsupported/unknown error rather than guessing from an agent name
+/// or selecting an unrelated root session.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RuntimeRecoveryKey {
+    pub mission_id: String,
+    pub generation: u32,
+    pub operation_id: String,
+}
+
+impl RuntimeRecoveryKey {
+    pub fn new(
+        mission_id: impl Into<String>,
+        generation: u32,
+        operation_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            mission_id: mission_id.into(),
+            generation,
+            operation_id: operation_id.into(),
+        }
+    }
+}
+
 /// A logical execution profile selected by policy and applied by an adapter.
 ///
 /// `profile_id` and `model_selector` are opaque to the control plane. The
@@ -147,6 +177,7 @@ impl RuntimeCapabilities {
 pub enum RuntimeCapability {
     ResolveExecution,
     CreateExecution,
+    RecoverExecution,
     InspectExecution,
     SelectProfile,
     ObserveContext,
@@ -159,6 +190,7 @@ impl RuntimeCapability {
         match self {
             Self::ResolveExecution => "resolve_execution",
             Self::CreateExecution => "create_execution",
+            Self::RecoverExecution => "recover_execution",
             Self::InspectExecution => "inspect_execution",
             Self::SelectProfile => "select_profile",
             Self::ObserveContext => "observe_context",
@@ -178,6 +210,7 @@ pub enum RuntimeErrorKind {
     Authentication,
     Transport,
     InvalidResponse,
+    ObservationFailed,
     ProfileSelection,
     ProviderCompletion,
 }
@@ -191,6 +224,7 @@ impl RuntimeErrorKind {
             Self::Authentication => "authentication",
             Self::Transport => "transport",
             Self::InvalidResponse => "invalid_response",
+            Self::ObservationFailed => "observation_failed",
             Self::ProfileSelection => "profile_selection",
             Self::ProviderCompletion => "provider_completion",
         }
@@ -420,6 +454,21 @@ pub trait RuntimeAdapter {
     fn create_execution(&mut self) -> RuntimeResult<RuntimeExecutionId> {
         Err(RuntimeError::unsupported(
             RuntimeCapability::CreateExecution,
+        ))
+    }
+
+    /// Find an execution previously created for `key`, if the adapter can
+    /// prove the association. `Ok(None)` means the adapter authoritatively
+    /// proved that no such side effect exists; an unsupported or indeterminate
+    /// lookup must return an error. The default is intentionally unsupported:
+    /// selecting a newest root session would risk promoting an unrelated
+    /// execution.
+    fn recover_execution(
+        &mut self,
+        _key: &RuntimeRecoveryKey,
+    ) -> RuntimeResult<Option<RuntimeExecution>> {
+        Err(RuntimeError::unsupported(
+            RuntimeCapability::RecoverExecution,
         ))
     }
 

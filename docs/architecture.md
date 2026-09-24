@@ -305,12 +305,67 @@ selection, context observation, continuation staging/resume, and persistent
 lookup; unsupported operations return a typed `RuntimeError` rather than a
 silent fallback. Errors retain a redacted detail alongside a small classification
 (unavailable, unsupported, missing execution, authentication, transport,
-invalid response, profile selection, or provider completion).
+invalid response, observation failure, profile selection, or provider
+completion).
 
-This boundary does not introduce a registry, scheduler, Resource Broker, second
-runtime, generic plugin protocol, or Reconciler. The existing OpenCode
+This boundary does not introduce a registry, scheduler, Resource Broker,
+second runtime, or generic plugin protocol. The existing OpenCode
 compatibility descriptor remains responsible for V1/V2 config, plugin, and
 launch differences.
+
+## Single-node reconciliation
+
+The first control loop is an explicit, bounded convergence pass:
+
+```text
+durable Mission state
+  + current durable RuntimeExecutionId binding
+  + one exact RuntimeAdapter observation
+  + durable rollover/recovery state
+        ↓
+pure ReconcileDecision (reason + action)
+        ↓
+at most one consequential action
+        ↓
+Mission CAS / recovery artifact persistence
+        ↓
+repeat on a later explicit tick
+```
+
+`Mission` remains durable semantic truth. `RuntimeAdapter` remains execution
+mechanics and observation. The `Reconciler` only compares those inputs and
+coordinates existing rollover/continuation mechanisms; it does not define new
+Mission phases or execute Explore/Build/Verify as a workflow. It is
+single-node, explicit-invocation, and has no resource selection.
+
+The planner is pure and transport-neutral. Its observation taxonomy keeps
+`exists`, authoritative `missing`, and `observation_failed` distinct from
+runtime-unavailable, authentication failure, transient transport failure, and
+unsupported capability. A failed inspection never becomes permission to create
+a replacement. The current durable `RuntimeExecutionId` is the only authority
+for an existing execution; raw OpenCode `agent`, provider, and model fields are
+provenance, not root/worker identity. A child or stale pre-cutover execution is
+never selected by a newest-session resolver.
+
+Recovery intent and a bounded Mission-derived continuation live in
+`.opencode-gear/orchestration/reconcile/`. Mission-local phase/receipt metadata
+is additive and CAS-protected. A create attempt is claimed before the runtime
+call; after a crash, the adapter must recover the exact operation or report an
+explicit indeterminate/unsupported result. The next ticks bind, prepare, stage,
+and resume the same target with one stable continuation identity. Repeated
+converged ticks settle to noop/wait without generation growth or duplicate
+semantic events. Incomplete rollover recovery always takes precedence over
+generic replacement. Terminal Missions are inert.
+
+`ocg reconcile --once` (also accepted as `ocg reconcile`) loads the durable
+Mission store, reports corrupt/quarantined entries, and performs one bounded
+pass. It does not start a daemon or enable background reconciliation. A missing
+runtime, unsupported lifecycle capability, or failed observation is reported
+and deferred/blocked rather than treated as execution absence. No credentials,
+service URLs, or raw runtime diagnostics are persisted in receipts.
+
+This is deliberately not Policy, Resource Broker, scheduler, distributed
+controller, second runtime, or a generic queue. Those remain deferred.
 
 
 Orchestration is the layer that carries a task across roles. It is deliberately
@@ -430,6 +485,12 @@ outside that lifetime:
   Checkpoints stay the shared evidence store — Missions store references to
   them, not copies. Sessions predate Missions and adopt one lazily on their
   next touch, keeping their progress.
+- **Reconcile authority.** The additive `reconcile` state on the Mission is
+  control-plane metadata for one bounded recovery operation, not semantic phase
+  state. It is claimed and persisted with the Mission revision/CAS; the
+  current binding remains the source of execution authority. Generic recovery
+  artifacts hold only the bounded Mission-derived continuation and stable
+  operation identity.
 - **UI/client failure is not Mission failure.** The OpenCode TUI, event
   subscription, bridge process and local V2 HTTP client are replaceable
   messengers. If one disappears, the bridge records an `unknown` observation
@@ -512,7 +573,8 @@ session.step.ended(stop)
 > and becomes the new session baseline.
 
 State lives under `.opencode-gear/orchestration/` (sessions in `state.json`,
-Missions in `missions/`) and the adapter under
+Missions in `missions/`, bounded generic recovery artifacts in `reconcile/`) and
+the adapter under
 `.opencode-gear/orchestration/plugin/`; all of it is ignored local state.
 
 ## Verification, distillation and checkpoints

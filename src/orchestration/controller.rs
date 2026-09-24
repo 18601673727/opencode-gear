@@ -40,7 +40,7 @@ use crate::orchestration::handoff::{
     HandoffFinding, HandoffVerification, ModelHandoffCapsule, ProjectionInput, Role, Severity,
 };
 use crate::orchestration::mission::{
-    self, Mission, MissionEventKind, MissionRolloverStatus, MissionStatus,
+    self, Mission, MissionEventKind, MissionReconcileStatus, MissionRolloverStatus, MissionStatus,
 };
 use crate::orchestration::projection::{self, ProjectionLimits};
 use crate::orchestration::rollover::{
@@ -283,7 +283,18 @@ impl<'a> Controller<'a> {
         let Some(mission) = mission::find_by_session(&self.root, execution_id.as_str())? else {
             return Ok(false);
         };
-        Ok(mission.runtime_execution_id().as_ref() == Some(execution_id))
+        Ok(self.is_current_execution_for(&mission, execution_id))
+    }
+
+    /// Check execution authority against an already-loaded Mission. This is
+    /// the allocation-free form used by reconciliation; it deliberately has
+    /// no runtime agent/model interpretation.
+    pub fn is_current_execution_for(
+        &self,
+        mission: &Mission,
+        execution_id: &RuntimeExecutionId,
+    ) -> bool {
+        mission.runtime_execution_id().as_ref() == Some(execution_id)
     }
 
     pub fn config(&self) -> &OrchestrationConfig {
@@ -341,7 +352,7 @@ impl<'a> Controller<'a> {
                 if let Some(mut old) = mission::load(&self.root, &previous.task_id)? {
                     if old.session_id.as_deref() == Some(session_key) {
                         old.release_session(now);
-                        mission::save(&self.root, &old)?;
+                        self.save_mission_preserving_reconcile(&old)?;
                     }
                 }
             }
@@ -377,6 +388,32 @@ impl<'a> Controller<'a> {
         Ok(mission)
     }
 
+    /// Save a Mission mutation without allowing an older bridge snapshot to
+    /// erase the reconciler's independently CAS-claimed control state. The
+    /// reconciler still owns all changes to that state; ordinary semantic
+    /// bridge writes remain compatible with the existing controller path.
+    fn save_mission_preserving_reconcile(&self, mission: &Mission) -> Result<()> {
+        let mut candidate = mission.clone();
+        if let Ok(Some(current)) = mission::load(&self.root, &candidate.mission_id) {
+            let has_control_state = current.generation == candidate.generation
+                && current.reconcile.status != MissionReconcileStatus::Idle
+                && current.reconcile.operation_id.is_some();
+            let incoming_is_explicit_conflict =
+                candidate.reconcile.status == MissionReconcileStatus::Conflict;
+            if has_control_state {
+                if !incoming_is_explicit_conflict {
+                    candidate.reconcile = current.reconcile;
+                }
+                // The bridge snapshot may predate the reconciler's CAS write.
+                // Never move the durable revision witness backwards while
+                // preserving (or explicitly invalidating) its control state.
+                candidate.revision = candidate.revision.max(current.revision.saturating_add(1));
+                candidate.updated_at = candidate.updated_at.max(current.updated_at);
+            }
+        }
+        mission::save(&self.root, &candidate).map(|_| ())
+    }
+
     /// Persist the Mission (durable product state, strict) before the session
     /// state (disposable execution state, fail-soft as before). The Mission
     /// is authoritative: a Mission write failure fails the call rather than
@@ -389,7 +426,7 @@ impl<'a> Controller<'a> {
         now: i64,
     ) -> Result<()> {
         if let Some(mission) = mission {
-            mission::save(&self.root, &mission)?;
+            self.save_mission_preserving_reconcile(&mission)?;
         }
         loaded.state.upsert(session, now);
         let _ = state::save(&self.root, &loaded.state);
@@ -628,7 +665,7 @@ impl<'a> Controller<'a> {
             let expected_revision = mission.revision;
             let expected_owner = mission.session_id.clone();
             if mission::load(&self.root, &mission.mission_id)?.is_none() {
-                mission::save(&self.root, &mission)?;
+                self.save_mission_preserving_reconcile(&mission)?;
             } else {
                 let _ = mission::save_if_revision(
                     &self.root,
@@ -1982,7 +2019,7 @@ impl<'a> Controller<'a> {
                 }
                 if let Some(mission) = &mut mission {
                     mission.sync_from_session(&session);
-                    mission::save(&self.root, mission)?;
+                    self.save_mission_preserving_reconcile(mission)?;
                 }
                 if touched {
                     session.updated_at = now;

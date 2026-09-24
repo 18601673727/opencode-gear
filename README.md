@@ -855,12 +855,22 @@ verify [fast|normal|full]
 tools <task...>     capability plan / Tool Context Firewall view (advisory)
 checkpoint list|show|save
                     inspect or record a versioned phase checkpoint
+reconcile [--once]  explicit single-node Mission convergence pass (no daemon)
 version             Gear, platform and the resolved OpenCode runtime
 doctor              read-only layering/config/OpenCode/proxy/runtime diagnosis
                     (--effective adds the live Configured/Resolved/Effective state)
 upgrade             self-update Gear, then maintain the active OpenCode
 help                print usage
 ```
+
+`ocg reconcile --once` loads durable Mission records without conversation
+history, observes each current `RuntimeExecutionId` through the runtime
+adapter, and performs at most one bounded convergence action per Mission. It
+reports observation failures separately from authoritative missing executions,
+keeps terminal Missions inert, and never uses raw OpenCode agent/model metadata
+as identity. The command is explicit and single-node; it does not start a
+background daemon. A missing runtime or unsupported lifecycle capability is
+reported as deferred/blocked rather than causing silent replacement.
 
 Inside the TUI, `Tab` / `Shift+Tab` cycle the three Lead agents. The cycle
 order depends on the active `default_agent`; the default configuration starts

@@ -33,6 +33,7 @@ pub use lifecycle::{
     RuntimeAdapter as RuntimeLifecycleAdapter, RuntimeCapabilities, RuntimeContextEvent,
     RuntimeContextObservation, RuntimeContinuation, RuntimeError, RuntimeErrorKind,
     RuntimeExecution, RuntimeExecutionId, RuntimeIdentity, RuntimeProfile, RuntimeProvenance,
+    RuntimeRecoveryKey,
 };
 pub use policy::{Channel, Fallback, RuntimePolicy};
 pub use resolve::{RuntimeManager, RuntimeReport, RuntimeSelection, RuntimeSource, UpgradeOutcome};

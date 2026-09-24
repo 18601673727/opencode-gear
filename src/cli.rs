@@ -190,6 +190,8 @@ pub enum Command {
     Verify(Vec<OsString>),
     Tools(Vec<OsString>),
     Checkpoint(Vec<OsString>),
+    /// Explicitly reconcile durable Missions once.
+    Reconcile(Vec<OsString>),
     /// Hidden/internal: the generated plugin's bridge. Never advertised.
     Bridge(Vec<OsString>),
     Version,
@@ -379,7 +381,7 @@ where
             // error it always had.
             if matches!(
                 command_token.as_deref(),
-                Some("checkpoint") | Some("config")
+                Some("checkpoint") | Some("config") | Some("reconcile")
             ) {
                 rest.push(args[index].clone());
                 index += 1;
@@ -437,6 +439,7 @@ where
         Some("verify") => Command::Verify(rest),
         Some("tools") => Command::Tools(rest),
         Some("checkpoint") => Command::Checkpoint(rest),
+        Some("reconcile") => Command::Reconcile(rest),
         Some("__bridge") => Command::Bridge(rest),
         Some("version") => Command::Version,
         Some("doctor") => Command::Doctor,
@@ -494,6 +497,7 @@ Commands:
   tools <task...>       show the capability plan / Tool Context Firewall view
   checkpoint list|show|save
                         inspect, or create, a phase checkpoint
+  reconcile [--once]    reconcile durable Missions once (explicit; no daemon)
   version               report Gear, platform and the resolved OpenCode runtime
   doctor                diagnose layering, Lead contracts, OpenCode, proxy and runtime (read-only)
   upgrade               self-update Gear, then maintain the active OpenCode
@@ -657,7 +661,7 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
         env.throttle.as_deref(),
     );
 
-    if cli.dry_run {
+    if cli.dry_run && !matches!(cli.command, Command::Reconcile(_)) {
         // Runtime-facing output: a dry-run must print the same contract a real
         // launch would use, so the runtime family is resolved exactly like
         // launch/doctor/models resolve it.
@@ -822,12 +826,142 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
             boundary.require(&invocation_dir).map_err(Failure::Gear)?;
             checkpoint_command(&effective, &project_root, args, cli.pretty)
         }
+        Command::Reconcile(args) => {
+            boundary.require(&invocation_dir).map_err(Failure::Gear)?;
+            reconcile_command(
+                &effective,
+                &project_root,
+                &invocation_dir,
+                &level,
+                &env,
+                args,
+                cli.pretty,
+            )
+        }
         Command::Bridge(args) => {
             boundary.require(&invocation_dir).map_err(Failure::Gear)?;
             bridge_command(&effective, &project_root, args, &env)
         }
         Command::Upgrade => upgrade_command(&effective, &project_root, &env, cli.disable_proxy),
     }
+}
+
+/// `ocg reconcile [--once]`: one bounded, explicit convergence pass over the
+/// durable Mission store. The command does not start a daemon or a background
+/// worker. A live V2 client is used only when the invocation already has a
+/// runtime endpoint or OpenCode's registered service is available; otherwise
+/// Missions are reported as runtime-unavailable and no replacement is made.
+fn reconcile_command(
+    effective: &config::Effective,
+    project_root: &Path,
+    invocation_dir: &Path,
+    level: &str,
+    env: &Env,
+    args: &[OsString],
+    pretty: bool,
+) -> std::result::Result<i32, Failure> {
+    for arg in args {
+        if arg != "--once" {
+            return Err(usage_failure(format!(
+                "unknown reconcile option: {} (only --once is supported)",
+                arg.to_string_lossy()
+            )));
+        }
+    }
+    validate::require_valid(effective).map_err(Failure::Gear)?;
+    let orchestration = crate::orchestration::OrchestrationConfig::from_config(&effective.data)
+        .map_err(Failure::Gear)?;
+    if !orchestration.enabled {
+        let value = json!({"disabled": true, "results": [], "issues": []});
+        println!(
+            "{}",
+            if pretty {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
+            } else {
+                serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+            }
+        );
+        return Ok(0);
+    }
+    let context = ContextConfig::from_config(&effective.data).map_err(Failure::Gear)?;
+    let capabilities = CapabilityConfig::from_config(&effective.data).map_err(Failure::Gear)?;
+    let verification = VerificationConfig::from_config(&effective.data).map_err(Failure::Gear)?;
+    let contract = model::lead_contract(&effective.data, level).map_err(Failure::Gear)?;
+    let profile = LeadSelection::from_contract(&contract).runtime_profile();
+    let git = SystemGitHost;
+    let clock = SystemClock;
+    let controller = crate::orchestration::controller::Controller::new(
+        project_root,
+        orchestration,
+        context,
+        capabilities,
+        verification,
+        &git,
+        &clock,
+    );
+
+    let print_run = |run: crate::orchestration::reconcile::ReconcileRun| {
+        let value = serde_json::to_value(&run).map_err(|error| {
+            Failure::Gear(GearError::config(format!(
+                "cannot serialize reconcile result: {error}"
+            )))
+        })?;
+        println!(
+            "{}",
+            if pretty {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
+            } else {
+                serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+            }
+        );
+        Ok(if run.has_failures() { 1 } else { 0 })
+    };
+
+    if let (Some(url), Some(password)) = (
+        env.v2_server_url.as_deref(),
+        env.v2_server_password.as_ref(),
+    ) {
+        let registration = compat::v2_client::ServiceRegistration::new(url, password.expose());
+        match compat::v2_client::V2SessionClient::connect(
+            &registration,
+            env.v2_directory
+                .clone()
+                .unwrap_or_else(|| invocation_dir.to_string_lossy().into_owned()),
+        ) {
+            Ok(mut client) => {
+                let mut reconciler = crate::orchestration::reconcile::Reconciler::new(
+                    &controller,
+                    &mut client,
+                    profile,
+                );
+                return print_run(reconciler.reconcile_once());
+            }
+            Err(_) => {
+                let mut reconciler = crate::orchestration::reconcile::Reconciler::without_runtime(
+                    &controller,
+                    profile,
+                );
+                return print_run(reconciler.reconcile_once());
+            }
+        }
+    }
+
+    // Discovery is a fallback for an explicitly invoked standalone pass. It is
+    // still an OpenCode V2 client and never a second runtime implementation.
+    if let Ok(registration) = compat::v2_client::ServiceRegistration::discover() {
+        if let Ok(mut client) = compat::v2_client::V2SessionClient::connect(
+            &registration,
+            invocation_dir.to_string_lossy().into_owned(),
+        ) {
+            let mut reconciler =
+                crate::orchestration::reconcile::Reconciler::new(&controller, &mut client, profile);
+            return print_run(reconciler.reconcile_once());
+        }
+    }
+
+    let mut reconciler =
+        crate::orchestration::reconcile::Reconciler::without_runtime(&controller, profile);
+    print_run(reconciler.reconcile_once())
 }
 
 /// The project template written by `ocg init`.

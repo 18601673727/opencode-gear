@@ -48,7 +48,7 @@ use crate::runtime::lifecycle::{
     RuntimeAdapter, RuntimeCapabilities, RuntimeContextEvent, RuntimeContextObservation,
     RuntimeContextUsage, RuntimeContinuation, RuntimeError, RuntimeErrorKind, RuntimeExecution,
     RuntimeExecutionId, RuntimeIdentity, RuntimeModelMetadata, RuntimeProfile, RuntimeProvenance,
-    RuntimeResult,
+    RuntimeRecoveryKey, RuntimeResult,
 };
 use serde_json::{json, Map, Value};
 use std::fmt;
@@ -722,6 +722,18 @@ fn runtime_error(error: GearError, default_kind: RuntimeErrorKind) -> RuntimeErr
         || lower.contains("timeout")
     {
         RuntimeErrorKind::Transport
+    } else if default_kind == RuntimeErrorKind::ExecutionMissing
+        && (lower.contains("http 404") || lower.contains("http 410"))
+    {
+        // Only an explicit not-found response proves execution absence. A
+        // server error or an unclassified failure must remain an observation
+        // failure/unavailable state, never authorize replacement.
+        RuntimeErrorKind::ExecutionMissing
+    } else if lower.contains("http 5")
+        || lower.contains("internal error")
+        || lower.contains("service unavailable")
+    {
+        RuntimeErrorKind::Unavailable
     } else if lower.contains("malformed")
         || lower.contains("valid json")
         || lower.contains("missing")
@@ -756,6 +768,9 @@ fn sanitize_runtime_detail(detail: &str, kind: RuntimeErrorKind) -> String {
             RuntimeErrorKind::Authentication => "runtime authentication was rejected".to_string(),
             RuntimeErrorKind::Transport => "runtime transport was unavailable".to_string(),
             RuntimeErrorKind::InvalidResponse => "runtime returned an invalid response".to_string(),
+            RuntimeErrorKind::ObservationFailed => {
+                "runtime observation was indeterminate".to_string()
+            }
             RuntimeErrorKind::ProfileSelection => {
                 "runtime profile selection or verification failed".to_string()
             }
@@ -861,6 +876,66 @@ impl RuntimeAdapter for V2SessionClient {
         V2SessionClient::create_fresh_session(self)
             .map(RuntimeExecutionId::new)
             .map_err(|error| runtime_error(error, RuntimeErrorKind::Unavailable))
+    }
+
+    fn recover_execution(
+        &mut self,
+        key: &RuntimeRecoveryKey,
+    ) -> RuntimeResult<Option<RuntimeExecution>> {
+        let path = format!(
+            "/api/session?directory={}&parentID=null&order=desc&limit=100",
+            encode_component(&self.directory)
+        );
+        let listed = self
+            .send("GET", &path, None)
+            .map_err(|error| runtime_error(error, RuntimeErrorKind::Unavailable))?;
+        let data = listed
+            .as_ref()
+            .and_then(|value| value.get("data"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                RuntimeError::new(
+                    RuntimeErrorKind::InvalidResponse,
+                    "runtime recovery listing did not contain a session array",
+                )
+            })?;
+        let mut matches = Vec::new();
+        for item in data {
+            let Some(id) = item.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let messages = self
+                .context_messages(id)
+                .map_err(|error| runtime_error(error, RuntimeErrorKind::Transport))?;
+            if messages.iter().any(|message| {
+                let Some(metadata) = message.get("metadata") else {
+                    return false;
+                };
+                metadata.get("marker").and_then(Value::as_str) == Some("OCG_RECONCILIATION")
+                    && metadata.get("mission_id").and_then(Value::as_str)
+                        == Some(key.mission_id.as_str())
+                    && metadata.get("generation").and_then(Value::as_u64)
+                        == Some(key.generation as u64)
+                    && metadata.get("operation_id").and_then(Value::as_str)
+                        == Some(key.operation_id.as_str())
+            }) {
+                matches.push(id.to_string());
+            }
+        }
+        match matches.as_slice() {
+            [] => Err(RuntimeError::new(
+                RuntimeErrorKind::ObservationFailed,
+                "interrupted execution creation has no authoritative recovery marker",
+            )),
+            [id] => Ok(Some(RuntimeExecution {
+                id: RuntimeExecutionId::new(id.clone()),
+                profile: None,
+            })),
+            _ => Err(RuntimeError::new(
+                RuntimeErrorKind::InvalidResponse,
+                "runtime recovery marker matched more than one root execution",
+            )),
+        }
     }
 
     fn inspect_execution(
@@ -1362,6 +1437,25 @@ mod tests {
             !message.contains("sk-live-should-not-leak"),
             "the response body must never be echoed: {message}"
         );
+    }
+
+    #[test]
+    fn inspection_requires_an_explicit_not_found_before_reporting_missing() {
+        let server_error = FakeTransport::with(vec![status(500, r#"{"_tag":"InternalError"}"#)]);
+        let error = RuntimeAdapter::inspect_execution(
+            &client(&server_error),
+            &RuntimeExecutionId::new(SESSION),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), RuntimeErrorKind::Unavailable);
+
+        let not_found = FakeTransport::with(vec![status(404, r#"{"_tag":"NotFound"}"#)]);
+        let error = RuntimeAdapter::inspect_execution(
+            &client(&not_found),
+            &RuntimeExecutionId::new(SESSION),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), RuntimeErrorKind::ExecutionMissing);
     }
 
     #[test]

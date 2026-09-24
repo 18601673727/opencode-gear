@@ -304,6 +304,126 @@ impl Default for MissionRolloverState {
     }
 }
 
+/// The small, durable state machine used by the single-node reconciler.
+///
+/// This is execution-control metadata, not Mission phase semantics. It records
+/// which idempotent recovery step has been claimed so a later tick can resume
+/// after a process crash without blindly repeating a runtime side effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionReconcileStatus {
+    #[default]
+    Idle,
+    Creating,
+    Created,
+    Bound,
+    Preparing,
+    Prepared,
+    Staging,
+    Staged,
+    Resuming,
+    Applied,
+    Failed,
+    Blocked,
+    Conflict,
+}
+
+impl MissionReconcileStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Creating => "creating",
+            Self::Created => "created",
+            Self::Bound => "bound",
+            Self::Preparing => "preparing",
+            Self::Prepared => "prepared",
+            Self::Staging => "staging",
+            Self::Staged => "staged",
+            Self::Resuming => "resuming",
+            Self::Applied => "applied",
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
+            Self::Conflict => "conflict",
+        }
+    }
+
+    pub fn is_inflight(self) -> bool {
+        matches!(
+            self,
+            Self::Creating
+                | Self::Created
+                | Self::Bound
+                | Self::Preparing
+                | Self::Prepared
+                | Self::Staging
+                | Self::Staged
+                | Self::Resuming
+        )
+    }
+}
+
+/// A bounded, privacy-safe explanation of the latest reconcile outcome. The
+/// control-plane enums live in the reconciler module; strings keep this
+/// additive Mission field independent of that module and preserve old records.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MissionReconcileReceipt {
+    pub generation: u32,
+    pub current_execution_id: Option<String>,
+    pub observed: String,
+    pub action: String,
+    pub reason: String,
+    pub result: String,
+    pub timestamp: i64,
+}
+
+/// Durable reconcile intent and its current local phase. The bounded
+/// continuation packet remains in the reconcile artifact, so Mission records do
+/// not grow with transcript or prompt content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MissionReconcileState {
+    pub status: MissionReconcileStatus,
+    pub operation_id: Option<String>,
+    pub base_execution_id: Option<String>,
+    pub target_execution_id: Option<String>,
+    pub continuation_id: Option<String>,
+    pub operation_count: u32,
+    /// Number of create attempts claimed for the current operation. A claim is
+    /// made before the runtime call so concurrent local ticks cannot both
+    /// create; after a crash the adapter recovery lookup decides whether the
+    /// claim reached the runtime.
+    pub create_attempt: u32,
+    pub failed_phase: Option<MissionReconcileStatus>,
+    pub retry_after: Option<i64>,
+    /// Observation failures use a separate bounded backoff so a missing
+    /// runtime cannot be confused with an authoritative missing execution.
+    pub observation_retry_after: Option<i64>,
+    pub observation_status: Option<String>,
+    pub last_error: Option<String>,
+    pub last_receipt: Option<MissionReconcileReceipt>,
+}
+
+impl Default for MissionReconcileState {
+    fn default() -> Self {
+        Self {
+            status: MissionReconcileStatus::Idle,
+            operation_id: None,
+            base_execution_id: None,
+            target_execution_id: None,
+            continuation_id: None,
+            operation_count: 0,
+            create_attempt: 0,
+            failed_phase: None,
+            retry_after: None,
+            observation_retry_after: None,
+            observation_status: None,
+            last_error: None,
+            last_receipt: None,
+        }
+    }
+}
+
 ///
 /// The task-scoped fields mirror the session's live execution view
 /// ([`SessionState`]); the controller syncs them at every mutation point.
@@ -362,6 +482,10 @@ pub struct Mission {
     /// version 1 and old records deserialize with `Idle`.
     #[serde(default)]
     pub rollover: MissionRolloverState,
+    /// Additive single-node reconcile intent. It is not phase semantics and is
+    /// ignored for terminal Missions.
+    #[serde(default)]
+    pub reconcile: MissionReconcileState,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -397,6 +521,7 @@ impl Default for Mission {
             history: Vec::new(),
             event_index: Vec::new(),
             rollover: MissionRolloverState::default(),
+            reconcile: MissionReconcileState::default(),
             created_at: 0,
             updated_at: 0,
         }
@@ -442,6 +567,202 @@ impl Mission {
         self.session_id.as_deref().map(RuntimeExecutionId::new)
     }
 
+    /// Start a new same-generation execution recovery operation. The Mission
+    /// remains the authority; this only claims the local reconcile state before
+    /// a runtime side effect is attempted.
+    pub fn begin_reconcile(
+        &mut self,
+        operation_id: &str,
+        base_execution_id: Option<&RuntimeExecutionId>,
+        now: i64,
+    ) -> bool {
+        if self.is_terminal() || operation_id.is_empty() {
+            return false;
+        }
+        if self.reconcile.status == MissionReconcileStatus::Conflict
+            || self.reconcile.status == MissionReconcileStatus::Blocked
+            || self.reconcile.status == MissionReconcileStatus::Failed
+        {
+            return false;
+        }
+        if self.reconcile.status.is_inflight()
+            || self.reconcile.operation_id.as_deref() == Some(operation_id)
+        {
+            return false;
+        }
+        self.reconcile = MissionReconcileState {
+            status: MissionReconcileStatus::Creating,
+            operation_id: Some(operation_id.to_string()),
+            base_execution_id: base_execution_id.map(|id| id.as_str().to_string()),
+            target_execution_id: None,
+            continuation_id: None,
+            operation_count: self.reconcile.operation_count.saturating_add(1),
+            create_attempt: 0,
+            failed_phase: None,
+            retry_after: None,
+            observation_retry_after: None,
+            observation_status: None,
+            last_error: None,
+            last_receipt: self.reconcile.last_receipt.clone(),
+        };
+        self.revision = self.revision.saturating_add(1);
+        self.updated_at = now;
+        true
+    }
+
+    /// Transition an already-claimed reconcile operation. The expected phase
+    /// makes a stale concurrent tick fail closed; callers still persist with
+    /// [`mission::save_if_revision`] at the Mission boundary.
+    pub fn transition_reconcile(
+        &mut self,
+        expected: MissionReconcileStatus,
+        next: MissionReconcileStatus,
+        target_execution_id: Option<&RuntimeExecutionId>,
+        now: i64,
+    ) -> bool {
+        if self.is_terminal() || self.reconcile.status != expected {
+            return false;
+        }
+        let next_target = target_execution_id
+            .map(|id| id.as_str().to_string())
+            .or_else(|| self.reconcile.target_execution_id.clone());
+        let changed =
+            self.reconcile.status != next || self.reconcile.target_execution_id != next_target;
+        self.reconcile.status = next;
+        self.reconcile.target_execution_id = next_target;
+        if next != MissionReconcileStatus::Failed {
+            self.reconcile.failed_phase = None;
+            self.reconcile.retry_after = None;
+            self.reconcile.observation_retry_after = None;
+            self.reconcile.observation_status = None;
+            self.reconcile.last_error = None;
+        }
+        if changed {
+            self.revision = self.revision.saturating_add(1);
+            self.updated_at = now;
+        }
+        changed
+    }
+
+    /// Claim one local create attempt for a `Creating` operation. The claim is
+    /// durable before the runtime call; a concurrent tick that loses the CAS
+    /// must perform recovery/observation instead of creating as well.
+    pub fn claim_reconcile_create(&mut self, now: i64) -> bool {
+        if self.is_terminal() || self.reconcile.status != MissionReconcileStatus::Creating {
+            return false;
+        }
+        self.reconcile.create_attempt = self.reconcile.create_attempt.saturating_add(1);
+        self.revision = self.revision.saturating_add(1);
+        self.updated_at = now;
+        true
+    }
+
+    /// Record a bounded observation-failure backoff without changing the
+    /// Mission's semantic or execution state.
+    pub fn defer_observation(&mut self, status: &str, retry_after: i64, now: i64) -> bool {
+        if self.is_terminal() || status.is_empty() {
+            return false;
+        }
+        let status = bounded_reconcile_text(status, 64);
+        let next = self
+            .reconcile
+            .observation_retry_after
+            .map(|current| current.max(retry_after))
+            .unwrap_or(retry_after);
+        let changed = self.reconcile.observation_retry_after != Some(next)
+            || self.reconcile.observation_status.as_deref() != Some(status.as_str());
+        if changed {
+            self.reconcile.observation_retry_after = Some(next);
+            self.reconcile.observation_status = Some(status);
+            self.revision = self.revision.saturating_add(1);
+            self.updated_at = now;
+        }
+        changed
+    }
+
+    /// Clear an observation backoff after an authoritative healthy observation.
+    pub fn clear_observation_defer(&mut self, now: i64) -> bool {
+        if self.is_terminal()
+            || (self.reconcile.observation_retry_after.is_none()
+                && self.reconcile.observation_status.is_none())
+        {
+            return false;
+        }
+        self.reconcile.observation_retry_after = None;
+        self.reconcile.observation_status = None;
+        self.revision = self.revision.saturating_add(1);
+        self.updated_at = now;
+        true
+    }
+
+    /// Mark a claimed operation retryable without changing its target or
+    /// generation. A stable continuation id is retained by the reconciler
+    /// artifact, so a retry cannot manufacture a new semantic continuation.
+    pub fn fail_reconcile(
+        &mut self,
+        expected: MissionReconcileStatus,
+        failed_phase: MissionReconcileStatus,
+        error: &str,
+        retry_after: Option<i64>,
+        now: i64,
+    ) -> bool {
+        if self.is_terminal() || self.reconcile.status != expected {
+            return false;
+        }
+        self.reconcile.status = MissionReconcileStatus::Failed;
+        self.reconcile.failed_phase = Some(failed_phase);
+        self.reconcile.retry_after = retry_after;
+        self.reconcile.last_error = Some(redact_reconcile_reason(error));
+        self.revision = self.revision.saturating_add(1);
+        self.updated_at = now;
+        true
+    }
+
+    /// Freeze a recovery that cannot safely proceed without an operator or a
+    /// changed runtime capability. This is deliberately not a Mission failure.
+    pub fn block_reconcile(&mut self, reason: &str, now: i64) -> bool {
+        if self.is_terminal()
+            || matches!(
+                self.reconcile.status,
+                MissionReconcileStatus::Blocked | MissionReconcileStatus::Conflict
+            )
+        {
+            return false;
+        }
+        self.reconcile.status = MissionReconcileStatus::Blocked;
+        self.reconcile.last_error = Some(redact_reconcile_reason(reason));
+        self.revision = self.revision.saturating_add(1);
+        self.updated_at = now;
+        true
+    }
+
+    /// Record a safe, bounded latest reconcile explanation. This is diagnostic
+    /// metadata, not a Mission event, and therefore cannot duplicate semantic
+    /// history on replay.
+    pub fn record_reconcile_receipt(&mut self, mut receipt: MissionReconcileReceipt) -> bool {
+        if self.is_terminal() {
+            return false;
+        }
+        receipt.observed = bounded_reconcile_text(&receipt.observed, 64);
+        receipt.action = bounded_reconcile_text(&receipt.action, 64);
+        receipt.reason = redact_reconcile_reason(&receipt.reason);
+        receipt.result = bounded_reconcile_text(&receipt.result, 32);
+        let changed = self.reconcile.last_receipt.as_ref().is_none_or(|previous| {
+            previous.generation != receipt.generation
+                || previous.current_execution_id != receipt.current_execution_id
+                || previous.observed != receipt.observed
+                || previous.action != receipt.action
+                || previous.reason != receipt.reason
+                || previous.result != receipt.result
+        });
+        if changed {
+            self.reconcile.last_receipt = Some(receipt.clone());
+            self.revision = self.revision.saturating_add(1);
+            self.updated_at = receipt.timestamp;
+        }
+        changed
+    }
+
     /// Supersede a recoverable rollover when a new explicit user session
     /// admission replaces an interrupted execution session. The old artifact
     /// remains on disk as a conflict record; the same Mission generation and
@@ -460,6 +781,19 @@ impl Mission {
         }
         let old_artifact = self.rollover.artifact_id.clone();
         self.rollover = MissionRolloverState::default();
+        // An explicit admission is a user-owned cutover. If an execution
+        // recovery was in flight for a different target, the reconciler must
+        // not later promote that stale target over the explicit binding, so
+        // freeze the operation as an explicit conflict. The direct rebind below
+        // would otherwise bypass `bind_session`'s in-flight guard.
+        if self.reconcile.status.is_inflight()
+            && self.reconcile.target_execution_id.as_deref() != Some(session_key)
+        {
+            self.reconcile.status = MissionReconcileStatus::Conflict;
+            self.reconcile.last_error = Some(redact_reconcile_reason(
+                "explicit session admission superseded reconcile recovery",
+            ));
+        }
         if let Some(artifact_id) = old_artifact {
             let event = self.event(
                 MissionEventKind::RolloverConflict,
@@ -578,6 +912,14 @@ impl Mission {
         if self.session_id.as_deref() == Some(session_key) {
             return false;
         }
+        if self.reconcile.status.is_inflight()
+            && self.reconcile.target_execution_id.as_deref() != Some(session_key)
+        {
+            self.reconcile.status = MissionReconcileStatus::Conflict;
+            self.reconcile.last_error = Some(redact_reconcile_reason(
+                "current execution binding changed during reconcile recovery",
+            ));
+        }
         self.session_id = Some(session_key.to_string());
         let event = self.event(
             MissionEventKind::SessionBound,
@@ -596,6 +938,12 @@ impl Mission {
     pub fn release_session(&mut self, now: i64) -> bool {
         if self.is_terminal() || self.session_id.is_none() {
             return false;
+        }
+        if self.reconcile.status.is_inflight() {
+            self.reconcile.status = MissionReconcileStatus::Conflict;
+            self.reconcile.last_error = Some(redact_reconcile_reason(
+                "current execution binding was released during reconcile recovery",
+            ));
         }
         self.session_id = None;
         let event = self.event(
@@ -1020,6 +1368,7 @@ impl Mission {
         self.last_diff_context = String::new();
         self.checkpoints.clear();
         self.rollover = MissionRolloverState::default();
+        self.reconcile = MissionReconcileState::default();
         let event = self.event(
             MissionEventKind::Admitted,
             "",
@@ -1171,6 +1520,21 @@ fn redact_reason(reason: &str) -> String {
     crate::telemetry::task::redact(reason)
 }
 
+fn redact_reconcile_reason(reason: &str) -> String {
+    bounded_reconcile_text(&crate::telemetry::task::redact(reason), 1024)
+}
+
+fn bounded_reconcile_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end])
+}
+
 /// A deterministic, safe event identity. Replays of the same logical
 /// transition produce the same id and are deduplicated by [`Mission::record`].
 fn event_id(mission_id: &str, kind: MissionEventKind, generation: u32, key: &str) -> String {
@@ -1222,6 +1586,17 @@ fn validate_mission(mission: &Mission) -> Result<()> {
     if mission.rollover.generation != 0 && mission.rollover.generation != mission.generation {
         return Err(GearError::config(
             "mission rollover state belongs to a different generation",
+        ));
+    }
+    if mission.reconcile.status != MissionReconcileStatus::Idle
+        && mission
+            .reconcile
+            .operation_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        return Err(GearError::config(
+            "mission reconcile state has no operation identity",
         ));
     }
     Ok(())

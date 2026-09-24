@@ -29,6 +29,7 @@ pub mod handoff;
 pub mod mission;
 pub mod plugin;
 pub mod projection;
+pub mod reconcile;
 pub mod rollover;
 pub mod state;
 
@@ -47,8 +48,14 @@ pub use handoff::{
     Transition,
 };
 pub use mission::{
-    Mission, MissionEvent, MissionEventKind, MissionRolloverState, MissionRolloverStatus,
-    MissionStatus, MissionSummary, NextAction, MISSION_SCHEMA_VERSION,
+    Mission, MissionEvent, MissionEventKind, MissionReconcileReceipt, MissionReconcileState,
+    MissionReconcileStatus, MissionRolloverState, MissionRolloverStatus, MissionStatus,
+    MissionSummary, NextAction, MISSION_SCHEMA_VERSION,
+};
+pub use reconcile::{
+    latest_artifact, load_artifact, plan, MissionStoreIssue, ObservationStatus, ReconcileAction,
+    ReconcileArtifact, ReconcileDecision, ReconcileInput, ReconcileOutcome, ReconcileResult,
+    ReconcileRun, RuntimeObservation, RECONCILE_SCHEMA_VERSION,
 };
 pub use rollover::{
     ContinuationPacket, LeadBinding, RolloverArtifact, RolloverStatus, ROLLOVER_SCHEMA_VERSION,
