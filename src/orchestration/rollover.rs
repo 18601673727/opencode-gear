@@ -14,7 +14,7 @@ use crate::orchestration::context_governor::{
 use crate::orchestration::handoff::{HandoffFinding, HandoffVerification};
 use crate::orchestration::mission::{Mission, NextAction};
 use crate::orchestration::state::{Attempts, OrchestrationPhase};
-use crate::runtime::compat::LeadSelection;
+use crate::runtime::lifecycle::RuntimeProfile;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -76,8 +76,9 @@ impl RolloverStatus {
     }
 }
 
-/// The sanitized Lead contract needed to prepare a target.  It contains no
-/// service URL, password, provider credential or raw runtime response.
+/// Legacy sanitized Lead projection retained for artifacts written before the
+/// runtime-neutral profile. It contains no service URL, password, provider
+/// credential or raw runtime response.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LeadBinding {
@@ -89,14 +90,36 @@ pub struct LeadBinding {
 }
 
 impl LeadBinding {
-    pub fn from_selection(selection: &LeadSelection) -> Self {
+    /// Compatibility projection for artifacts written before the runtime
+    /// lifecycle profile was introduced.
+    pub fn from_runtime_profile(profile: &RuntimeProfile) -> Self {
+        let (provider_id, model_id) = profile
+            .model_selector
+            .split_once('/')
+            .map(|(provider, model)| (provider.to_string(), model.to_string()))
+            .unwrap_or_else(|| (String::new(), profile.model_selector.clone()));
         Self {
-            level: Some(selection.level.clone()),
-            agent: selection.agent.clone(),
-            provider_id: selection.provider_id.clone(),
-            model_id: selection.model_id.clone(),
-            variant: selection.variant.clone(),
+            level: profile.level.clone(),
+            agent: profile.profile_id.clone(),
+            provider_id,
+            model_id,
+            variant: profile.variant.clone(),
         }
+    }
+
+    pub fn to_runtime_profile(&self) -> Option<RuntimeProfile> {
+        if self.agent.is_empty() || self.provider_id.is_empty() || self.model_id.is_empty() {
+            return None;
+        }
+        let mut profile = RuntimeProfile::new(
+            self.agent.clone(),
+            format!("{}/{}", self.provider_id, self.model_id),
+            self.variant.clone(),
+        );
+        if let Some(level) = &self.level {
+            profile = profile.with_level(level.clone());
+        }
+        Some(profile)
     }
 }
 
@@ -309,6 +332,12 @@ pub struct RolloverArtifact {
     pub continuation: ContinuationPacket,
     pub continuation_digest: String,
     pub continuation_bytes: usize,
+    /// Runtime-neutral profile used to prepare/recover the target. `lead` is
+    /// retained for compatibility with artifacts written before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_profile: Option<RuntimeProfile>,
+    /// Legacy OpenCode-shaped projection. New code reads `runtime_profile`
+    /// first and migrates old records through `runtime_profile()`.
     pub lead: Option<LeadBinding>,
     /// Mission `updated_at` observed before any target cutover.  It is a cheap
     /// optimistic-concurrency witness; the Mission itself remains authoritative.
@@ -339,6 +368,7 @@ impl Default for RolloverArtifact {
             continuation: ContinuationPacket::default(),
             continuation_digest: String::new(),
             continuation_bytes: 0,
+            runtime_profile: None,
             lead: None,
             base_mission_updated_at: 0,
             base_mission_revision: 0,
@@ -428,6 +458,7 @@ impl RolloverArtifact {
             continuation,
             continuation_digest,
             continuation_bytes,
+            runtime_profile: None,
             lead,
             base_mission_updated_at: mission.updated_at,
             base_mission_revision: mission.revision,
@@ -447,6 +478,14 @@ impl RolloverArtifact {
     pub fn set_base_mission(&mut self, mission: &Mission) {
         self.base_mission_updated_at = mission.updated_at;
         self.base_mission_revision = mission.revision;
+    }
+
+    /// Return the neutral profile, accepting the legacy Lead projection from
+    /// artifacts written by the previous durable implementation.
+    pub fn runtime_profile(&self) -> Option<RuntimeProfile> {
+        self.runtime_profile
+            .clone()
+            .or_else(|| self.lead.as_ref().and_then(LeadBinding::to_runtime_profile))
     }
 
     pub fn mark_target_ready(
@@ -1063,6 +1102,37 @@ mod tests {
         assert_eq!(artifact.source_session_id, "session-old");
         assert_eq!(artifact.target_session_id.as_deref(), Some("session-new"));
         assert_eq!(artifact.generation, 1);
+    }
+
+    #[test]
+    fn legacy_lead_binding_projects_to_a_runtime_profile() {
+        let binding = LeadBinding {
+            level: Some("high".to_string()),
+            agent: "lead-high".to_string(),
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            variant: Some("high".to_string()),
+        };
+        let profile = binding.to_runtime_profile().unwrap();
+        assert_eq!(profile.profile_id, "lead-high");
+        assert_eq!(profile.model_selector, "provider/model");
+        assert_eq!(profile.level.as_deref(), Some("high"));
+
+        let mut artifact = RolloverArtifact::prepare(
+            &mission(),
+            "session-old",
+            ContextObservation::default(),
+            "context budget",
+            Some(binding),
+            2,
+            &ContextGovernorConfig::default(),
+        )
+        .unwrap();
+        artifact.runtime_profile = None;
+        let mut value = serde_json::to_value(&artifact).unwrap();
+        value.as_object_mut().unwrap().remove("runtime_profile");
+        let decoded: RolloverArtifact = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.runtime_profile().unwrap(), profile);
     }
 
     #[test]

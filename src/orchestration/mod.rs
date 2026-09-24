@@ -1,5 +1,7 @@
-//! Orchestration: typed role hand-offs, a local controller and the generated
-//! OpenCode plugin adapter.
+//! Orchestration: typed role hand-offs, durable Mission state, a local
+//! controller, and the generated OpenCode plugin adapter. Runtime execution
+//! mechanics enter through the neutral `runtime::lifecycle` boundary; OpenCode
+//! protocol details stay in the concrete adapter.
 //!
 //! This module owns durable, inspectable hand-offs between phases. It does not
 //! own the conversation or the model loop — OpenCode does. The Rust controller

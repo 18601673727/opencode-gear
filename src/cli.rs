@@ -27,6 +27,7 @@ use crate::proxy::{ProxyScheme, ProxySelection, ProxySource};
 use crate::report;
 use crate::runtime::compat::{self, LeadSelection, RuntimeAdapter, SessionClient};
 use crate::runtime::effective as runtime_effective;
+use crate::runtime::lifecycle::RuntimeAdapter as RuntimeLifecycleAdapter;
 use crate::runtime::policy::RuntimePolicy;
 use crate::runtime::{self, install::Layout};
 use crate::telemetry::{self, TelemetryConfig};
@@ -1048,18 +1049,21 @@ fn launch(
                     invocation_dir.to_string_lossy(),
                 )
                 .map_err(Failure::Gear)?;
-                let session =
-                    compat::select_session_lead(&mut client, &lead).map_err(Failure::Gear)?;
+                let profile = lead.runtime_profile();
+                let session_id = RuntimeLifecycleAdapter::resolve_execution(&mut client)
+                    .map_err(|error| Failure::Gear(GearError::config(error.to_string())))?;
+                RuntimeLifecycleAdapter::prepare_execution(&mut client, &session_id, &profile)
+                    .map_err(|error| Failure::Gear(GearError::config(error.to_string())))?;
                 let observed = client
-                    .effective_lead(&session.session_id)
+                    .effective_lead(session_id.as_str())
                     .map_err(Failure::Gear)?;
                 eprintln!(
                     "ocg: runtime {} | session {} | effective Lead {}",
                     runtime.identity().describe(),
-                    session.session_id,
+                    session_id,
                     crate::runtime::effective::render_effective(&observed)
                 );
-                runtime_target_session = Some(session.session_id);
+                runtime_target_session = Some(session_id.to_string());
                 v2_runtime = Some(runtime);
             }
         }
@@ -3202,7 +3206,7 @@ fn bridge_payload(
                 .unwrap_or_else(|| project_root.to_string_lossy().into_owned());
             match compat::v2_client::V2SessionClient::connect(&registration, directory) {
                 Ok(client) => {
-                    bridge = bridge.with_rollover_runtime(client, lead);
+                    bridge = bridge.with_rollover_runtime(client, lead.runtime_profile());
                 }
                 Err(_) => {
                     // The bridge will record an explicit unknown observation;

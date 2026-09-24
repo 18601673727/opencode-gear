@@ -41,6 +41,7 @@
 use crate::error::{GearError, Result};
 use crate::orchestration::handoff::{HandoffFinding, HandoffVerification, Role, Transition};
 use crate::orchestration::state::{Attempts, OrchestrationPhase, SessionState};
+use crate::runtime::lifecycle::RuntimeExecutionId;
 use crate::verification::result::VerificationReport;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -434,6 +435,13 @@ impl Mission {
         self.status.is_terminal()
     }
 
+    /// The replaceable runtime execution binding, kept distinct from the
+    /// durable Mission identity. The serialized field remains `session_id` for
+    /// backward compatibility with existing Mission records.
+    pub fn runtime_execution_id(&self) -> Option<RuntimeExecutionId> {
+        self.session_id.as_deref().map(RuntimeExecutionId::new)
+    }
+
     /// Supersede a recoverable rollover when a new explicit user session
     /// admission replaces an interrupted execution session. The old artifact
     /// remains on disk as a conflict record; the same Mission generation and
@@ -553,6 +561,12 @@ impl Mission {
             self.history.drain(0..excess);
         }
         true
+    }
+
+    /// Bind a runtime execution as the Mission's current execution state. The
+    /// serialized `session_id` remains the backward-compatible wire field.
+    pub fn bind_runtime_execution(&mut self, execution_id: &RuntimeExecutionId, now: i64) -> bool {
+        self.bind_session(execution_id.as_str(), now)
     }
 
     /// Bind a session as the Mission's current execution state. A changed
@@ -1723,12 +1737,16 @@ mod tests {
     fn session_binding_is_replaceable_and_recorded() {
         let mut mission = admitted();
         assert_eq!(mission.session_id.as_deref(), Some("session-1"));
-        // Rebinding the same session is a no-op.
-        assert!(!mission.bind_session("session-1", 10));
+        // Rebinding the same execution is a no-op.
+        assert!(!mission.bind_runtime_execution(&RuntimeExecutionId::new("session-1"), 10));
         // Replacing the binding keeps identity and is recorded.
-        assert!(mission.bind_session("session-2", 11));
+        assert!(mission.bind_runtime_execution(&RuntimeExecutionId::new("session-2"), 11));
         assert_eq!(mission.mission_id, TASK_ID);
         assert_eq!(mission.session_id.as_deref(), Some("session-2"));
+        assert_ne!(
+            mission.runtime_execution_id().unwrap().as_str(),
+            mission.mission_id
+        );
         assert!(mission.history.iter().any(|event| {
             event.kind == MissionEventKind::SessionBound
                 && event.session_id.as_deref() == Some("session-2")

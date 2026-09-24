@@ -1,17 +1,21 @@
 //! Context telemetry and the conservative session-rollover governor.
 //!
-//! This module deliberately separates *observation* from *action*.  OpenCode
-//! can report a token count for one model request, but that number is not by
-//! itself proof of the active context window.  The governor therefore keeps
-//! the raw V2 fields, records their provenance, and only compares a measured
-//! value with a limit that the V2 model catalogue actually reported.  No
+//! This module deliberately separates *observation* from *action*. A runtime
+//! adapter can report a token count for one model request, but that number is
+//! not by itself proof of the active context window. The governor keeps the
+//! normalized usage fields, records their provenance, and only compares a
+//! measured value with a limit that the adapter actually reported. No
 //! denominator or percentage is fabricated when either side is unavailable.
 //!
-//! The types in this file are local, small, and deliberately boring.  They are
-//! also the contract used by the bridge when it writes telemetry and rollover
-//! artifacts.  The network/API details remain in `runtime::compat::v2_client`.
+//! The durable telemetry types here are local and deliberately boring. Runtime
+//! adapters normalize their engine-specific response shapes before conversion
+//! through `ContextObservation::from_runtime`; network/API details remain in
+//! the concrete OpenCode adapter.
 
 use crate::error::{GearError, Result};
+use crate::runtime::lifecycle::{
+    RuntimeContextObservation, RuntimeContextUsage, RuntimeModelMetadata, RuntimeProvenance,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -306,13 +310,11 @@ fn parse_action(value: &Value, label: &str) -> Result<GovernorAction> {
     }
 }
 
-/// Token fields from OpenCode V2's `TokenUsage.Info` object.
+/// Token fields normalized from one runtime observation.
 ///
-/// V2 splits a message's input into the non-cached `input` field and cache
-/// reads/writes.  For one message, OpenCode's own pressure calculation uses
-/// `input + cache.read`; we retain every raw field and expose that same
-/// single-message projection.  Crucially, this is never a sum over messages:
-/// a cumulative transcript is not an active-context measurement.
+/// The active-context projection uses one message's `input + cache.read`.
+/// Cache writes remain separate, and a transcript is never summed into an
+/// active-context measurement.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TokenUsage {
@@ -321,6 +323,42 @@ pub struct TokenUsage {
     pub reasoning: Option<u64>,
     pub cache_read: Option<u64>,
     pub cache_write: Option<u64>,
+}
+
+impl From<RuntimeContextUsage> for TokenUsage {
+    fn from(usage: RuntimeContextUsage) -> Self {
+        Self {
+            input: usage.input,
+            output: usage.output,
+            reasoning: usage.reasoning,
+            cache_read: usage.cache_read,
+            cache_write: usage.cache_write,
+        }
+    }
+}
+
+impl From<RuntimeProvenance> for TelemetryProvenance {
+    fn from(provenance: RuntimeProvenance) -> Self {
+        match provenance {
+            RuntimeProvenance::Exact => Self::Exact,
+            RuntimeProvenance::Estimated => Self::Estimated,
+            RuntimeProvenance::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<RuntimeModelMetadata> for ModelMetadata {
+    fn from(model: RuntimeModelMetadata) -> Self {
+        Self {
+            provider_id: model.provider_id,
+            model_id: model.model_id,
+            context_limit: model.context_limit,
+            input_limit: model.input_limit,
+            output_limit: model.output_limit,
+            effective_limit: model.effective_limit,
+            source: model.source,
+        }
+    }
 }
 
 impl TokenUsage {
@@ -332,29 +370,13 @@ impl TokenUsage {
             && self.cache_write.is_none()
     }
 
-    /// Parse a V2 token object without accepting missing fields as zero.
-    pub fn from_value(value: Option<&Value>) -> Self {
-        let Some(value) = value else {
-            return Self::default();
-        };
-        let cache = value.get("cache");
-        Self {
-            input: number(value.get("input")),
-            output: number(value.get("output")),
-            reasoning: number(value.get("reasoning")),
-            cache_read: cache.and_then(|value| number(value.get("read"))),
-            cache_write: cache.and_then(|value| number(value.get("write"))),
-        }
-    }
-
     /// Project the active context carried by one V2 message.
     ///
-    /// OpenCode's message accounting splits the request into `input` and
-    /// `cache.read`; the effective request context is their sum.  Cache
-    /// writes are deliberately excluded: they are accounting for newly
-    /// written cache entries, not an additional item in the active prompt.
-    /// The addition is checked so malformed or future values cannot wrap
-    /// into a small, apparently safe number.
+    /// The runtime's message accounting may split the request into `input`
+    /// and `cache.read`; the effective request context is their sum. Cache
+    /// writes are deliberately excluded: they account for newly written cache
+    /// entries, not an additional active-prompt item. The addition is checked
+    /// so malformed or future values cannot wrap into a small, safe number.
     pub fn active_context_tokens(&self) -> Result<Option<u64>> {
         match (self.input, self.cache_read) {
             (None, None) => Ok(None),
@@ -378,11 +400,7 @@ impl TokenUsage {
     }
 }
 
-fn number(value: Option<&Value>) -> Option<u64> {
-    value.and_then(Value::as_u64)
-}
-
-/// Model limits returned by V2's `/api/model` route.
+/// Model limits normalized by the runtime adapter.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelMetadata {
@@ -398,44 +416,12 @@ pub struct ModelMetadata {
 }
 
 impl ModelMetadata {
-    /// Parse one `/api/model` catalogue entry without treating absent fields
-    /// as zero or inventing a provider limit.
-    pub fn from_v2_value(value: &Value) -> Self {
-        let limit = value.get("limit");
-        Self {
-            provider_id: value
-                .get("providerID")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            model_id: value
-                .get("id")
-                .or_else(|| value.get("modelID"))
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            context_limit: limit
-                .and_then(|limit| limit.get("context"))
-                .and_then(Value::as_u64)
-                .filter(|limit| *limit > 0),
-            input_limit: limit
-                .and_then(|limit| limit.get("input"))
-                .and_then(Value::as_u64),
-            output_limit: limit
-                .and_then(|limit| limit.get("output"))
-                .and_then(Value::as_u64),
-            effective_limit: limit
-                .and_then(|limit| limit.get("context"))
-                .and_then(Value::as_u64)
-                .filter(|limit| *limit > 0),
-            source: Some("opencode-v2:/api/model".to_string()),
-        }
-    }
-
     pub fn is_trustworthy_limit(&self) -> bool {
         self.effective_limit.filter(|limit| *limit > 0).is_some()
     }
 }
 
-/// A compact, privacy-safe observation of one V2 step.
+/// A compact, privacy-safe observation of one runtime step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ContextObservation {
@@ -447,7 +433,7 @@ pub struct ContextObservation {
     pub finish: Option<String>,
     pub safe_boundary: bool,
     pub usage: TokenUsage,
-    /// The value used for the comparison: one V2 message's
+    /// The value used for the comparison: one runtime message's
     /// `input + cache.read` projection. Cache writes are retained separately
     /// in [`Self::usage`] and never added to this value.
     pub used_tokens: Option<u64>,
@@ -457,9 +443,9 @@ pub struct ContextObservation {
     pub compaction_count: usize,
     /// Provenance of the raw usage fields.
     pub usage_provenance: TelemetryProvenance,
-    /// Provenance of the active-context projection.  V2 currently provides
-    /// message-level usage, not a separately named active-context counter, so
-    /// a present value is conservatively marked estimated.
+    /// Provenance of the active-context projection. A present value is
+    /// conservatively marked estimated when the runtime reports message-level
+    /// usage rather than a separate active-context counter.
     pub context_provenance: TelemetryProvenance,
     pub note: Option<String>,
 }
@@ -488,6 +474,29 @@ impl Default for ContextObservation {
 }
 
 impl ContextObservation {
+    /// Convert the runtime-neutral observation into the durable telemetry
+    /// shape. No OpenCode response fields cross this boundary.
+    pub fn from_runtime(observation: RuntimeContextObservation) -> Self {
+        Self {
+            schema_version: CONTEXT_ARTIFACT_SCHEMA_VERSION,
+            session_id: observation.execution_id.to_string(),
+            event_id: observation.event_id,
+            observed_at: observation.observed_at,
+            assistant_message_id: observation.assistant_message_id,
+            finish: observation.finish,
+            safe_boundary: observation.safe_boundary,
+            usage: observation.usage.into(),
+            used_tokens: observation.used_tokens,
+            limit_tokens: observation.limit_tokens,
+            model: observation.model.into(),
+            message_count: observation.message_count,
+            compaction_count: observation.compaction_count,
+            usage_provenance: observation.usage_provenance.into(),
+            context_provenance: observation.context_provenance.into(),
+            note: observation.note,
+        }
+    }
+
     pub fn unknown(session_id: &str, event_id: &str, now: i64, note: impl Into<String>) -> Self {
         Self {
             session_id: session_id.to_string(),
@@ -495,84 +504,6 @@ impl ContextObservation {
             observed_at: now,
             note: Some(crate::telemetry::task::redact(&note.into())),
             ..Self::default()
-        }
-    }
-
-    /// Build an observation from a V2 context response and optional step
-    /// tokens. Only one message's usage is projected; summing message usage
-    /// would turn a transcript into a false cumulative context measurement.
-    /// For that one message OpenCode's effective input is `input + cache.read`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_v2(
-        session_id: &str,
-        event_id: &str,
-        now: i64,
-        finish: Option<String>,
-        safe_boundary: bool,
-        assistant_message_id: Option<String>,
-        step_tokens: Option<&Value>,
-        context_messages: &[Value],
-        model: ModelMetadata,
-    ) -> Self {
-        let mut usage = TokenUsage::from_value(step_tokens);
-        let mut message_id = assistant_message_id;
-        if usage.is_empty() {
-            for message in context_messages.iter().rev() {
-                if message.get("type").and_then(Value::as_str) == Some("assistant") {
-                    if let Some(tokens) = message.get("tokens") {
-                        usage = TokenUsage::from_value(Some(tokens));
-                        message_id = message
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                            .or(message_id);
-                    }
-                    if !usage.is_empty() {
-                        break;
-                    }
-                }
-            }
-        }
-        let compaction_count = context_messages
-            .iter()
-            .filter(|message| message.get("type").and_then(Value::as_str) == Some("compaction"))
-            .count();
-        let provenance = if usage.is_empty() {
-            TelemetryProvenance::Unknown
-        } else {
-            TelemetryProvenance::Exact
-        };
-        let (used_tokens, note) = match usage.active_context_tokens() {
-            Ok(value) => (value, None),
-            Err(_) => (
-                None,
-                Some(
-                    "the V2 input + cache.read projection overflowed; no context comparison was attempted"
-                        .to_string(),
-                ),
-            ),
-        };
-        Self {
-            schema_version: CONTEXT_ARTIFACT_SCHEMA_VERSION,
-            session_id: session_id.to_string(),
-            event_id: event_id.to_string(),
-            observed_at: now,
-            assistant_message_id: message_id,
-            finish,
-            safe_boundary,
-            used_tokens,
-            limit_tokens: model.effective_limit,
-            model,
-            message_count: context_messages.len(),
-            compaction_count,
-            usage_provenance: provenance,
-            context_provenance: if used_tokens.is_some() {
-                TelemetryProvenance::Estimated
-            } else {
-                TelemetryProvenance::Unknown
-            },
-            usage,
-            note,
         }
     }
 }
@@ -825,7 +756,7 @@ pub fn safe_artifact_id(id: &str) -> String {
     format!("a-{}", digest.get(..24).unwrap_or(&digest))
 }
 
-/// Build a deterministic event identity when OpenCode did not provide one.
+/// Build a deterministic event identity when the runtime did not provide one.
 pub fn event_identity(
     session_id: &str,
     message_id: Option<&str>,
@@ -844,6 +775,9 @@ pub fn event_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::lifecycle::{
+        RuntimeContextObservation, RuntimeContextUsage, RuntimeExecutionId, RuntimeProvenance,
+    };
     use serde_json::json;
 
     fn observation(
@@ -945,22 +879,30 @@ mod tests {
     }
 
     #[test]
-    fn v2_message_usage_is_not_summed_as_a_cumulative_context_total() {
-        let messages = vec![
-            json!({"type": "assistant", "id": "m1", "tokens": {"input": 100, "output": 5}}),
-            json!({"type": "assistant", "id": "m2", "tokens": {"input": 150, "cache": {"read": 25, "write": 9}, "output": 7}}),
-        ];
-        let result = ContextObservation::from_v2(
-            "s",
-            "e",
-            1,
-            Some("stop".to_string()),
-            true,
-            Some("m2".to_string()),
-            Some(&messages[1]["tokens"]),
-            &messages,
-            ModelMetadata::default(),
-        );
+    fn runtime_message_usage_is_not_summed_as_a_cumulative_context_total() {
+        let result = ContextObservation::from_runtime(RuntimeContextObservation {
+            execution_id: RuntimeExecutionId::new("s"),
+            event_id: "e".to_string(),
+            observed_at: 1,
+            assistant_message_id: Some("m2".to_string()),
+            finish: Some("stop".to_string()),
+            safe_boundary: true,
+            usage: RuntimeContextUsage {
+                input: Some(150),
+                output: Some(7),
+                cache_read: Some(25),
+                cache_write: Some(9),
+                ..RuntimeContextUsage::default()
+            },
+            used_tokens: Some(175),
+            limit_tokens: None,
+            model: Default::default(),
+            message_count: 2,
+            compaction_count: 0,
+            usage_provenance: RuntimeProvenance::Exact,
+            context_provenance: RuntimeProvenance::Estimated,
+            note: None,
+        });
         assert_eq!(result.used_tokens, Some(175));
         assert_eq!(result.usage.cache_write, Some(9));
         assert_eq!(result.usage_provenance, TelemetryProvenance::Exact);

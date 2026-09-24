@@ -1,4 +1,8 @@
-//! Managed OpenCode runtime.
+//! Managed OpenCode runtime and the runtime-neutral execution lifecycle seam.
+//!
+//! `compat` describes OpenCode family/config behavior. `lifecycle` is the
+//! stateful per-invocation contract consumed by Mission orchestration; OpenCode
+//! V2 is its first concrete adapter.
 //!
 //! The runtime layer answers one question for a launch: which `opencode`
 //! executable should run? The answer is one of four sources, in a fixed
@@ -18,12 +22,18 @@ pub mod compat;
 pub mod effective;
 pub mod hash;
 pub mod install;
+pub mod lifecycle;
 pub mod policy;
 pub mod release;
 pub mod resolve;
 pub mod self_update;
 
 pub use compat::{detect, detect_from_host, Major, RuntimeAdapter, RuntimeVersion, SessionClient};
+pub use lifecycle::{
+    RuntimeAdapter as RuntimeLifecycleAdapter, RuntimeCapabilities, RuntimeContextEvent,
+    RuntimeContextObservation, RuntimeContinuation, RuntimeError, RuntimeErrorKind,
+    RuntimeExecution, RuntimeExecutionId, RuntimeIdentity, RuntimeProfile, RuntimeProvenance,
+};
 pub use policy::{Channel, Fallback, RuntimePolicy};
 pub use resolve::{RuntimeManager, RuntimeReport, RuntimeSelection, RuntimeSource, UpgradeOutcome};
 

@@ -268,7 +268,50 @@ symbols/source, current git diff, verification state) and embeds the capability
 plan and targeted-test proposal. The stable order is part of the contract and is
 covered by deterministic tests.
 
-## Orchestration
+## Runtime lifecycle boundary
+
+Mission semantics and execution mechanics have separate owners:
+
+```text
+Mission / Controller / Bridge
+              │
+              ▼
+runtime::lifecycle::RuntimeAdapter
+              │
+              ▼
+OpenCode V2 adapter (V2SessionClient + OwnedV2Server)
+```
+
+`RuntimeAdapter` is the small, stateful per-invocation lifecycle seam. It
+owns the operations the current controller and bridge actually consume:
+resolve/create/inspect a runtime execution, apply and verify a runtime profile,
+observe normalized context, and stage/resume a continuation. Its execution ID is
+an opaque replaceable binding; it is never a Mission ID. The durable Mission
+continues to use the existing `session_id` field on disk for backward
+compatibility, with `runtime_execution_id()` as the typed view of that binding.
+
+OpenCode V2 is the first concrete implementation. Its HTTP routes, response
+JSON, service registration, agent/model selection, synthetic continuation
+protocol, and V2 token/model projection stay in the OpenCode adapter. The
+controller consumes typed execution/profile/continuation values. The generated
+plugin/bridge remains the intentional OpenCode event-integration layer, but it
+converts event payloads into the neutral observation request rather than
+interpreting V2 session responses. V1 remains the existing request-scoped
+compatibility path: it has no V2 lifecycle capabilities and does not emulate
+session creation or continuation.
+
+Capabilities are explicit. A caller can distinguish execution creation, profile
+selection, context observation, continuation staging/resume, and persistent
+lookup; unsupported operations return a typed `RuntimeError` rather than a
+silent fallback. Errors retain a redacted detail alongside a small classification
+(unavailable, unsupported, missing execution, authentication, transport,
+invalid response, profile selection, or provider completion).
+
+This boundary does not introduce a registry, scheduler, Resource Broker, second
+runtime, generic plugin protocol, or Reconciler. The existing OpenCode
+compatibility descriptor remains responsible for V1/V2 config, plugin, and
+launch differences.
+
 
 Orchestration is the layer that carries a task across roles. It is deliberately
 split so policy cannot drift into the wrong language:
@@ -279,6 +322,8 @@ Rust (authority)
   mission            durable per-task record: identity, generation, lifecycle
   projection         typed ModelHandoffCapsule, caps, secret defense
   bridge             `ocg __bridge <event>` JSON translation + telemetry
+  runtime boundary   neutral execution/profile/context/continuation contract
+  OpenCode adapter   V1/V2 lifecycle and transport implementation
   plugin generator   materialize the adapter, inject the file:// URL
 
 JavaScript (transport only)
@@ -365,10 +410,12 @@ outside that lifetime:
 - **Identity.** `mission_id` is the existing deterministic task id, derived
   from the admitted task text and never from a session, so the same Mission
   identity is recovered across session changes, restarts and rebinds.
-- **Binding.** The current OpenCode session is `session_id` on the Mission:
-  replaceable execution metadata, not identity. A fresh session that admits the
-  same task binds to the same Mission and is seeded from it, keeping findings,
-  attempts, checkpoint references and the exact next action.
+- **Binding.** The current runtime execution is `session_id` on the Mission:
+  replaceable execution metadata, not identity. The serialized name remains for
+  compatibility with existing Mission files; the typed runtime view is
+  `RuntimeExecutionId`. A fresh execution that admits the same task binds to the
+  same Mission and is seeded from it, keeping findings, attempts, checkpoint
+  references and the exact next action.
 - **Lifecycle.** `Active` is the only non-terminal status; `Completed`,
   `Failed` and `Cancelled` are unambiguous terminal states with a persisted
   reason. A conflicting transition fails explicitly; re-admitting a terminal
@@ -395,8 +442,10 @@ outside that lifetime:
 ### Context pressure and same-generation rollover
 
 The context governor is a small, artifact-backed layer above the Mission. It
-observes one V2 message at the completed root-Lead boundary, after the output
-event has been handled and the disposable session view has been synchronized:
+observes one runtime message at the completed root-Lead boundary, after the
+output event has been handled and the disposable execution view has been
+synchronized. The OpenCode V2 adapter supplies the normalized observation; the
+policy layer does not know its HTTP or JSON shape:
 
 ```text
 session.step.ended(stop)
@@ -415,8 +464,9 @@ session.step.ended(stop)
   missing usage, missing model limits and failed V2 queries are explicit
   `unknown` observations and cannot trigger automatic replacement.
 - Policy defaults are an ordered 70% approaching warning and 80% rollover
-  request. Thresholds require a trustworthy `/api/model` limit; an optional
-  absolute cap can operate without one. No percentage is fabricated.
+  request. Thresholds require a trustworthy runtime model limit reported by the
+  adapter; an optional absolute cap can operate without one. No percentage is
+  fabricated.
 - A required observation at an unsafe boundary is durably marked pending. Only
   a completed root-Lead `stop` after output handling is a safe boundary. Tool
   errors, partial output, missing clients and `tool-calls` steps do not claim

@@ -27,7 +27,8 @@ use crate::preflight::{Availability, ModelPreflight};
 use crate::proxy::ChildProxyEnv;
 use crate::runtime::compat::v2_client::V2SessionClient;
 use crate::runtime::compat::v2_server::{OwnedV2Server, RuntimeIdentity};
-use crate::runtime::compat::{select_session_lead, EffectiveLead, LeadSelection, SessionClient};
+use crate::runtime::compat::{EffectiveLead, LeadSelection, SessionClient};
+use crate::runtime::lifecycle::RuntimeAdapter as RuntimeLifecycleAdapter;
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -257,11 +258,15 @@ pub fn observe_owned_v2(
 ) -> Result<ObservedActivation> {
     let server = OwnedV2Server::start(program, config_content, extra_env, proxy)?;
     let mut client = V2SessionClient::connect(server.registration(), directory)?;
-    let selection = select_session_lead(&mut client, lead)?;
-    let effective = client.effective_lead(&selection.session_id)?;
+    let profile = lead.runtime_profile();
+    let session_id = RuntimeLifecycleAdapter::resolve_execution(&mut client)
+        .map_err(|error| crate::error::GearError::config(error.to_string()))?;
+    RuntimeLifecycleAdapter::prepare_execution(&mut client, &session_id, &profile)
+        .map_err(|error| crate::error::GearError::config(error.to_string()))?;
+    let effective = client.effective_lead(session_id.as_str())?;
     Ok(ObservedActivation {
         identity: server.identity().clone(),
-        session_id: selection.session_id,
+        session_id: session_id.to_string(),
         effective,
     })
 }

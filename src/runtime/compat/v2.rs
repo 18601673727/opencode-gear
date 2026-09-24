@@ -52,6 +52,10 @@ impl RuntimeAdapter for V2Adapter {
         LaunchMode::Daemon
     }
 
+    fn lifecycle_capabilities(&self) -> crate::runtime::lifecycle::RuntimeCapabilities {
+        crate::runtime::lifecycle::RuntimeCapabilities::OPENCODE_V2
+    }
+
     fn is_task_tool(&self, tool: &str) -> bool {
         tool == "subagent"
     }

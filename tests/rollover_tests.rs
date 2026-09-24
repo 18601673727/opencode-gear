@@ -5,15 +5,18 @@ use opencode_gear::clock::FixedClock;
 use opencode_gear::context::ContextConfig;
 use opencode_gear::orchestration::bridge::BridgeContext;
 use opencode_gear::orchestration::config::OrchestrationConfig;
-use opencode_gear::orchestration::context_governor::{
-    ContextObservation, ModelMetadata, TelemetryProvenance,
-};
+use opencode_gear::orchestration::context_governor::{ContextObservation, TelemetryProvenance};
 use opencode_gear::orchestration::controller::Controller;
 use opencode_gear::orchestration::mission::{self, Mission, MissionRolloverStatus};
 use opencode_gear::orchestration::state::SessionState;
 use opencode_gear::process::{FakeCaptureRunner, FakeGitHost};
 use opencode_gear::runtime::compat::{
     EffectiveLead, LeadSelection, SessionClient, SessionLifecycleClient,
+};
+use opencode_gear::runtime::lifecycle::{
+    RuntimeAdapter, RuntimeCapabilities, RuntimeContextEvent, RuntimeContextObservation,
+    RuntimeContinuation, RuntimeError, RuntimeErrorKind, RuntimeExecution, RuntimeExecutionId,
+    RuntimeIdentity, RuntimeModelMetadata, RuntimeProfile, RuntimeResult,
 };
 use opencode_gear::telemetry::TelemetryConfig;
 use opencode_gear::verification::config::VerificationConfig;
@@ -23,6 +26,10 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 const TASK: &str = "make rollover durable";
+
+fn profile() -> RuntimeProfile {
+    lead().runtime_profile()
+}
 
 fn lead() -> LeadSelection {
     LeadSelection {
@@ -49,6 +56,8 @@ struct RuntimeState {
     conflict_on_stage: Option<(PathBuf, String)>,
 }
 
+/// A lifecycle-only fake: the controller never constructs an OpenCode HTTP
+/// client, service registration, or transport object for these contracts.
 #[derive(Clone)]
 struct FakeRolloverRuntime {
     state: Rc<RefCell<RuntimeState>>,
@@ -181,8 +190,8 @@ impl SessionLifecycleClient for FakeRolloverRuntime {
         &self,
         _provider_id: Option<&str>,
         _model_id: Option<&str>,
-    ) -> opencode_gear::error::Result<ModelMetadata> {
-        Ok(ModelMetadata {
+    ) -> opencode_gear::error::Result<RuntimeModelMetadata> {
+        Ok(RuntimeModelMetadata {
             provider_id: Some("test-provider".into()),
             model_id: Some("test-model".into()),
             context_limit: Some(100),
@@ -266,6 +275,111 @@ impl SessionLifecycleClient for FakeRolloverRuntime {
     }
 }
 
+impl RuntimeAdapter for FakeRolloverRuntime {
+    fn identity(&self) -> RuntimeIdentity {
+        RuntimeIdentity::new("fake", "rollover-test", "in-memory")
+    }
+
+    fn capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities::OPENCODE_V2
+    }
+
+    fn resolve_execution(&mut self) -> RuntimeResult<RuntimeExecutionId> {
+        <Self as SessionClient>::resolve_session(self)
+            .map(RuntimeExecutionId::new)
+            .map_err(|error| RuntimeError::new(RuntimeErrorKind::Unavailable, error.to_string()))
+    }
+
+    fn create_execution(&mut self) -> RuntimeResult<RuntimeExecutionId> {
+        <Self as SessionLifecycleClient>::create_fresh_session(self)
+            .map(RuntimeExecutionId::new)
+            .map_err(|error| RuntimeError::new(RuntimeErrorKind::Unavailable, error.to_string()))
+    }
+
+    fn inspect_execution(
+        &self,
+        execution_id: &RuntimeExecutionId,
+    ) -> RuntimeResult<RuntimeExecution> {
+        Ok(RuntimeExecution {
+            id: execution_id.clone(),
+            profile: None,
+        })
+    }
+
+    fn prepare_execution(
+        &mut self,
+        execution_id: &RuntimeExecutionId,
+        profile: &RuntimeProfile,
+    ) -> RuntimeResult<RuntimeExecution> {
+        <Self as SessionClient>::select_agent(self, execution_id.as_str(), &profile.profile_id)
+            .map_err(|error| {
+                RuntimeError::new(RuntimeErrorKind::ProfileSelection, error.to_string())
+            })?;
+        let (provider, model) = profile.model_selector.split_once('/').ok_or_else(|| {
+            RuntimeError::new(RuntimeErrorKind::ProfileSelection, "profile selector")
+        })?;
+        <Self as SessionClient>::select_model(
+            self,
+            execution_id.as_str(),
+            provider,
+            model,
+            profile.variant.as_deref(),
+        )
+        .map_err(|error| {
+            RuntimeError::new(RuntimeErrorKind::ProfileSelection, error.to_string())
+        })?;
+        Ok(RuntimeExecution {
+            id: execution_id.clone(),
+            profile: Some(profile.clone()),
+        })
+    }
+
+    fn observe_context(
+        &self,
+        event: &RuntimeContextEvent,
+    ) -> RuntimeResult<RuntimeContextObservation> {
+        if self.state.borrow().fail_context {
+            return Err(RuntimeError::new(
+                RuntimeErrorKind::Unavailable,
+                "synthetic context query failure",
+            ));
+        }
+        Ok(RuntimeContextObservation::unknown(event, "fake context"))
+    }
+
+    fn stage_runtime_continuation(
+        &self,
+        execution_id: &RuntimeExecutionId,
+        continuation: &RuntimeContinuation,
+    ) -> RuntimeResult<()> {
+        <Self as SessionLifecycleClient>::stage_continuation(
+            self,
+            execution_id.as_str(),
+            &continuation.id,
+            &continuation.text,
+            &continuation.description,
+            &continuation.metadata,
+        )
+        .map_err(|error| RuntimeError::new(RuntimeErrorKind::Transport, error.to_string()))
+    }
+
+    fn resume_runtime_continuation(
+        &self,
+        execution_id: &RuntimeExecutionId,
+        continuation: &RuntimeContinuation,
+    ) -> RuntimeResult<()> {
+        <Self as SessionLifecycleClient>::resume_continuation(
+            self,
+            execution_id.as_str(),
+            &continuation.id,
+            &continuation.text,
+            &continuation.description,
+            &continuation.metadata,
+        )
+        .map_err(|error| RuntimeError::new(RuntimeErrorKind::ProviderCompletion, error.to_string()))
+    }
+}
+
 fn controller<'a>(root: &Path, git: &'a FakeGitHost, clock: &'a FixedClock) -> Controller<'a> {
     Controller::new(
         root,
@@ -313,7 +427,7 @@ fn safe_rollover_preserves_mission_progress_and_targets_the_verified_session() {
             "ses_source",
             observation(true, "evt-safe"),
             &mut runtime,
-            &lead(),
+            &profile(),
         )
         .unwrap();
 
@@ -359,7 +473,7 @@ fn failed_target_creation_keeps_the_old_binding_and_exposes_a_retryable_failure(
             "ses_source",
             observation(true, "evt-fail"),
             &mut runtime,
-            &lead(),
+            &profile(),
         )
         .unwrap();
     assert!(!result.decision.rollover_allowed);
@@ -425,7 +539,7 @@ fn an_artifact_left_before_the_mission_intent_can_be_adopted_on_restart() {
             "ses_source",
             observation(false, "evt-orphan"),
             &mut runtime,
-            &lead(),
+            &profile(),
         )
         .unwrap();
     assert!(pending.decision.deferred_for_boundary);
@@ -438,7 +552,7 @@ fn an_artifact_left_before_the_mission_intent_can_be_adopted_on_restart() {
             "ses_source",
             observation(true, "evt-orphan-safe"),
             &mut runtime,
-            &lead(),
+            &profile(),
         )
         .unwrap();
     assert_eq!(
@@ -468,7 +582,7 @@ fn a_concurrent_mission_update_forces_conflict_instead_of_overwriting_progress()
             "ses_source",
             observation(true, "evt-conflict"),
             &mut runtime,
-            &lead(),
+            &profile(),
         )
         .unwrap();
     assert_eq!(
@@ -502,7 +616,7 @@ fn a_second_pressure_cycle_creates_a_new_artifact_without_changing_generation() 
             "ses_source",
             observation(true, "evt-first"),
             &mut runtime,
-            &lead(),
+            &profile(),
         )
         .unwrap();
     assert_eq!(first.rollover_status, Some(MissionRolloverStatus::Applied));
@@ -514,7 +628,7 @@ fn a_second_pressure_cycle_creates_a_new_artifact_without_changing_generation() 
     second_observation.session_id = "ses_target".to_string();
     runtime.state.borrow_mut().target = "ses_target_2".to_string();
     let second = ocg
-        .observe_context("ses_target", second_observation, &mut runtime, &lead())
+        .observe_context("ses_target", second_observation, &mut runtime, &profile())
         .unwrap();
     assert_eq!(second.rollover_status, Some(MissionRolloverStatus::Applied));
     let mission = mission::load(dir.path(), &mission_id).unwrap().unwrap();
@@ -546,7 +660,7 @@ fn an_unsafe_boundary_is_recorded_and_replayed_at_the_next_safe_boundary() {
             "ses_source",
             observation(false, "evt-pending"),
             &mut runtime,
-            &lead(),
+            &profile(),
         )
         .unwrap();
     assert!(pending.decision.deferred_for_boundary);
@@ -564,7 +678,7 @@ fn an_unsafe_boundary_is_recorded_and_replayed_at_the_next_safe_boundary() {
             "ses_source",
             observation(true, "evt-safe-after-pending"),
             &mut runtime,
-            &lead(),
+            &profile(),
         )
         .unwrap();
     assert_eq!(
@@ -588,7 +702,7 @@ fn a_failed_rollover_can_retry_after_the_cooldown_without_changing_identity() {
             "ses_source",
             observation(true, "evt-stage-fail"),
             &mut runtime,
-            &lead(),
+            &profile(),
         )
         .unwrap();
     assert_eq!(failed.rollover_status, Some(MissionRolloverStatus::Failed));
@@ -607,7 +721,7 @@ fn a_failed_rollover_can_retry_after_the_cooldown_without_changing_identity() {
             "ses_source",
             observation(true, "evt-stage-retry"),
             &mut runtime,
-            &lead(),
+            &profile(),
         )
         .unwrap();
     assert_eq!(
@@ -632,7 +746,7 @@ fn a_resume_failure_after_cutover_is_recoverable_without_rebinding_the_old_sessi
             "ses_source",
             observation(true, "evt-resume-fail"),
             &mut runtime,
-            &lead(),
+            &profile(),
         )
         .unwrap();
     assert_eq!(failed.rollover_status, Some(MissionRolloverStatus::Active));
@@ -654,7 +768,7 @@ fn a_resume_failure_after_cutover_is_recoverable_without_rebinding_the_old_sessi
                 value
             },
             &mut runtime,
-            &lead(),
+            &profile(),
         )
         .unwrap();
     assert_eq!(
@@ -681,7 +795,7 @@ fn a_failed_v2_context_query_is_unknown_and_cannot_change_the_mission_owner() {
     let mission_id = ocg.admit_user_task("ses_source", TASK).unwrap().task_id;
     let runner = FakeCaptureRunner::new();
     let bridge = BridgeContext::new(&ocg, &runner, TelemetryConfig::disabled())
-        .with_rollover_runtime(FakeRolloverRuntime::failing_context(), lead());
+        .with_rollover_runtime(FakeRolloverRuntime::failing_context(), profile());
     let value = bridge.dispatch(
         "context.observe",
         &serde_json::json!({
@@ -713,7 +827,7 @@ fn explicit_readmission_can_supersede_an_unacknowledged_active_rollover() {
             "ses_source",
             observation(true, "evt-readmission-failure"),
             &mut runtime,
-            &lead(),
+            &profile(),
         )
         .unwrap();
     assert_eq!(failed.rollover_status, Some(MissionRolloverStatus::Active));
@@ -743,7 +857,7 @@ fn an_unavailable_runtime_client_never_changes_the_mission_owner() {
     unknown.context_provenance = TelemetryProvenance::Unknown;
     let mut runtime = FakeRolloverRuntime::default();
     let result = ocg
-        .observe_context("ses_source", unknown, &mut runtime, &lead())
+        .observe_context("ses_source", unknown, &mut runtime, &profile())
         .unwrap();
     assert!(!result.decision.rollover_allowed);
     let mission = mission::load(dir.path(), &mission_id).unwrap().unwrap();
@@ -774,7 +888,7 @@ fn a_disabled_governor_is_inert_and_does_not_write_telemetry_or_rollover() {
             "ses_source",
             observation(true, "evt-disabled"),
             &mut runtime,
-            &lead(),
+            &profile(),
         )
         .unwrap();
     assert_eq!(
@@ -805,7 +919,7 @@ fn a_terminal_mission_is_never_resurrected_by_observation() {
             "ses_source",
             observation(true, "evt-terminal"),
             &mut runtime,
-            &lead(),
+            &profile(),
         )
         .unwrap();
     assert!(!result.decision.rollover_allowed);

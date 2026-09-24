@@ -208,6 +208,13 @@ pub trait RuntimeAdapter: Send + Sync {
     /// How a launch reaches the runtime.
     fn launch_mode(&self) -> LaunchMode;
 
+    /// Lifecycle capabilities exposed by the concrete OpenCode family.
+    /// V1 intentionally returns the empty set: its request-scoped Lead path
+    /// does not provide the V2 session lifecycle contract.
+    fn lifecycle_capabilities(&self) -> crate::runtime::lifecycle::RuntimeCapabilities {
+        crate::runtime::lifecycle::RuntimeCapabilities::NONE
+    }
+
     /// Whether a tool event names this runtime's delegation tool.
     fn is_task_tool(&self, tool: &str) -> bool;
 }
@@ -239,6 +246,18 @@ impl LeadSelection {
     pub fn full_model_id(&self) -> String {
         format!("{}/{}", self.provider_id, self.model_id)
     }
+
+    /// Convert the policy-resolved OpenCode contract into the runtime-neutral
+    /// lifecycle profile consumed by orchestration. OpenCode field names stay
+    /// on this compatibility side of the boundary.
+    pub fn runtime_profile(&self) -> crate::runtime::lifecycle::RuntimeProfile {
+        crate::runtime::lifecycle::RuntimeProfile::new(
+            self.agent.clone(),
+            self.full_model_id(),
+            self.variant.clone(),
+        )
+        .with_level(self.level.clone())
+    }
 }
 
 /// The Lead a session actually reports after selection. Fields are optional so
@@ -251,15 +270,13 @@ pub struct EffectiveLead {
     pub variant: Option<String>,
 }
 
-/// The session-level operations a v2 runtime exposes. Gear keeps no HTTP or SSE
-/// details here; implementations are injected, so tests use a deterministic
-/// in-memory client and production can bind an HTTP client.
-/// Runtime operations needed for an explicit, artifact-backed rollover.
+/// Legacy OpenCode session lifecycle seam used by the compatibility layer.
 ///
-/// This is deliberately separate from [`SessionClient`]: `resolve_session`
-/// may reuse the newest project session, while a rollover must create a known
-/// fresh target.  Implementations are invocation-scoped; no operation here
-/// restarts a runtime or reads provider credentials.
+/// New orchestration code uses [`crate::runtime::lifecycle::RuntimeAdapter`].
+/// This trait remains for the existing V2 client contract and older callers;
+/// its JSON-shaped methods are not part of the Mission-facing boundary.
+/// Implementations are invocation-scoped; no operation here restarts a
+/// runtime or reads provider credentials.
 pub trait SessionLifecycleClient {
     /// Create a new root session in the already configured project directory.
     fn create_fresh_session(&self) -> Result<String>;
@@ -275,7 +292,7 @@ pub trait SessionLifecycleClient {
         &self,
         provider_id: Option<&str>,
         model_id: Option<&str>,
-    ) -> Result<crate::orchestration::context_governor::ModelMetadata>;
+    ) -> Result<crate::runtime::lifecycle::RuntimeModelMetadata>;
     /// Add a durable synthetic continuation message. Synthetic input is used
     /// instead of a normal prompt so it cannot be mistaken for a new user task
     /// and cannot reset Mission identity.
@@ -336,13 +353,8 @@ pub trait SessionClient {
     fn effective_lead(&self, session: &str) -> Result<EffectiveLead>;
 }
 
-/// A runtime that can perform an explicit same-Mission session replacement.
-///
-/// This is a supertrait rather than a wider `SessionClient`: ordinary session
-/// resolution does not need lifecycle or continuation privileges, and test
-/// clients can keep their existing small implementations. The blanket impl
-/// means any real client that implements both narrow contracts automatically
-/// satisfies the coordinator.
+/// Legacy composition retained for compatibility callers. Mission-facing
+/// orchestration now depends on [`crate::runtime::lifecycle::RuntimeAdapter`].
 pub trait RolloverRuntime: SessionClient + SessionLifecycleClient {}
 
 impl<T> RolloverRuntime for T where T: SessionClient + SessionLifecycleClient {}
@@ -670,6 +682,10 @@ mod tests {
         assert_eq!(v1.launch_mode(), LaunchMode::Exec);
         assert!(v1.is_task_tool("task"));
         assert!(!v1.is_task_tool("subagent"));
+        assert_eq!(
+            v1.lifecycle_capabilities(),
+            crate::runtime::lifecycle::RuntimeCapabilities::NONE
+        );
 
         let v2 = adapter_for(&detect("2.0.11").unwrap());
         assert_eq!(v2.major(), Major::V2);
@@ -679,6 +695,10 @@ mod tests {
         assert_eq!(v2.launch_mode(), LaunchMode::Daemon);
         assert!(v2.is_task_tool("subagent"));
         assert!(!v2.is_task_tool("task"));
+        assert_eq!(
+            v2.lifecycle_capabilities(),
+            crate::runtime::lifecycle::RuntimeCapabilities::OPENCODE_V2
+        );
     }
 
     fn lead() -> LeadSelection {

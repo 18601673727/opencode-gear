@@ -23,6 +23,11 @@ use opencode_gear::runtime::compat::v2_server::OwnedV2Server;
 use opencode_gear::runtime::compat::{
     select_session_lead, LeadSelection, SessionClient, SessionLifecycleClient,
 };
+use opencode_gear::runtime::lifecycle::{
+    RuntimeAdapter, RuntimeCapabilities, RuntimeContextEvent, RuntimeContextObservation,
+    RuntimeContinuation, RuntimeError, RuntimeErrorKind, RuntimeExecution, RuntimeExecutionId,
+    RuntimeIdentity, RuntimeModelMetadata, RuntimeProfile, RuntimeResult,
+};
 use opencode_gear::verification::config::VerificationConfig;
 use reqwest::blocking::Client as HttpClient;
 use serde_json::{json, Value};
@@ -74,6 +79,10 @@ fn lead() -> LeadSelection {
         model_id: MODEL.to_string(),
         variant: None,
     }
+}
+
+fn profile() -> RuntimeProfile {
+    lead().runtime_profile()
 }
 
 fn controller<'a>(root: &Path, git: &'a FakeGitHost, clock: &'a FixedClock) -> Controller<'a> {
@@ -177,7 +186,7 @@ impl SessionLifecycleClient for KillAfterCutoverRuntime {
         &self,
         provider_id: Option<&str>,
         model_id: Option<&str>,
-    ) -> GearResult<opencode_gear::orchestration::context_governor::ModelMetadata> {
+    ) -> GearResult<RuntimeModelMetadata> {
         self.inner.model_metadata(provider_id, model_id)
     }
 
@@ -237,6 +246,72 @@ impl SessionLifecycleClient for KillAfterCutoverRuntime {
         // This is the deterministic failpoint. No timing or polling is
         // involved: the controller calls resume only after cutover is durable.
         std::process::abort();
+    }
+}
+
+impl RuntimeAdapter for KillAfterCutoverRuntime {
+    fn identity(&self) -> RuntimeIdentity {
+        RuntimeIdentity::new("test", "opencode-v2", "rollover-smoke")
+    }
+
+    fn capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities::OPENCODE_V2
+    }
+
+    fn resolve_execution(&mut self) -> RuntimeResult<RuntimeExecutionId> {
+        RuntimeAdapter::resolve_execution(&mut self.inner)
+    }
+
+    fn create_execution(&mut self) -> RuntimeResult<RuntimeExecutionId> {
+        RuntimeAdapter::create_execution(&mut self.inner)
+    }
+
+    fn inspect_execution(
+        &self,
+        execution_id: &RuntimeExecutionId,
+    ) -> RuntimeResult<RuntimeExecution> {
+        RuntimeAdapter::inspect_execution(&self.inner, execution_id)
+    }
+
+    fn prepare_execution(
+        &mut self,
+        execution_id: &RuntimeExecutionId,
+        profile: &RuntimeProfile,
+    ) -> RuntimeResult<RuntimeExecution> {
+        RuntimeAdapter::prepare_execution(&mut self.inner, execution_id, profile)
+    }
+
+    fn observe_context(
+        &self,
+        event: &RuntimeContextEvent,
+    ) -> RuntimeResult<RuntimeContextObservation> {
+        RuntimeAdapter::observe_context(&self.inner, event)
+    }
+
+    fn stage_runtime_continuation(
+        &self,
+        execution_id: &RuntimeExecutionId,
+        continuation: &RuntimeContinuation,
+    ) -> RuntimeResult<()> {
+        RuntimeAdapter::stage_runtime_continuation(&self.inner, execution_id, continuation)
+    }
+
+    fn resume_runtime_continuation(
+        &self,
+        execution_id: &RuntimeExecutionId,
+        continuation: &RuntimeContinuation,
+    ) -> RuntimeResult<()> {
+        // Reuse the failpoint implementation above so the kill remains exactly
+        // before the real resume request.
+        <Self as SessionLifecycleClient>::resume_continuation(
+            self,
+            execution_id.as_str(),
+            &continuation.id,
+            &continuation.text,
+            &continuation.description,
+            &continuation.metadata,
+        )
+        .map_err(|error| RuntimeError::new(RuntimeErrorKind::ProviderCompletion, error.to_string()))
     }
 }
 
@@ -549,7 +624,7 @@ fn run_kill_phase() -> PhaseResult<()> {
         &source,
         observation(&source, "real-v2-cutover-kill", true, 90),
         &mut runtime,
-        &lead(),
+        &profile(),
     );
     Err(SmokeFailure::new(
         "ocg_recovery_failure",
@@ -615,7 +690,7 @@ fn run_recover_phase() -> PhaseResult<()> {
             &target,
             observation(&target, "real-v2-recover-after-kill", true, 10),
             &mut runtime,
-            &lead(),
+            &profile(),
         )
         .map_err(|error| SmokeFailure::new("ocg_recovery_failure", error.to_string()))?;
     if result.rollover_status != Some(MissionRolloverStatus::Applied) {
@@ -688,7 +763,7 @@ fn run_recover_phase() -> PhaseResult<()> {
             &target,
             observation(&target, "real-v2-recover-replay", true, 10),
             &mut runtime,
-            &lead(),
+            &profile(),
         )
         .map_err(|error| SmokeFailure::new("ocg_recovery_failure", error.to_string()))?;
     let after_replay = mission::load(&root, &mission_id)

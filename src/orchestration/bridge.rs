@@ -19,7 +19,9 @@ use crate::orchestration::controller::{
 use crate::orchestration::handoff::Role;
 use crate::process::CaptureRunner;
 use crate::reports::ReportsConfig;
-use crate::runtime::compat::{LeadSelection, RolloverRuntime};
+use crate::runtime::lifecycle::{
+    RuntimeAdapter, RuntimeContextEvent, RuntimeContextUsage, RuntimeProfile,
+};
 use crate::telemetry::{self, Event, OrchestrationMetrics, Outcome, TelemetryConfig};
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -44,8 +46,8 @@ pub struct BridgeContext<'a> {
     pub reports: ReportsConfig,
     /// Invocation-scoped runtime client. It is absent for ordinary bridge
     /// calls and for tests that only exercise policy projection.
-    pub rollover_runtime: Option<RefCell<Box<dyn RolloverRuntime>>>,
-    pub rollover_lead: Option<LeadSelection>,
+    pub rollover_runtime: Option<RefCell<Box<dyn RuntimeAdapter>>>,
+    pub rollover_profile: Option<RuntimeProfile>,
 }
 
 impl<'a> BridgeContext<'a> {
@@ -60,7 +62,7 @@ impl<'a> BridgeContext<'a> {
             telemetry,
             reports: ReportsConfig::default(),
             rollover_runtime: None,
-            rollover_lead: None,
+            rollover_profile: None,
         }
     }
 
@@ -68,13 +70,13 @@ impl<'a> BridgeContext<'a> {
     /// The client is held inside this short-lived bridge value: a dropped
     /// OpenCode/UI connection cannot turn into a Mission failure because the
     /// Mission record is never stored in this object.
-    pub fn with_rollover_runtime<R: RolloverRuntime + 'static>(
+    pub fn with_rollover_runtime<R: RuntimeAdapter + 'static>(
         mut self,
         runtime: R,
-        lead: LeadSelection,
+        profile: RuntimeProfile,
     ) -> Self {
         self.rollover_runtime = Some(RefCell::new(Box::new(runtime)));
-        self.rollover_lead = Some(lead);
+        self.rollover_profile = Some(profile);
         self
     }
 
@@ -350,50 +352,76 @@ impl<'a> BridgeContext<'a> {
             .or_else(|| payload.get("data").and_then(|data| data.get("tokens")))
             .cloned();
 
-        let (observation, decision, rollover) = if let Some(runtime_cell) =
-            self.rollover_runtime.as_ref()
-        {
-            let mut runtime_cell = runtime_cell.borrow_mut();
-            let runtime: &mut dyn RolloverRuntime = runtime_cell.as_mut();
-            match self.collect_v2_observation(
-                runtime,
-                &session,
-                &event_id,
-                now,
-                finish.clone(),
-                safe_boundary,
-                assistant_message_id.clone(),
-                step_tokens.as_ref(),
-                payload,
-            ) {
-                Ok(observation) => match self.controller.observe_context(
-                    &session,
-                    observation.clone(),
-                    runtime,
-                    self.rollover_lead
-                        .as_ref()
-                        .expect("runtime implies a Lead contract"),
-                ) {
-                    Ok(result) => {
-                        let decision = result.decision.clone();
-                        (observation, decision, Some(result))
+        let (observation, decision, rollover) =
+            if let Some(runtime_cell) = self.rollover_runtime.as_ref() {
+                let mut runtime_cell = runtime_cell.borrow_mut();
+                let runtime: &mut dyn RuntimeAdapter = runtime_cell.as_mut();
+                let reported_profile = payload
+                    .get("provider_id")
+                    .and_then(Value::as_str)
+                    .zip(payload.get("model_id").and_then(Value::as_str))
+                    .map(|(provider, model)| {
+                        RuntimeProfile::new(
+                            payload
+                                .get("agent")
+                                .and_then(Value::as_str)
+                                .unwrap_or("runtime"),
+                            format!("{provider}/{model}"),
+                            payload
+                                .get("variant")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        )
+                    });
+                let event = RuntimeContextEvent {
+                    execution_id: session.clone().into(),
+                    event_id: event_id.clone(),
+                    observed_at: now,
+                    assistant_message_id: assistant_message_id.clone(),
+                    finish: finish.clone(),
+                    safe_boundary,
+                    reported_usage: Some(RuntimeContextUsage::from_value(step_tokens.as_ref())),
+                    reported_profile,
+                };
+                match runtime.observe_context(&event) {
+                    Ok(runtime_observation) => {
+                        let observation = ContextObservation::from_runtime(runtime_observation);
+                        match self.controller.observe_context(
+                            &session,
+                            observation.clone(),
+                            runtime,
+                            self.rollover_profile
+                                .as_ref()
+                                .expect("runtime implies a profile"),
+                        ) {
+                            Ok(result) => {
+                                let decision = result.decision.clone();
+                                (observation, decision, Some(result))
+                            }
+                            Err(error) => {
+                                return self.error_outcome(
+                                    safe_error(&error.to_string()),
+                                    Some(Role::Lead),
+                                    Some(session),
+                                )
+                            }
+                        }
                     }
                     Err(error) => {
-                        return self.error_outcome(
-                            safe_error(&error.to_string()),
-                            Some(Role::Lead),
-                            Some(session),
-                        )
-                    }
-                },
-                Err(reason) => {
-                    let observation =
-                        ContextObservation::unknown(&session, &event_id, now, safe_error(&reason));
-                    let decision = self
-                        .controller
-                        .evaluate_context(&session, observation.clone())
-                        .unwrap_or_else(|error| {
-                            crate::orchestration::context_governor::GovernorDecision {
+                        let observation = ContextObservation::unknown(
+                            &session,
+                            &event_id,
+                            now,
+                            format!(
+                                "runtime context observation unavailable: {}",
+                                safe_error(&error.to_string())
+                            ),
+                        );
+                        let decision =
+                            self.controller
+                                .evaluate_context(&session, observation.clone())
+                                .unwrap_or_else(|error| {
+                                    crate::orchestration::context_governor::GovernorDecision {
                                 state: GovernorState::Unknown,
                                 action:
                                     crate::orchestration::context_governor::GovernorAction::Warn,
@@ -402,32 +430,32 @@ impl<'a> BridgeContext<'a> {
                                 deferred_for_boundary: false,
                                 reason: safe_error(&error.to_string()),
                             }
-                        });
-                    (observation, decision, None)
+                                });
+                        (observation, decision, None)
+                    }
                 }
-            }
-        } else {
-            let observation = ContextObservation::unknown(
+            } else {
+                let observation = ContextObservation::unknown(
                 &session,
                 &event_id,
                 now,
-                "no invocation-scoped OpenCode V2 client is available; context telemetry is unknown",
+                "no invocation-scoped runtime adapter is available; context telemetry is unknown",
             );
-            let decision = self
-                .controller
-                .evaluate_context(&session, observation.clone())
-                .unwrap_or_else(
-                    |error| crate::orchestration::context_governor::GovernorDecision {
-                        state: GovernorState::Unknown,
-                        action: crate::orchestration::context_governor::GovernorAction::Warn,
-                        utilization_percent: None,
-                        rollover_allowed: false,
-                        deferred_for_boundary: false,
-                        reason: safe_error(&error.to_string()),
-                    },
-                );
-            (observation, decision, None)
-        };
+                let decision = self
+                    .controller
+                    .evaluate_context(&session, observation.clone())
+                    .unwrap_or_else(|error| {
+                        crate::orchestration::context_governor::GovernorDecision {
+                            state: GovernorState::Unknown,
+                            action: crate::orchestration::context_governor::GovernorAction::Warn,
+                            utilization_percent: None,
+                            rollover_allowed: false,
+                            deferred_for_boundary: false,
+                            reason: safe_error(&error.to_string()),
+                        }
+                    });
+                (observation, decision, None)
+            };
 
         let value = context_governance_value(&observation, &decision, rollover.as_ref());
         BridgeOutcome {
@@ -442,107 +470,6 @@ impl<'a> BridgeContext<'a> {
             session_id: Some(session),
             task_type: "context".to_string(),
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn collect_v2_observation(
-        &self,
-        runtime: &dyn RolloverRuntime,
-        session: &str,
-        event_id: &str,
-        now: i64,
-        finish: Option<String>,
-        safe_boundary: bool,
-        assistant_message_id: Option<String>,
-        step_tokens: Option<&Value>,
-        payload: &Value,
-    ) -> Result<ContextObservation, String> {
-        let messages = runtime.context_messages(session).map_err(|error| {
-            format!(
-                "V2 context query unavailable: {}",
-                safe_error(&error.to_string())
-            )
-        })?;
-        let info = runtime.session_info(session).map_err(|error| {
-            format!(
-                "V2 session query unavailable: {}",
-                safe_error(&error.to_string())
-            )
-        })?;
-        if info.get("id").and_then(Value::as_str) != Some(session) {
-            return Err("V2 session query returned a different session identity".to_string());
-        }
-        let model = info.get("model").and_then(Value::as_object);
-        let provider_id = payload
-            .get("provider_id")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                model
-                    .and_then(|model| model.get("providerID"))
-                    .and_then(Value::as_str)
-            })
-            .map(str::to_string);
-        let model_id = payload
-            .get("model_id")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                model
-                    .and_then(|model| model.get("id").or_else(|| model.get("modelID")))
-                    .and_then(Value::as_str)
-            })
-            .map(str::to_string);
-        let mut metadata = if provider_id.is_some() || model_id.is_some() {
-            runtime
-                .model_metadata(provider_id.as_deref(), model_id.as_deref())
-                .map_err(|error| {
-                    format!(
-                        "V2 model metadata unavailable: {}",
-                        safe_error(&error.to_string())
-                    )
-                })?
-        } else {
-            crate::orchestration::context_governor::ModelMetadata::default()
-        };
-        // If the runtime reports a smaller effective budget on the session
-        // record, prefer it over the broader catalogue value. This is still a
-        // runtime observation, not a guessed provider limit.
-        let runtime_limit = info
-            .get("limit")
-            .and_then(|limit| limit.get("context").or_else(|| limit.get("contextLimit")))
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                model.and_then(|model| {
-                    model
-                        .get("limit")
-                        .and_then(|limit| {
-                            limit.get("context").or_else(|| limit.get("contextLimit"))
-                        })
-                        .and_then(Value::as_u64)
-                })
-            })
-            .or_else(|| info.get("contextLimit").and_then(Value::as_u64))
-            .or_else(|| model.and_then(|model| model.get("contextLimit").and_then(Value::as_u64)))
-            .filter(|limit| *limit > 0);
-        if let Some(runtime_limit) = runtime_limit {
-            metadata.effective_limit = Some(
-                metadata
-                    .effective_limit
-                    .map(|limit| limit.min(runtime_limit))
-                    .unwrap_or(runtime_limit),
-            );
-            metadata.source = Some("opencode-v2:/api/session+model".to_string());
-        }
-        Ok(ContextObservation::from_v2(
-            session,
-            event_id,
-            now,
-            finish,
-            safe_boundary,
-            assistant_message_id,
-            step_tokens,
-            &messages,
-            metadata,
-        ))
     }
 
     fn tool_before(&self, payload: &Value) -> BridgeOutcome {

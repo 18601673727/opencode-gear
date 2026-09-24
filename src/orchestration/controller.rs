@@ -48,7 +48,9 @@ use crate::orchestration::rollover::{
 };
 use crate::orchestration::state::{self, Attempts, OrchestrationPhase, SessionState};
 use crate::process::{CaptureRunner, GitHost};
-use crate::runtime::compat::{select_existing_session_lead, LeadSelection, RolloverRuntime};
+use crate::runtime::lifecycle::{
+    RuntimeAdapter, RuntimeContinuation, RuntimeError, RuntimeExecutionId, RuntimeProfile,
+};
 use crate::telemetry::OrchestrationMetrics;
 use crate::verification::config::VerificationConfig;
 use crate::verification::distill;
@@ -61,6 +63,10 @@ use std::path::{Path, PathBuf};
 /// hand-offs. It is advisory: [`parse_explore_output`] still falls back to a
 /// deterministic line parser when the model ignores it.
 pub const EXPLORE_RESPONSE_CONTRACT: &str = "\nExplore response contract (advisory): end your reply with one JSON object and no prose after it:\n{\"goal\":\"...\",\"constraints\":[\"...\"],\"findings\":[{\"summary\":\"...\",\"source\":\"path\",\"severity\":\"info|warning|critical\"}],\"files\":[\"path\"],\"symbols\":[\"name\"]}\n";
+
+fn runtime_gear_error(error: RuntimeError) -> GearError {
+    GearError::config(error.to_string())
+}
 
 /// The dynamic context prepared for an ordinary user message.
 ///
@@ -353,7 +359,7 @@ impl<'a> Controller<'a> {
                 }
             }
         }
-        mission.bind_session(session_key, now);
+        mission.bind_runtime_execution(&RuntimeExecutionId::new(session_key), now);
         if mission.task.is_none() {
             mission.task = Some(Self::stored_task_text(message));
         }
@@ -393,8 +399,8 @@ impl<'a> Controller<'a> {
         &self,
         session_id: &str,
         mut observation: ContextObservation,
-        runtime: &mut dyn RolloverRuntime,
-        lead: &LeadSelection,
+        runtime: &mut dyn RuntimeAdapter,
+        profile: &RuntimeProfile,
     ) -> Result<ContextGovernanceResult> {
         let source_session_id = state::safe_id(session_id);
         if source_session_id.is_empty() {
@@ -602,7 +608,7 @@ impl<'a> Controller<'a> {
                     source_session_id,
                     artifact,
                     runtime,
-                    lead,
+                    profile,
                     now,
                 );
             }
@@ -741,12 +747,13 @@ impl<'a> Controller<'a> {
                 &source_session_id,
                 observation.clone(),
                 decision.reason.clone(),
-                Some(LeadBinding::from_selection(lead)),
+                Some(LeadBinding::from_runtime_profile(profile)),
                 now,
                 &self.config.context_governor,
                 self.config.max_debug_retries,
             )?
         };
+        artifact.runtime_profile = Some(profile.clone());
         if artifact.artifact_id.is_empty() {
             return Err(GearError::config("rollover artifact has an empty id"));
         }
@@ -881,7 +888,7 @@ impl<'a> Controller<'a> {
                 source_session_id,
                 artifact,
                 runtime,
-                lead,
+                profile,
                 now,
             );
         }
@@ -904,7 +911,11 @@ impl<'a> Controller<'a> {
         let target_session_id = if let Some(target) = artifact.target_session_id.clone() {
             target
         } else {
-            match runtime.create_fresh_session() {
+            match runtime
+                .create_execution()
+                .map(|target| target.to_string())
+                .map_err(runtime_gear_error)
+            {
                 Ok(target) => target,
                 Err(error) => {
                     artifact.mark_failed(
@@ -968,7 +979,12 @@ impl<'a> Controller<'a> {
             return Err(GearError::config(error));
         }
 
-        if let Err(error) = select_existing_session_lead(runtime, &target_session_id, lead) {
+        let target_execution_id = RuntimeExecutionId::new(target_session_id.clone());
+        if let Err(error) = runtime
+            .prepare_execution(&target_execution_id, profile)
+            .map(|_| ())
+            .map_err(runtime_gear_error)
+        {
             artifact.mark_failed(
                 &error.to_string(),
                 now,
@@ -1003,7 +1019,7 @@ impl<'a> Controller<'a> {
         }
         // The target identity is a runtime fact, not merely a string returned
         // by the create call. Session info is read back before staging.
-        if let Err(error) = verify_target_session(runtime, &target_session_id) {
+        if let Err(error) = verify_target_execution(runtime, &target_execution_id) {
             artifact.mark_failed(
                 &error.to_string(),
                 now,
@@ -1038,16 +1054,16 @@ impl<'a> Controller<'a> {
             });
         }
 
-        let continuation_text = artifact.continuation.render();
-        let continuation_description = "OCG same-generation Mission continuation";
-        let continuation_metadata = rollover::continuation_metadata(&artifact.continuation);
-        if let Err(error) = runtime.stage_continuation(
-            &target_session_id,
-            &artifact.prompt_id(),
-            &continuation_text,
-            continuation_description,
-            &continuation_metadata,
-        ) {
+        let continuation = RuntimeContinuation::new(
+            artifact.prompt_id(),
+            artifact.continuation.render(),
+            "OCG same-generation Mission continuation",
+            rollover::continuation_metadata(&artifact.continuation),
+        );
+        if let Err(error) = runtime
+            .stage_runtime_continuation(&target_execution_id, &continuation)
+            .map_err(runtime_gear_error)
+        {
             artifact.mark_failed(
                 &error.to_string(),
                 now,
@@ -1083,7 +1099,7 @@ impl<'a> Controller<'a> {
         {
             artifact.mark_target_ready(
                 &target_session_id,
-                LeadBinding::from_selection(lead),
+                LeadBinding::from_runtime_profile(profile),
                 now,
             )?;
             rollover::save(&self.root, &artifact)?;
@@ -1238,13 +1254,10 @@ impl<'a> Controller<'a> {
         state_after.state.upsert(seeded, now);
         let state_error = state::save(&self.root, &state_after.state).err();
 
-        if let Err(error) = runtime.resume_continuation(
-            &target_session_id,
-            &artifact.prompt_id(),
-            &continuation_text,
-            continuation_description,
-            &continuation_metadata,
-        ) {
+        if let Err(error) = runtime
+            .resume_runtime_continuation(&target_execution_id, &continuation)
+            .map_err(runtime_gear_error)
+        {
             let retry_after =
                 Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds));
             artifact.mark_failed(&error.to_string(), now, retry_after);
@@ -1416,15 +1429,21 @@ impl<'a> Controller<'a> {
         decision: GovernorDecision,
         source_session_id: String,
         mut artifact: RolloverArtifact,
-        runtime: &mut dyn RolloverRuntime,
-        lead: &LeadSelection,
+        runtime: &mut dyn RuntimeAdapter,
+        profile: &RuntimeProfile,
         now: i64,
     ) -> Result<ContextGovernanceResult> {
+        artifact.runtime_profile = Some(profile.clone());
         let target_session_id = artifact
             .target_session_id
             .clone()
             .ok_or_else(|| GearError::config("active rollover has no target session"))?;
-        if let Err(error) = select_existing_session_lead(runtime, &target_session_id, lead) {
+        let target_execution_id = RuntimeExecutionId::new(target_session_id.clone());
+        if let Err(error) = runtime
+            .prepare_execution(&target_execution_id, profile)
+            .map(|_| ())
+            .map_err(runtime_gear_error)
+        {
             artifact.mark_failed(
                 &error.to_string(),
                 now,
@@ -1457,7 +1476,7 @@ impl<'a> Controller<'a> {
                 note: Some(crate::telemetry::task::redact(&error.to_string())),
             });
         }
-        if let Err(error) = verify_target_session(runtime, &target_session_id) {
+        if let Err(error) = verify_target_execution(runtime, &target_execution_id) {
             artifact.mark_failed(
                 &error.to_string(),
                 now,
@@ -1489,16 +1508,16 @@ impl<'a> Controller<'a> {
                 note: Some(crate::telemetry::task::redact(&error.to_string())),
             });
         }
-        let continuation_text = artifact.continuation.render();
-        let description = "OCG same-generation Mission continuation";
-        let metadata = rollover::continuation_metadata(&artifact.continuation);
-        if let Err(error) = runtime.resume_continuation(
-            &target_session_id,
-            &artifact.prompt_id(),
-            &continuation_text,
-            description,
-            &metadata,
-        ) {
+        let continuation = RuntimeContinuation::new(
+            artifact.prompt_id(),
+            artifact.continuation.render(),
+            "OCG same-generation Mission continuation",
+            rollover::continuation_metadata(&artifact.continuation),
+        );
+        if let Err(error) = runtime
+            .resume_runtime_continuation(&target_execution_id, &continuation)
+            .map_err(runtime_gear_error)
+        {
             let retry_after =
                 Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds));
             artifact.mark_failed(&error.to_string(), now, retry_after);
@@ -3845,17 +3864,17 @@ pub fn diff_reference(block: &str) -> Option<String> {
     ))
 }
 
-fn verify_target_session(runtime: &dyn RolloverRuntime, target_session_id: &str) -> Result<()> {
-    let info = runtime.session_info(target_session_id)?;
-    let reported = info
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            GearError::config("target session identity was not reported by the runtime")
-        })?;
-    if reported != target_session_id {
+fn verify_target_execution(
+    runtime: &dyn RuntimeAdapter,
+    target_execution_id: &RuntimeExecutionId,
+) -> Result<()> {
+    let execution = runtime
+        .inspect_execution(target_execution_id)
+        .map_err(runtime_gear_error)?;
+    if execution.id != *target_execution_id {
         return Err(GearError::config(format!(
-            "runtime reported target session {reported}, expected {target_session_id}"
+            "runtime reported target execution {}, expected {}",
+            execution.id, target_execution_id
         )));
     }
     Ok(())

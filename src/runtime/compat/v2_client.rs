@@ -1,11 +1,11 @@
 //! OpenCode 2.x local session transport.
 //!
-//! [`V2SessionClient`] implements the version-agnostic
-//! [`SessionClient`](super::SessionClient) contract against the OpenCode 2
-//! local daemon. Every HTTP route, JSON shape and discovery detail lives here,
-//! so no other module has to know how the v2 runtime is reached and no Lead
-//! policy is duplicated: [`select_session_lead`](super::select_session_lead)
-//! still decides *which* agent/model/variant to apply.
+//! [`V2SessionClient`] is the first concrete runtime lifecycle adapter. It
+//! implements the runtime-neutral contract in
+//! [`crate::runtime::lifecycle::RuntimeAdapter`] while retaining the existing
+//! OpenCode compatibility traits for launch/effective-state callers. Every
+//! HTTP route, JSON shape and discovery detail lives here, so Mission-facing
+//! orchestration does not parse V2 responses.
 //!
 //! The routes below were read from the running OpenCode 2.0.x server's own
 //! OpenAPI document (`GET /openapi.json`) and exercised live; they are not
@@ -40,7 +40,16 @@
 
 use crate::error::{GearError, Result};
 use crate::http::Secret;
-use crate::runtime::compat::{EffectiveLead, SessionClient, SessionLifecycleClient};
+use crate::runtime::compat::{
+    select_existing_session_lead, EffectiveLead, LeadSelection, SessionClient,
+    SessionLifecycleClient,
+};
+use crate::runtime::lifecycle::{
+    RuntimeAdapter, RuntimeCapabilities, RuntimeContextEvent, RuntimeContextObservation,
+    RuntimeContextUsage, RuntimeContinuation, RuntimeError, RuntimeErrorKind, RuntimeExecution,
+    RuntimeExecutionId, RuntimeIdentity, RuntimeModelMetadata, RuntimeProfile, RuntimeProvenance,
+    RuntimeResult,
+};
 use serde_json::{json, Map, Value};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -449,7 +458,7 @@ impl V2SessionClient {
         &self,
         provider_id: Option<&str>,
         model_id: Option<&str>,
-    ) -> Result<crate::orchestration::context_governor::ModelMetadata> {
+    ) -> Result<RuntimeModelMetadata> {
         let path = format!("/api/model?directory={}", encode_component(&self.directory));
         let body = self
             .send("GET", &path, None)?
@@ -470,12 +479,12 @@ impl V2SessionClient {
         let Some(entry) = entry else {
             // A valid catalogue response with no matching model is an
             // observation with unknown limits, not permission to invent one.
-            return Ok(crate::orchestration::context_governor::ModelMetadata {
+            return Ok(RuntimeModelMetadata {
                 source: Some("opencode-v2:/api/model".to_string()),
                 ..Default::default()
             });
         };
-        Ok(crate::orchestration::context_governor::ModelMetadata::from_v2_value(entry))
+        Ok(model_metadata_from_v2(entry))
     }
 
     /// Inject a durable synthetic continuation. The normal prompt route is
@@ -534,7 +543,7 @@ impl SessionLifecycleClient for V2SessionClient {
         &self,
         provider_id: Option<&str>,
         model_id: Option<&str>,
-    ) -> Result<crate::orchestration::context_governor::ModelMetadata> {
+    ) -> Result<RuntimeModelMetadata> {
         Self::model_metadata(self, provider_id, model_id)
     }
 
@@ -695,6 +704,342 @@ impl SessionClient for V2SessionClient {
             model_id,
             variant,
         })
+    }
+}
+
+fn runtime_error(error: GearError, default_kind: RuntimeErrorKind) -> RuntimeError {
+    let detail = error.to_string();
+    let lower = detail.to_ascii_lowercase();
+    let kind = if lower.contains("http 401")
+        || lower.contains("http 403")
+        || lower.contains("credential")
+        || lower.contains("unauthorized")
+    {
+        RuntimeErrorKind::Authentication
+    } else if lower.contains("transport")
+        || lower.contains("connection")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+    {
+        RuntimeErrorKind::Transport
+    } else if lower.contains("malformed")
+        || lower.contains("valid json")
+        || lower.contains("missing")
+        || lower.contains("did not contain")
+        || lower.contains("different session")
+    {
+        RuntimeErrorKind::InvalidResponse
+    } else {
+        default_kind
+    };
+    let safe_detail = sanitize_runtime_detail(&detail, kind);
+    RuntimeError::new(kind, safe_detail)
+}
+
+fn sanitize_runtime_detail(detail: &str, kind: RuntimeErrorKind) -> String {
+    let mut safe = detail
+        .replace("OpenCode V2 session request", "runtime request")
+        .replace("OpenCode V2 session response", "runtime response")
+        .replace("OpenCode V2 session", "runtime")
+        .replace("OpenCode", "runtime")
+        .replace("/api/", "<runtime-route>/")
+        .replace("/openapi", "<runtime-route>")
+        .replace("http://", "<runtime-endpoint>")
+        .replace("https://", "<runtime-endpoint>");
+    if safe.trim().is_empty() {
+        safe = match kind {
+            RuntimeErrorKind::Unavailable => {
+                "runtime lifecycle operation was unavailable".to_string()
+            }
+            RuntimeErrorKind::Unsupported => "runtime capability is unsupported".to_string(),
+            RuntimeErrorKind::ExecutionMissing => "runtime execution was not found".to_string(),
+            RuntimeErrorKind::Authentication => "runtime authentication was rejected".to_string(),
+            RuntimeErrorKind::Transport => "runtime transport was unavailable".to_string(),
+            RuntimeErrorKind::InvalidResponse => "runtime returned an invalid response".to_string(),
+            RuntimeErrorKind::ProfileSelection => {
+                "runtime profile selection or verification failed".to_string()
+            }
+            RuntimeErrorKind::ProviderCompletion => {
+                "runtime continuation could not be completed".to_string()
+            }
+        };
+    }
+    safe
+}
+
+fn profile_to_lead(profile: &RuntimeProfile) -> RuntimeResult<LeadSelection> {
+    if profile.is_empty() {
+        return Err(RuntimeError::new(
+            RuntimeErrorKind::ProfileSelection,
+            "runtime profile is missing its profile id or model selector",
+        ));
+    }
+    let (provider_id, model_id) = profile.model_selector.split_once('/').ok_or_else(|| {
+        RuntimeError::new(
+            RuntimeErrorKind::ProfileSelection,
+            "runtime profile model selector must be provider/model",
+        )
+    })?;
+    if provider_id.is_empty() || model_id.is_empty() {
+        return Err(RuntimeError::new(
+            RuntimeErrorKind::ProfileSelection,
+            "runtime profile model selector is incomplete",
+        ));
+    }
+    Ok(LeadSelection {
+        level: "runtime".to_string(),
+        agent: profile.profile_id.clone(),
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+        variant: profile.variant.clone(),
+    })
+}
+
+fn model_metadata_from_v2(value: &Value) -> RuntimeModelMetadata {
+    let limit = value.get("limit");
+    RuntimeModelMetadata {
+        provider_id: value
+            .get("providerID")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        model_id: value
+            .get("id")
+            .or_else(|| value.get("modelID"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        context_limit: limit
+            .and_then(|limit| limit.get("context"))
+            .and_then(Value::as_u64)
+            .filter(|limit| *limit > 0),
+        input_limit: limit
+            .and_then(|limit| limit.get("input"))
+            .and_then(Value::as_u64),
+        output_limit: limit
+            .and_then(|limit| limit.get("output"))
+            .and_then(Value::as_u64),
+        effective_limit: limit
+            .and_then(|limit| limit.get("context"))
+            .and_then(Value::as_u64)
+            .filter(|limit| *limit > 0),
+        source: Some("opencode-v2:/api/model".to_string()),
+    }
+}
+
+fn runtime_context_limit(info: &Value, model: Option<&Map<String, Value>>) -> Option<u64> {
+    info.get("limit")
+        .and_then(|limit| limit.get("context").or_else(|| limit.get("contextLimit")))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            model.and_then(|model| {
+                model
+                    .get("limit")
+                    .and_then(|limit| limit.get("context").or_else(|| limit.get("contextLimit")))
+                    .and_then(Value::as_u64)
+            })
+        })
+        .or_else(|| info.get("contextLimit").and_then(Value::as_u64))
+        .or_else(|| model.and_then(|model| model.get("contextLimit").and_then(Value::as_u64)))
+        .filter(|limit| *limit > 0)
+}
+
+impl RuntimeAdapter for V2SessionClient {
+    fn identity(&self) -> RuntimeIdentity {
+        RuntimeIdentity::new("opencode", "v2", "invocation")
+    }
+
+    fn capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities::OPENCODE_V2
+    }
+
+    fn resolve_execution(&mut self) -> RuntimeResult<RuntimeExecutionId> {
+        SessionClient::resolve_session(self)
+            .map(RuntimeExecutionId::new)
+            .map_err(|error| runtime_error(error, RuntimeErrorKind::Unavailable))
+    }
+
+    fn create_execution(&mut self) -> RuntimeResult<RuntimeExecutionId> {
+        V2SessionClient::create_fresh_session(self)
+            .map(RuntimeExecutionId::new)
+            .map_err(|error| runtime_error(error, RuntimeErrorKind::Unavailable))
+    }
+
+    fn inspect_execution(
+        &self,
+        execution_id: &RuntimeExecutionId,
+    ) -> RuntimeResult<RuntimeExecution> {
+        let info = self
+            .session_info(execution_id.as_str())
+            .map_err(|error| runtime_error(error, RuntimeErrorKind::ExecutionMissing))?;
+        let reported = info.get("id").and_then(Value::as_str).ok_or_else(|| {
+            RuntimeError::new(
+                RuntimeErrorKind::InvalidResponse,
+                "runtime execution response did not report an id",
+            )
+        })?;
+        if reported != execution_id.as_str() {
+            return Err(RuntimeError::new(
+                RuntimeErrorKind::ExecutionMissing,
+                format!(
+                    "runtime reported execution {reported}, expected {}",
+                    execution_id.as_str()
+                ),
+            ));
+        }
+        Ok(RuntimeExecution {
+            id: execution_id.clone(),
+            profile: None,
+        })
+    }
+
+    fn prepare_execution(
+        &mut self,
+        execution_id: &RuntimeExecutionId,
+        profile: &RuntimeProfile,
+    ) -> RuntimeResult<RuntimeExecution> {
+        let lead = profile_to_lead(profile)?;
+        select_existing_session_lead(self, execution_id.as_str(), &lead)
+            .map_err(|error| runtime_error(error, RuntimeErrorKind::ProfileSelection))?;
+        Ok(RuntimeExecution {
+            id: execution_id.clone(),
+            profile: Some(profile.clone()),
+        })
+    }
+
+    fn observe_context(
+        &self,
+        event: &RuntimeContextEvent,
+    ) -> RuntimeResult<RuntimeContextObservation> {
+        let messages = self
+            .context_messages(event.execution_id.as_str())
+            .map_err(|error| runtime_error(error, RuntimeErrorKind::Unavailable))?;
+        let info = self
+            .session_info(event.execution_id.as_str())
+            .map_err(|error| runtime_error(error, RuntimeErrorKind::Unavailable))?;
+        if info.get("id").and_then(Value::as_str) != Some(event.execution_id.as_str()) {
+            return Err(RuntimeError::new(
+                RuntimeErrorKind::InvalidResponse,
+                "runtime context query returned a different execution identity",
+            ));
+        }
+        let model = info.get("model").and_then(Value::as_object);
+        let reported_profile = event.reported_profile.as_ref();
+        let provider_id = reported_profile
+            .and_then(|profile| profile.model_selector.split_once('/'))
+            .map(|(provider, _)| provider.to_string())
+            .or_else(|| {
+                model
+                    .and_then(|model| model.get("providerID"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        let model_id = reported_profile
+            .and_then(|profile| profile.model_selector.split_once('/'))
+            .map(|(_, model)| model.to_string())
+            .or_else(|| {
+                model
+                    .and_then(|model| model.get("id").or_else(|| model.get("modelID")))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        let mut metadata = if provider_id.is_some() || model_id.is_some() {
+            self.model_metadata(provider_id.as_deref(), model_id.as_deref())
+                .map_err(|error| runtime_error(error, RuntimeErrorKind::InvalidResponse))?
+        } else {
+            RuntimeModelMetadata::default()
+        };
+        if let Some(limit) = runtime_context_limit(&info, model) {
+            metadata.effective_limit = Some(
+                metadata
+                    .effective_limit
+                    .map(|current| current.min(limit))
+                    .unwrap_or(limit),
+            );
+            metadata.source = Some("opencode-v2:/api/session+model".to_string());
+        }
+        let mut usage = event.reported_usage.clone().unwrap_or_default();
+        let mut assistant_message_id = event.assistant_message_id.clone();
+        if usage.is_empty() {
+            for message in messages.iter().rev() {
+                if message.get("type").and_then(Value::as_str) == Some("assistant") {
+                    usage = RuntimeContextUsage::from_value(message.get("tokens"));
+                    assistant_message_id = message
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or(assistant_message_id);
+                    if !usage.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+        let used_tokens = usage.active_context_tokens();
+        let overflow = usage.input.is_some() && usage.cache_read.is_some() && used_tokens.is_none();
+        let usage_provenance = if usage.is_empty() {
+            RuntimeProvenance::Unknown
+        } else {
+            RuntimeProvenance::Exact
+        };
+        let context_provenance = if used_tokens.is_some() {
+            RuntimeProvenance::Estimated
+        } else {
+            RuntimeProvenance::Unknown
+        };
+        Ok(RuntimeContextObservation {
+            execution_id: event.execution_id.clone(),
+            event_id: event.event_id.clone(),
+            observed_at: event.observed_at,
+            assistant_message_id,
+            finish: event.finish.clone(),
+            safe_boundary: event.safe_boundary,
+            usage,
+            used_tokens,
+            limit_tokens: metadata.effective_limit,
+            model: metadata,
+            message_count: messages.len(),
+            compaction_count: messages
+                .iter()
+                .filter(|message| message.get("type").and_then(Value::as_str) == Some("compaction"))
+                .count(),
+            usage_provenance,
+            context_provenance,
+            note: overflow.then(|| {
+                "runtime context token projection overflowed; no comparison was attempted"
+                    .to_string()
+            }),
+        })
+    }
+
+    fn stage_runtime_continuation(
+        &self,
+        execution_id: &RuntimeExecutionId,
+        continuation: &RuntimeContinuation,
+    ) -> RuntimeResult<()> {
+        SessionLifecycleClient::stage_continuation(
+            self,
+            execution_id.as_str(),
+            &continuation.id,
+            &continuation.text,
+            &continuation.description,
+            &continuation.metadata,
+        )
+        .map_err(|error| runtime_error(error, RuntimeErrorKind::Transport))
+    }
+
+    fn resume_runtime_continuation(
+        &self,
+        execution_id: &RuntimeExecutionId,
+        continuation: &RuntimeContinuation,
+    ) -> RuntimeResult<()> {
+        SessionLifecycleClient::resume_continuation(
+            self,
+            execution_id.as_str(),
+            &continuation.id,
+            &continuation.text,
+            &continuation.description,
+            &continuation.metadata,
+        )
+        .map_err(|error| runtime_error(error, RuntimeErrorKind::ProviderCompletion))
     }
 }
 
@@ -1156,6 +1501,95 @@ mod tests {
             .url
             .starts_with(&format!("{BASE}/api/model?directory=")));
         assert_eq!(requests[4].body.as_ref().unwrap()["resume"], json!(false));
+    }
+
+    #[test]
+    fn runtime_adapter_normalizes_v2_context_and_profile_selection() {
+        let fake = FakeTransport::with(vec![
+            ok(json!({
+                "data": [{
+                    "id": "msg",
+                    "type": "assistant",
+                    "tokens": {"input": 100, "cache": {"read": 25, "write": 9}, "output": 7}
+                }]
+            })),
+            ok(json!({
+                "data": {
+                    "id": SESSION,
+                    "agent": "lead-high",
+                    "model": {"id": "gpt-6-astra", "providerID": "openai"}
+                }
+            })),
+            ok(json!({
+                "data": [{
+                    "providerID": "openai",
+                    "id": "gpt-6-astra",
+                    "limit": {"context": 1000, "input": 900, "output": 100}
+                }]
+            })),
+        ]);
+        let subject = client(&fake);
+        let event = RuntimeContextEvent {
+            execution_id: RuntimeExecutionId::new(SESSION),
+            event_id: "event".to_string(),
+            observed_at: 7,
+            assistant_message_id: Some("msg".to_string()),
+            finish: Some("stop".to_string()),
+            safe_boundary: true,
+            reported_usage: None,
+            reported_profile: None,
+        };
+        let observation = RuntimeAdapter::observe_context(&subject, &event).unwrap();
+        assert_eq!(observation.used_tokens, Some(125));
+        assert_eq!(observation.limit_tokens, Some(1000));
+        assert_eq!(observation.usage.cache_write, Some(9));
+        assert_eq!(observation.usage_provenance, RuntimeProvenance::Exact);
+        assert_eq!(observation.context_provenance, RuntimeProvenance::Estimated);
+        assert_eq!(subject.capabilities(), RuntimeCapabilities::OPENCODE_V2);
+        assert_eq!(subject.identity().runtime, "opencode");
+    }
+
+    #[test]
+    fn runtime_adapter_prepares_a_profile_without_exposing_http_shapes() {
+        let fake = FakeTransport::with(vec![
+            no_content(),
+            no_content(),
+            ok(json!({
+                "data": {
+                    "agent": "lead-high",
+                    "model": {"id": "gpt-6-astra", "providerID": "openai"}
+                }
+            })),
+        ]);
+        let mut subject = client(&fake);
+        let profile = lead(None).runtime_profile();
+        let execution = RuntimeAdapter::prepare_execution(
+            &mut subject,
+            &RuntimeExecutionId::new(SESSION),
+            &profile,
+        )
+        .unwrap();
+        assert_eq!(execution.id.as_str(), SESSION);
+        assert_eq!(execution.profile, Some(profile));
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].url.ends_with("/agent"));
+        assert!(requests[1].url.ends_with("/model"));
+        assert!(requests[2].url.ends_with(SESSION));
+    }
+
+    #[test]
+    fn runtime_adapter_classifies_auth_without_transport_leakage() {
+        let fake = FakeTransport::with(vec![status(
+            401,
+            r#"{"message":"Bearer super-secret-token-value","path":"/api/session"}"#,
+        )]);
+        let mut subject = client(&fake);
+        let error = RuntimeAdapter::resolve_execution(&mut subject).unwrap_err();
+        assert_eq!(error.kind(), RuntimeErrorKind::Authentication);
+        assert!(error.detail().contains("401"));
+        assert!(!error.detail().contains("/api/"));
+        assert!(!error.detail().contains("super-secret-token-value"));
     }
 
     #[test]
