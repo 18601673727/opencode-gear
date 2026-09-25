@@ -22,6 +22,9 @@ models:
     opencode-go:
       label: "OpenCode Go"
 
+    opencode:
+      label: "OpenCode Zen"
+
     goat:
       label: "Command Code"
 
@@ -63,8 +66,8 @@ models:
       id: space-bunny-free
       label: "Space Bunny Free"
 
-    ocgo-muse-free:
-      provider: opencode-go
+    zen-muse-free:
+      provider: opencode
       id: muse-spark-1.3-contributor-free
       label: "Muse Spark 1.3 Contributor Free"
 
@@ -97,7 +100,7 @@ throttle:
 # -----------------------------------------------------------
 
 routing:
-  small_model: ocgo-muse-free
+  small_model: zen-muse-free
 
   roles:
     explore:
@@ -110,7 +113,7 @@ routing:
       model: goat-deepseek
 
     verify:
-      model: ocgo-muse-free
+      model: zen-muse-free
 
     debug:
       model: ocgo-bunny
