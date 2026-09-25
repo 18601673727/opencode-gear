@@ -491,6 +491,9 @@ fn a_corrupt_record_is_isolated_and_reported() {
     value["resources"][&key]["health"]["state"] = json!("not_a_real_state");
     fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
 
+    // Drop the replay authority so the legacy projection scan is exercised.
+    fs::remove_dir_all(opencode_gear::orchestration::replay_dir(project)).unwrap();
+    fs::remove_file(project.join(".opencode-gear/orchestration/replay.initialized")).unwrap();
     let loaded = load(project);
     assert!(
         !loaded.corrupt,

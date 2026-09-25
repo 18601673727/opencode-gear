@@ -1102,6 +1102,21 @@ impl Mission {
         true
     }
 
+    /// Record a rollover transition whose event identity is stable across
+    /// retries. [`Mission::record`] deduplicates that identity; when the caller
+    /// has nevertheless changed durable control metadata (for example re-opening
+    /// a retryable rollover or refreshing its retry cooldown), the mutation
+    /// witness must still advance. Otherwise the replay authority would reject
+    /// a content change committed at an unchanged revision.
+    fn record_or_advance(&mut self, event: MissionEvent, before: &Mission) -> bool {
+        let recorded = self.record(event);
+        let state_changed = self != before;
+        if !recorded && state_changed {
+            self.revision = self.revision.saturating_add(1);
+        }
+        recorded || state_changed
+    }
+
     /// Bind a runtime execution as the Mission's current execution state. The
     /// serialized `session_id` remains the backward-compatible wire field.
     pub fn bind_runtime_execution(&mut self, execution_id: &RuntimeExecutionId, now: i64) -> bool {
@@ -1262,6 +1277,7 @@ impl Mission {
         ) {
             return Ok(false);
         }
+        let before = self.clone();
         self.rollover.status = MissionRolloverStatus::Preparing;
         self.rollover.last_attempt_at = Some(now);
         self.rollover.last_error = None;
@@ -1273,7 +1289,7 @@ impl Mission {
             None,
             now,
         );
-        let changed = self.record(event);
+        let changed = self.record_or_advance(event, &before);
         self.updated_at = now;
         Ok(changed)
     }
@@ -1307,6 +1323,7 @@ impl Mission {
         if self.rollover.target_session_id.as_deref() == Some(target_session_id) {
             return Ok(false);
         }
+        let before = self.clone();
         self.rollover.status = MissionRolloverStatus::TargetReady;
         self.rollover.target_session_id = Some(target_session_id.to_string());
         self.rollover.last_attempt_at = Some(now);
@@ -1319,7 +1336,7 @@ impl Mission {
             None,
             now,
         );
-        let changed = self.record(event);
+        let changed = self.record_or_advance(event, &before);
         self.updated_at = now;
         Ok(changed)
     }
@@ -1360,6 +1377,7 @@ impl Mission {
             // Treat that as the same transition; never emit a second owner or
             // reset generation/terminal state.
             if self.rollover.status == MissionRolloverStatus::TargetReady {
+                let before = self.clone();
                 self.rollover.status = MissionRolloverStatus::Active;
                 self.rollover.last_error = None;
                 let event = self.event(
@@ -1370,7 +1388,7 @@ impl Mission {
                     Some(redact_reason("same-generation rollover recovery")),
                     now,
                 );
-                let _ = self.record(event);
+                let _ = self.record_or_advance(event, &before);
                 self.updated_at = now;
                 return Ok(true);
             }
@@ -1382,6 +1400,7 @@ impl Mission {
                 self.mission_id
             )));
         }
+        let before = self.clone();
         self.session_id = Some(target_session_id.to_string());
         self.rollover.status = MissionRolloverStatus::Active;
         self.rollover.last_error = None;
@@ -1393,7 +1412,7 @@ impl Mission {
             Some(redact_reason("same-generation rollover")),
             now,
         );
-        let changed = self.record(event);
+        let changed = self.record_or_advance(event, &before);
         self.updated_at = now;
         Ok(changed)
     }
@@ -1424,6 +1443,7 @@ impl Mission {
                 self.rollover.status.as_str()
             )));
         }
+        let before = self.clone();
         self.rollover.status = MissionRolloverStatus::Applied;
         self.rollover.retry_after = None;
         self.rollover.last_error = None;
@@ -1435,7 +1455,7 @@ impl Mission {
             None,
             now,
         );
-        let changed = self.record(event);
+        let changed = self.record_or_advance(event, &before);
         self.updated_at = now;
         Ok(changed)
     }
@@ -1462,6 +1482,7 @@ impl Mission {
             return Ok(false);
         }
         let old_status = self.rollover.status;
+        let before = self.clone();
         self.rollover.status = MissionRolloverStatus::Failed;
         self.rollover.last_attempt_at = Some(now);
         self.rollover.retry_after = retry_after;
@@ -1480,7 +1501,7 @@ impl Mission {
             Some(redact_reason(error)),
             now,
         );
-        let changed = self.record(event);
+        let changed = self.record_or_advance(event, &before);
         self.updated_at = now;
         Ok(changed)
     }
@@ -1503,6 +1524,7 @@ impl Mission {
         if self.rollover.status == MissionRolloverStatus::Conflict {
             return Ok(false);
         }
+        let before = self.clone();
         self.rollover.status = MissionRolloverStatus::Conflict;
         self.rollover.last_error = Some(redact_reason(reason));
         let event = self.event(
@@ -1513,7 +1535,7 @@ impl Mission {
             Some(redact_reason(reason)),
             now,
         );
-        let changed = self.record(event);
+        let changed = self.record_or_advance(event, &before);
         self.updated_at = now;
         Ok(changed)
     }
@@ -1770,7 +1792,7 @@ pub fn mission_path(root: &Path, mission_id: &str) -> Result<PathBuf> {
     Ok(missions_dir(root).join(format!("{mission_id}.json")))
 }
 
-fn validate_mission(mission: &Mission) -> Result<()> {
+pub(crate) fn validate_mission(mission: &Mission) -> Result<()> {
     if mission.schema_version != MISSION_SCHEMA_VERSION {
         return Err(GearError::config(format!(
             "mission {} has unsupported schema_version {}",
@@ -1832,14 +1854,36 @@ fn validate_mission(mission: &Mission) -> Result<()> {
     Ok(())
 }
 
-/// Load one Mission by id.
+/// A strict raw read of the legacy projection, without consulting the replay
+/// authority and without quarantining. Used to bootstrap the authority.
 ///
-/// - `Ok(None)`: no Mission record exists (that is not corruption).
-/// - `Ok(Some(_))`: the durable record, verified against the schema version.
-/// - `Err(_)`: the record is corrupt or from an unsupported schema version.
-///   It was quarantined to `<mission_id>.corrupt.json` (bytes preserved) and
-///   must never be silently treated as "no Mission".
-pub fn load(root: &Path, mission_id: &str) -> Result<Option<Mission>> {
+/// - `Ok(None)`: no record exists.
+/// - `Err(_)`: the record exists but is corrupt, unsupported or belongs to a
+///   different identity. The bytes are left untouched so a bootstrap can fail
+///   closed with unresolved corruption.
+pub(crate) fn load_raw(root: &Path, mission_id: &str) -> Result<Option<Mission>> {
+    let path = mission_path(root, mission_id)?;
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(GearError::read(&path, error)),
+    };
+    let mission: Mission = serde_json::from_str(&text)
+        .map_err(|error| GearError::config(format!("mission {mission_id} is corrupt: {error}")))?;
+    if mission.mission_id != mission_id {
+        return Err(GearError::config(format!(
+            "mission {mission_id} record identity {} does not match its path",
+            mission.mission_id
+        )));
+    }
+    validate_mission(&mission)?;
+    Ok(Some(mission))
+}
+
+/// Read one Mission from the legacy projection, quarantining a corrupt record
+/// and preserving its bytes. This is only consulted before the replay authority
+/// is initialized.
+fn load_projection(root: &Path, mission_id: &str) -> Result<Option<Mission>> {
     let path = mission_path(root, mission_id)?;
     if !path.is_file() {
         return Ok(None);
@@ -1879,6 +1923,29 @@ pub fn load(root: &Path, mission_id: &str) -> Result<Option<Mission>> {
     }
 }
 
+/// Load one Mission by id.
+///
+/// Once the replay authority is initialized it is the read source: a Mission
+/// removed from the projection is still returned while it remains in the
+/// authority. Only before first initialization is the legacy projection
+/// consulted for migration bootstrap.
+///
+/// - `Ok(None)`: no Mission record exists (that is not corruption).
+/// - `Ok(Some(_))`: the durable record, verified against the schema version.
+/// - `Err(_)`: the authority is unreadable, or (before initialization) the
+///   legacy record is corrupt or from an unsupported schema version. A corrupt
+///   legacy record is quarantined to `<mission_id>.corrupt.json` (bytes
+///   preserved) and must never be silently treated as "no Mission".
+pub fn load(root: &Path, mission_id: &str) -> Result<Option<Mission>> {
+    // Unsafe ids are rejected before any lookup, whether the authority or the
+    // legacy projection answers the read.
+    mission_path(root, mission_id)?;
+    match crate::orchestration::replay::read_authoritative_snapshot(root)? {
+        Some(snapshot) => Ok(snapshot.missions.get(mission_id).cloned()),
+        None => load_projection(root, mission_id),
+    }
+}
+
 /// Persist a Mission atomically. Ensures the state tree stays git-ignored.
 ///
 /// Mission writes use a small sibling lock so independent bridge processes do
@@ -1905,21 +1972,28 @@ pub fn save_if_revision(
 ) -> Result<bool> {
     validate_mission(mission)?;
     let _lock = MissionLock::acquire(root, &mission.mission_id)?;
-    let Some(current) = load(root, &mission.mission_id)? else {
-        return Ok(false);
-    };
-    if current.revision != expected_revision
-        || current.generation != mission.generation
-        || expected_owner.is_some_and(|owner| current.session_id.as_deref() != Some(owner))
-    {
+    if !crate::orchestration::replay::SnapshotService::compare_and_append_mission(
+        root,
+        mission,
+        expected_revision,
+        expected_owner,
+    )? {
         return Ok(false);
     }
-    write_mission_unchecked(root, mission)?;
+    write_mission_projection(root, mission)?;
     Ok(true)
 }
 
 fn write_mission_unchecked(root: &Path, mission: &Mission) -> Result<PathBuf> {
     crate::runtime::install::ensure_gitignore(root)?;
+    // The replay authority is committed before the compatibility projection.
+    // If the projection write below fails, the authority already holds the
+    // update and re-running this save is idempotent.
+    crate::orchestration::replay::record_mission_update(root, mission)?;
+    write_mission_projection(root, mission)
+}
+
+fn write_mission_projection(root: &Path, mission: &Mission) -> Result<PathBuf> {
     let path = mission_path(root, &mission.mission_id)?;
     let value = serde_json::to_value(mission).map_err(|error| {
         GearError::config(format!(
@@ -1997,6 +2071,16 @@ pub fn find_by_session(root: &Path, session_id: &str) -> Result<Option<Mission>>
     if session_id.is_empty() {
         return Ok(None);
     }
+    if let Some(snapshot) = crate::orchestration::replay::read_authoritative_snapshot(root)? {
+        return Ok(snapshot
+            .missions
+            .into_values()
+            .find(|mission| mission.session_id.as_deref() == Some(session_id)));
+    }
+    find_by_session_projection(root, session_id)
+}
+
+fn find_by_session_projection(root: &Path, session_id: &str) -> Result<Option<Mission>> {
     let dir = missions_dir(root);
     let Ok(entries) = fs::read_dir(dir) else {
         return Ok(None);
@@ -2012,7 +2096,7 @@ pub fn find_by_session(root: &Path, session_id: &str) -> Result<Option<Mission>>
         if name.ends_with(".corrupt") {
             continue;
         }
-        let Some(mission) = load(root, name)? else {
+        let Some(mission) = load_projection(root, name)? else {
             continue;
         };
         if mission.session_id.as_deref() == Some(session_id) {
@@ -2034,10 +2118,46 @@ pub struct MissionSummary {
     pub file: String,
 }
 
-/// List every readable Mission, most recently updated first. Read-only:
-/// corrupt files are counted, never returned, never quarantined here, and
-/// already-quarantined `.corrupt.json` records are skipped.
+fn mission_summary(mission: &Mission) -> MissionSummary {
+    MissionSummary {
+        mission_id: mission.mission_id.clone(),
+        status: mission.status,
+        phase: mission.phase,
+        generation: mission.generation,
+        session_id: mission.session_id.clone(),
+        updated_at: mission.updated_at,
+        file: format!("{}.json", mission.mission_id),
+    }
+}
+
+/// List every readable Mission, most recently updated first.
+///
+/// Once the replay authority is initialized it is the read source, so a
+/// Mission whose projection file failed or was removed is still listed from
+/// authoritative state. Only before initialization is the legacy projection
+/// scanned. A read-only operation: it never initializes or creates the replay
+/// store and never quarantines.
 pub fn list(root: &Path) -> (Vec<MissionSummary>, usize) {
+    match crate::orchestration::replay::read_authoritative_snapshot(root) {
+        Ok(Some(snapshot)) => {
+            let mut summaries: Vec<MissionSummary> =
+                snapshot.missions.values().map(mission_summary).collect();
+            summaries.sort_by(|a, b| {
+                b.updated_at
+                    .cmp(&a.updated_at)
+                    .then_with(|| a.mission_id.cmp(&b.mission_id))
+            });
+            (summaries, 0)
+        }
+        Ok(None) => list_projection(root),
+        // `list` has no error channel. An initialized-but-unreadable authority
+        // is reported as one unresolved corruption instead of an empty list,
+        // so a caller cannot mistake authority loss for "no Missions".
+        Err(_) => (Vec::new(), 1),
+    }
+}
+
+fn list_projection(root: &Path) -> (Vec<MissionSummary>, usize) {
     let dir = missions_dir(root);
     let Ok(entries) = fs::read_dir(&dir) else {
         return (Vec::new(), 0);
@@ -2165,7 +2285,11 @@ mod tests {
     fn corrupt_mission_is_quarantined_and_reported_never_silently_reset() {
         let dir = tempfile::tempdir().unwrap();
         let mission = admitted();
-        let path = save(dir.path(), &mission).unwrap();
+        // Write the legacy projection directly so the replay authority is not
+        // initialized: this exercises the migration-bootstrap read path.
+        let path = mission_path(dir.path(), TASK_ID).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec(&mission).unwrap()).unwrap();
         fs::write(&path, "{ this is not json").unwrap();
         let error = load(dir.path(), TASK_ID).unwrap_err();
         let text = error.to_string();
@@ -2388,8 +2512,20 @@ mod tests {
         older.updated_at = 1;
         let mut newer = Mission::admit("task-bbbbbbbbbbbbbbbb", "two", "s", 2);
         newer.updated_at = 2;
-        save(dir.path(), &older).unwrap();
-        save(dir.path(), &newer).unwrap();
+        // Write the legacy projections directly so the replay authority is not
+        // initialized and the projection scan is what is under test.
+        let missions = missions_dir(dir.path());
+        fs::create_dir_all(&missions).unwrap();
+        fs::write(
+            missions.join("task-aaaaaaaaaaaaaaaa.json"),
+            serde_json::to_vec(&older).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            missions.join("task-bbbbbbbbbbbbbbbb.json"),
+            serde_json::to_vec(&newer).unwrap(),
+        )
+        .unwrap();
         // A corrupt sibling is counted, never listed, never quarantined here.
         fs::write(
             missions_dir(dir.path()).join("task-cccccccccccccccc.json"),

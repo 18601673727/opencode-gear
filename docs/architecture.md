@@ -952,6 +952,48 @@ scoped, bounded and redacted. The reconcile and Policy receipts embed a compact
 budget projection and the economic reason, and the Policy receipt retains all
 co-firing blocking rules.
 
+## Durable replay authority
+
+Phase 2B-1 adds one durable authority above the per-domain durable files:
+`.opencode-gear/orchestration/replay/state.json` holds an authoritative snapshot
+of the current durable domains (full `Mission`s, `ApprovalRecord`s and
+normalized durable `ResourceObservation`s) plus a bounded, hash-chained journal
+of normalized upserts. The cursor is `{ epoch, seq }`, assigned under a
+project-wide cross-process file lock and read together with the snapshot under
+the same lock. The existing `missions/`, `approvals/` and `resources/` files
+remain compatibility projections written after the authority is committed.
+
+Corruption fails closed; retention is bounded and never yields a partial replay;
+and an epoch changes only through the explicit
+`begin_new_epoch_after_continuity_loss` assertion. Once initialized, the public
+Mission/approval/resource readers are served by the authority, and writers commit
+through it before refreshing the compatibility projections; the first bootstrap
+reads projections strictly and refuses to run over unresolved corruption. Mission
+upserts are monotonic (revision strictly advances within a generation) and the
+resource and approval domains are bounded by their own domain limits. See
+[replay.md](replay.md) for the authority, cursor and validation invariants.
+
+## Loopback control plane
+
+Phase 2B-2 exposes the authority through a thin, loopback-only HTTP/1.1 + SSE
+surface. `ControlService` (`src/orchestration/control.rs`) is the single,
+transport-neutral seam; `src/control_server.rs` only parses requests, routes
+them and frames JSON/SSE responses. `ocg serve [--addr 127.0.0.1:PORT]` binds a
+numeric loopback address (default `127.0.0.1:0`), prints the bound base URL and
+runs until terminated.
+
+The snapshot and budget reads that return a cursor pair their state and cursor
+in one authority read; approval and resource listings are authority-backed but
+do not return synchronization cursors. Writes (`POST /api/v1/approvals/{id}/approve|reject`,
+`PUT /api/v1/budgets/{mission}`) commit through the existing domain path and
+return the post-commit cursor. `GET /api/v1/events?epoch=&after=` replays the
+retained journal and then tails new events by polling the same reader; SSE ids
+are `epoch:seq`, heartbeats carry no id, and an expired/future/wrong-epoch
+cursor is an explicit failure rather than a partial replay. Failures use one
+typed JSON envelope with a stable code and status, bounded and redacted. There
+is no authentication, CORS, frontend, WebSocket or reconciliation route. See
+[control.md](control.md) for the routes, schemas, SSE semantics and limits.
+
 ## Verification, distillation and checkpoints
 
 Verification is the explicit, configured half of the quality loop. It is a

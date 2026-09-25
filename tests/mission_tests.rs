@@ -504,23 +504,14 @@ fn a_corrupt_mission_fails_explicitly_and_preserves_the_record() {
     let controller = new_controller(dir.path(), &git, &clock);
     let mission_id = Controller::task_id(TASK);
 
-    controller.admit_user_task("s", TASK).unwrap();
-    controller
-        .prepare_handoff("s", Role::Explore, "explore the parser")
-        .unwrap();
-    controller
-        .consume_explore_result("s", &explore_json())
-        .unwrap();
-
+    // A legacy projection that predates the replay authority is corrupt. This
+    // exercises the migration-bootstrap read path, where the projection is the
+    // authority until replay is first initialized.
     let path = mission::mission_path(dir.path(), &mission_id).unwrap();
-    let committed = fs::read_to_string(&path).unwrap();
-    assert!(
-        committed.contains("escape handling"),
-        "progress was committed before corruption"
-    );
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, "{ truncated").unwrap();
 
-    // A fresh session admitting the same task must NOT silently restart.
+    // A fresh session admitting the task must NOT silently restart.
     let error = controller.admit_user_task("s2", TASK).unwrap_err();
     let text = error.to_string();
     assert!(text.contains("corrupt"), "{text}");
@@ -536,17 +527,11 @@ fn a_corrupt_mission_fails_explicitly_and_preserves_the_record() {
         "no session was admitted against a corrupt Mission"
     );
 
-    // The still-live session keeps its progress and adopts a fresh record on
-    // its next touch: the corruption surfaced once and nothing was discarded.
-    controller
-        .prepare_handoff("s", Role::Build, "implement")
-        .unwrap();
-    let adopted = controller.load_mission(&mission_id).unwrap().unwrap();
-    assert_eq!(adopted.mission_id, mission_id);
-    assert!(adopted
-        .findings
-        .iter()
-        .any(|finding| finding.summary.contains("escape handling")));
+    // The quarantined artifact is unresolved corruption: it blocks an
+    // automatic replay bootstrap rather than being silently incorporated.
+    let retry = controller.admit_user_task("s2", TASK).unwrap_err();
+    assert!(retry.to_string().contains("unresolved corrupt"), "{retry}");
+    assert!(path.with_extension("corrupt.json").is_file());
 }
 
 #[test]
@@ -611,13 +596,12 @@ fn mission_listing_is_read_only_and_does_not_create_state() {
 #[test]
 fn an_invalid_revision_is_quarantined_instead_of_being_adopted() {
     let dir = tempfile::tempdir().unwrap();
-    let clock = FixedClock::new(1_000);
-    let git = FakeGitHost::new();
-    let controller = new_controller(dir.path(), &git, &clock);
-    let mission_id = controller.admit_user_task("s", TASK).unwrap().task_id;
+    let mission_id = Controller::task_id(TASK);
+    // Write the legacy projection directly so the replay authority is not
+    // initialized and the projection validation is exercised.
     let path = mission::mission_path(dir.path(), &mission_id).unwrap();
-    let mut value: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut value = serde_json::to_value(Mission::admit(&mission_id, TASK, "s", 1)).unwrap();
     value["revision"] = json!(0);
     fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
     assert!(mission::load(dir.path(), &mission_id).is_err());

@@ -207,6 +207,8 @@ pub enum Command {
     Approve(Vec<OsString>),
     /// Resolve a pending approval as rejected.
     Reject(Vec<OsString>),
+    /// Run the loopback-only HTTP/SSE control server.
+    Serve(Vec<OsString>),
     /// Hidden/internal: the generated plugin's bridge. Never advertised.
     Bridge(Vec<OsString>),
     Version,
@@ -405,6 +407,7 @@ where
                     | Some("approvals")
                     | Some("approve")
                     | Some("reject")
+                    | Some("serve")
             ) {
                 rest.push(args[index].clone());
                 index += 1;
@@ -469,6 +472,7 @@ where
         Some("approvals") => Command::Approvals(rest),
         Some("approve") => Command::Approve(rest),
         Some("reject") => Command::Reject(rest),
+        Some("serve") => Command::Serve(rest),
         Some("__bridge") => Command::Bridge(rest),
         Some("version") => Command::Version,
         Some("doctor") => Command::Doctor,
@@ -538,6 +542,8 @@ Commands:
                         approve a pending admission request
   reject <id> [--note TEXT] [--json]
                         reject a pending admission request
+  serve [--addr 127.0.0.1:PORT]
+                        run the loopback-only HTTP/SSE control server
   version               report Gear, platform and the resolved OpenCode runtime
   doctor                diagnose layering, Lead contracts, OpenCode, proxy and runtime (read-only)
   upgrade               self-update Gear, then maintain the active OpenCode
@@ -701,7 +707,7 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
         env.throttle.as_deref(),
     );
 
-    if cli.dry_run && !matches!(cli.command, Command::Reconcile(_)) {
+    if cli.dry_run && !matches!(cli.command, Command::Reconcile(_) | Command::Serve(_)) {
         // Runtime-facing output: a dry-run must print the same contract a real
         // launch would use, so the runtime family is resolved exactly like
         // launch/doctor/models resolve it.
@@ -913,6 +919,10 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
                 crate::orchestration::policy::ApprovalStatus::Rejected,
                 cli.pretty,
             )
+        }
+        Command::Serve(args) => {
+            boundary.require(&invocation_dir).map_err(Failure::Gear)?;
+            serve_command(&project_root, args, cli.pretty)
         }
         Command::Bridge(args) => {
             boundary.require(&invocation_dir).map_err(Failure::Gear)?;
@@ -1599,35 +1609,13 @@ fn budget_set_command(
     validate::require_valid(effective).map_err(Failure::Gear)?;
     let clock = SystemClock;
     let now = clock.now_unix();
-    let Some(mut mission) =
-        crate::orchestration::mission::load(project_root, &mission_id).map_err(Failure::Gear)?
-    else {
-        return Err(Failure::Gear(GearError::config(format!(
-            "unknown Mission '{mission_id}'"
-        ))));
-    };
-    let expected_revision = mission.revision;
-    let expected_owner = mission.session_id.clone();
+    let service =
+        crate::orchestration::ControlService::open(project_root).map_err(Failure::Gear)?;
     let amount = crate::orchestration::budget::Money::new(limit, currency);
-    if !mission
-        .set_hard_budget(amount, now)
-        .map_err(Failure::Gear)?
-    {
-        // Setting the same limit is a no-op; report the durable state.
-    }
-    if !crate::orchestration::mission::save_if_revision(
-        project_root,
-        &mission,
-        expected_revision,
-        expected_owner.as_deref(),
-    )
-    .map_err(Failure::Gear)?
-    {
-        return Err(Failure::Gear(GearError::config(
-            "Mission changed while setting the hard budget; retry later",
-        )));
-    }
-    let budget = mission.budget.receipt();
+    let view = service
+        .set_budget(&mission_id, amount, now)
+        .map_err(|error| Failure::Gear(error.into_gear_error()))?;
+    let budget = view.budget;
     if json {
         print_json(
             &serde_json::to_value(&budget).unwrap_or(serde_json::Value::Null),
@@ -1769,14 +1757,11 @@ fn resolve_approval_command(
     let approval_id = approval_id.ok_or_else(|| usage_failure("an approval id is required"))?;
     validate::require_valid(effective).map_err(Failure::Gear)?;
     let clock = SystemClock;
-    let record = crate::orchestration::policy::resolve_approval(
-        project_root,
-        &approval_id,
-        status,
-        note,
-        clock.now_unix(),
-    )
-    .map_err(Failure::Gear)?;
+    let service =
+        crate::orchestration::ControlService::open(project_root).map_err(Failure::Gear)?;
+    let (record, _cursor) = service
+        .resolve_approval(&approval_id, status, note, clock.now_unix())
+        .map_err(|error| Failure::Gear(error.into_gear_error()))?;
     if json {
         let value = serde_json::to_value(&record).unwrap_or(serde_json::Value::Null);
         print_json(&value, pretty);
@@ -1799,6 +1784,42 @@ fn print_json(value: &serde_json::Value, pretty: bool) {
             serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
         }
     );
+}
+
+/// `ocg serve [--addr 127.0.0.1:PORT]`: run the loopback-only HTTP/SSE control
+/// server over the durable orchestration authority.
+///
+/// The server prints its bound base URL and then runs until the process is
+/// terminated. Only loopback addresses are accepted, so the control plane can
+/// never be reached from another host.
+fn serve_command(
+    project_root: &Path,
+    args: &[OsString],
+    pretty: bool,
+) -> std::result::Result<i32, Failure> {
+    let mut addr = "127.0.0.1:0".to_string();
+    let mut index = 0;
+    while index < args.len() {
+        let text = args[index].to_string_lossy().into_owned();
+        if text == "--addr" || text.starts_with("--addr=") {
+            addr = option_value(args, "--addr", &mut index)?;
+            continue;
+        }
+        return Err(usage_failure(format!("unknown serve option: {text}")));
+    }
+    let config = crate::control_server::ServerConfig::default();
+    let server = crate::control_server::ControlServer::bind(&addr, project_root, config)
+        .map_err(Failure::Gear)?;
+    let base = server.base_url();
+    if pretty {
+        print_json(&json!({ "listening": base }), true);
+    } else {
+        println!("listening on {base}");
+    }
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    server.serve(stop).map_err(Failure::Gear)?;
+    Ok(0)
 }
 
 /// The project template written by `ocg init`.

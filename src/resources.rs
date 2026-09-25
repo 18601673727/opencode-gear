@@ -969,6 +969,30 @@ impl ResourceRegistry {
         self.observations.get(id.as_str())
     }
 
+    /// The complete durable observation set, keyed by resource id.
+    ///
+    /// This is the exact normalized domain that the replay authority owns; the
+    /// configured uses are derived and never durable.
+    pub(crate) fn observations(&self) -> &BTreeMap<String, ResourceObservation> {
+        &self.observations
+    }
+
+    /// Rebuild the durable registry from an authoritative observation set.
+    /// Configured uses are derived elsewhere and are never supplied here.
+    pub(crate) fn from_observations(
+        updated_at: i64,
+        observations: BTreeMap<String, ResourceObservation>,
+    ) -> Self {
+        let mut registry = Self {
+            schema_version: RESOURCE_SCHEMA_VERSION,
+            updated_at,
+            observations,
+            configured: BTreeMap::new(),
+        };
+        registry.enforce_bound();
+        registry
+    }
+
     /// Build the merged view for one id.
     pub fn resource(&self, id: &ResourceId) -> Option<ResourceRecord> {
         let observation = self.observations.get(id.as_str())?;
@@ -1060,41 +1084,68 @@ fn is_safe_id(value: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
 }
 
-/// Load the registry, keeping corruption explicit and per-record isolated.
-pub fn load(root: &Path) -> LoadedRegistry {
+/// A strict raw read of the legacy projection, without consulting the replay
+/// authority. Used to bootstrap the authority and to read projections before
+/// the first initialization.
+///
+/// - A missing registry is `Ok(empty)` with `exists == false`.
+/// - An unreadable document (I/O) is `Err`.
+/// - A malformed or unsupported document is `Ok(corrupt == true)` so the
+///   caller can fail closed with the registry's own representation.
+pub(crate) fn load_raw(root: &Path) -> Result<LoadedRegistry> {
     let path = registry_path(root);
-    if !path.is_file() {
-        return LoadedRegistry {
-            registry: ResourceRegistry::new(0),
-            corrupt: false,
-            exists: false,
-            issues: Vec::new(),
-        };
-    }
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(_) => return corrupt(file_issue(&path, "registry document could not be read")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LoadedRegistry {
+                registry: ResourceRegistry::new(0),
+                corrupt: false,
+                exists: false,
+                issues: Vec::new(),
+            })
+        }
+        Err(error) => return Err(GearError::read(&path, error)),
     };
     let value: Value = match serde_json::from_str(&text) {
         Ok(value) => value,
         Err(error) => {
-            return corrupt(file_issue(
+            return Ok(corrupt(file_issue(
                 &path,
                 &format!("registry document is not valid JSON: {error}"),
-            ))
+            )))
         }
     };
-    let schema_version = value
+    let raw_schema_version = value
         .get("schema_version")
         .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
+        .unwrap_or(0);
+    let schema_version = match u32::try_from(raw_schema_version) {
+        Ok(version) => version,
+        Err(_) => {
+            return Ok(corrupt(file_issue(
+                &path,
+                &format!("registry has an out-of-range schema_version {raw_schema_version}"),
+            )))
+        }
+    };
     if schema_version != RESOURCE_SCHEMA_VERSION {
-        return corrupt(file_issue(
+        return Ok(corrupt(file_issue(
             &path,
             &format!("registry has unsupported schema_version {schema_version}"),
-        ));
+        )));
     }
-    let updated_at = value.get("updated_at").and_then(Value::as_i64).unwrap_or(0);
+    let Some(updated_at) = value.get("updated_at").and_then(Value::as_i64) else {
+        return Ok(corrupt(file_issue(
+            &path,
+            "registry is missing a valid updated_at",
+        )));
+    };
+    if value.get("resources").and_then(Value::as_object).is_none() {
+        return Ok(corrupt(file_issue(
+            &path,
+            "registry is missing a valid resources object",
+        )));
+    }
     let mut registry = ResourceRegistry::new(updated_at);
     let mut issues = Vec::new();
     if let Some(resources) = value.get("resources").and_then(Value::as_object) {
@@ -1117,11 +1168,47 @@ pub fn load(root: &Path) -> LoadedRegistry {
         }
     }
     registry.enforce_bound();
-    LoadedRegistry {
+    Ok(LoadedRegistry {
         registry,
         corrupt: false,
         exists: true,
         issues,
+    })
+}
+
+/// Load the authoritative durable registry.
+///
+/// Once the replay authority is initialized it is the read source; only before
+/// first initialization is the legacy projection consulted for migration
+/// bootstrap. An initialized-but-unreadable authority fails closed with the
+/// registry's existing `corrupt` representation.
+pub fn load(root: &Path) -> LoadedRegistry {
+    match crate::orchestration::replay::read_authoritative_snapshot(root) {
+        Ok(Some(snapshot)) => {
+            let updated_at = snapshot
+                .resources
+                .values()
+                .map(|observation| observation.updated_at)
+                .max()
+                .unwrap_or(0);
+            LoadedRegistry {
+                registry: ResourceRegistry::from_observations(updated_at, snapshot.resources),
+                corrupt: false,
+                exists: true,
+                issues: Vec::new(),
+            }
+        }
+        Ok(None) => match load_raw(root) {
+            Ok(loaded) => loaded,
+            Err(error) => corrupt(file_issue(
+                &registry_path(root),
+                &format!("registry projection could not be read: {error}"),
+            )),
+        },
+        Err(error) => corrupt(file_issue(
+            &crate::orchestration::replay::state_path(root),
+            &format!("replay authority is unreadable: {error}"),
+        )),
     }
 }
 
@@ -1141,7 +1228,7 @@ fn file_issue(path: &Path, detail: &str) -> ResourceIssue {
     }
 }
 
-fn validate_observation(
+pub(crate) fn validate_observation(
     key: &str,
     observation: &ResourceObservation,
 ) -> std::result::Result<(), String> {
@@ -1164,6 +1251,8 @@ fn validate_observation(
 /// Persist the registry atomically. Only dynamic observations are written.
 pub fn save(root: &Path, registry: &ResourceRegistry) -> Result<PathBuf> {
     crate::runtime::install::ensure_gitignore(root)?;
+    // The replay authority is committed before the compatibility projection.
+    crate::orchestration::replay::record_resource_updates(root, registry)?;
     let path = registry_path(root);
     let document = RegistryDocument {
         schema_version: RESOURCE_SCHEMA_VERSION,

@@ -554,12 +554,20 @@ impl<'a> Controller<'a> {
                 candidate.reconcile.status == MissionReconcileStatus::Conflict;
             if has_control_state {
                 if !incoming_is_explicit_conflict {
-                    candidate.reconcile = current.reconcile;
+                    candidate.reconcile = current.reconcile.clone();
                 }
                 // The bridge snapshot may predate the reconciler's CAS write.
                 // Never move the durable revision witness backwards while
                 // preserving (or explicitly invalidating) its control state.
                 candidate.revision = candidate.revision.max(current.revision.saturating_add(1));
+                candidate.updated_at = candidate.updated_at.max(current.updated_at);
+            }
+            // The replay authority requires a content change to strictly advance
+            // the revision witness. A merged stale snapshot may still differ in
+            // non-authoritative fields at an equal revision, so advance once
+            // rather than letting the authority reject a legitimate bridge write.
+            if candidate != current && candidate.revision <= current.revision {
+                candidate.revision = current.revision.saturating_add(1);
                 candidate.updated_at = candidate.updated_at.max(current.updated_at);
             }
         }

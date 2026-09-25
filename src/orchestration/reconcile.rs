@@ -949,7 +949,20 @@ impl<'a, 'r> Reconciler<'a, 'r> {
                 .cmp(&right.file)
                 .then_with(|| left.classification.cmp(&right.classification))
         });
-        let (summaries, _) = mission::list(&root);
+        let (summaries, authority_corrupt) = mission::list(&root);
+        if authority_corrupt > 0
+            && !issues
+                .iter()
+                .any(|issue| issue.classification == "replay_authority")
+        {
+            issues.push(MissionStoreIssue {
+                file: crate::orchestration::replay::state_path(&root)
+                    .display()
+                    .to_string(),
+                classification: "replay_authority".to_string(),
+                detail: "the authoritative Mission snapshot is unreadable".to_string(),
+            });
+        }
         let mut results = Vec::new();
         for summary in summaries {
             results.push(self.reconcile_mission(&summary.mission_id));

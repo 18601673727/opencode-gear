@@ -899,6 +899,16 @@ reserved and unresolved spend; `ocg budget set --mission <id> --limit <micros>
 --currency <code>` is the only supported way to raise or change a cap. See
 [architecture.md](docs/architecture.md#mission-budget-and-quota-admission).
 
+`ocg serve [--addr 127.0.0.1:PORT]` runs a loopback-only HTTP/1.1 + SSE control
+server over the durable orchestration authority. It is local operator tooling,
+not a network service: only numeric loopback addresses bind, there is no
+authentication/CORS/frontend/WebSocket support, and there is no reconciliation
+route. Reads, approval mutations, resource/budget inspection and an
+event stream from a cursor are available; every mutation returns the
+post-commit cursor so a stream can resume without a gap. See
+[docs/control.md](docs/control.md) for the routes, schemas, SSE semantics and
+limits.
+
 Inside the TUI, `Tab` / `Shift+Tab` cycle the three Lead agents. The cycle
 order depends on the active `default_agent`; the default configuration starts
 at `lead-low`. If you do not want the keybind, remove `keybinds` from
@@ -1505,6 +1515,8 @@ walkthrough.
 | [docs/architecture.md](docs/architecture.md) | The two axes, resolution pipeline, invariants, extension points |
 | [docs/configuration.md](docs/configuration.md) | Every registry, override shape, environment variable and command |
 | [docs/verification.md](docs/verification.md) | Verification, log distillation, test selection, capabilities/firewall, checkpoints, stable ordering |
+| [docs/replay.md](docs/replay.md) | The durable replay authority: cursor/atomicity, epochs, retention, fail-closed bootstrap |
+| [docs/control.md](docs/control.md) | The loopback-only HTTP/1.1 + SSE control plane: routes, schemas, error envelope, limits |
 | [docs/telemetry.md](docs/telemetry.md) | Telemetry schema, privacy model, token provenance, orchestration accounting, `ocg stats`, doctor checks, deferred boundaries |
 | [docs/token-efficiency.md](docs/token-efficiency.md) | Recorded deterministic context, log-distillation and orchestration hand-off measurements |
 | [docs/migration.md](docs/migration.md) | Step-by-step migration from a whole-bundle Gear/profile setup |

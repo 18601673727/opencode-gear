@@ -25,6 +25,7 @@ pub mod budget;
 pub mod checkpoint;
 pub mod config;
 pub mod context_governor;
+pub mod control;
 pub mod controller;
 pub mod handoff;
 pub mod mission;
@@ -32,6 +33,7 @@ pub mod plugin;
 pub mod policy;
 pub mod projection;
 pub mod reconcile;
+pub mod replay;
 pub mod rollover;
 pub mod state;
 
@@ -46,6 +48,10 @@ pub use config::OrchestrationConfig;
 pub use context_governor::{
     ContextGovernorConfig, ContextObservation, GovernorAction, GovernorDecision, GovernorState,
     ModelMetadata, TelemetryProvenance, TokenUsage,
+};
+pub use control::{
+    ApiIssue, ApprovalsView, BudgetView, ControlError, ControlService, ReplaySlice, ResourcesView,
+    SnapshotView, CONTROL_API_SCHEMA_VERSION, MAX_ERROR_MESSAGE_BYTES,
 };
 pub use controller::{
     BuildDecision, BuildOutcome, ContextGovernanceResult, Controller, ExploreDigest,
@@ -71,6 +77,11 @@ pub use reconcile::{
     latest_artifact, load_artifact, plan, MissionStoreIssue, ObservationStatus, ReconcileAction,
     ReconcileArtifact, ReconcileDecision, ReconcileInput, ReconcileOutcome, ReconcileResult,
     ReconcileRun, RuntimeObservation, RECONCILE_SCHEMA_VERSION,
+};
+pub use replay::{
+    replay_dir, state_path, AuthoritativeSnapshot, Cursor, DomainEvent, EventEnvelope, ReplayAfter,
+    SnapshotConfig, SnapshotService, DEFAULT_RETENTION, MAX_RETENTION, REPLAY_DIR, REPLAY_FILE,
+    REPLAY_SCHEMA_VERSION,
 };
 pub use rollover::{
     ContinuationPacket, LeadBinding, RolloverArtifact, RolloverStatus, ROLLOVER_SCHEMA_VERSION,

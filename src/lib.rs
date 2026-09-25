@@ -14,6 +14,7 @@ pub mod clock;
 pub mod config;
 pub mod config_command;
 pub mod context;
+pub mod control_server;
 pub mod defaults;
 pub mod error;
 pub mod http;

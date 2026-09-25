@@ -750,9 +750,12 @@ fn approval_persistence_round_trips_and_rejects_corruption() {
     assert!(!again.authorizes("task-1", 2, PolicyAction::RecoverExecution));
     assert!(!again.authorizes("task-1", 1, PolicyAction::EnsureExecution));
 
-    // Corruption is explicit, never a silent reset.
-    let path = approval_path(dir.path(), &request.approval_id).unwrap();
-    fs::write(&path, "{ not json").unwrap();
+    // Corruption of the durable authority is explicit, never a silent reset.
+    fs::write(
+        opencode_gear::orchestration::state_path(dir.path()),
+        "{ not json",
+    )
+    .unwrap();
     assert!(load_approval(dir.path(), &request.approval_id).is_err());
     let listed = list_approvals(dir.path());
     assert!(listed.approvals.is_empty());

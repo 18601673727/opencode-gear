@@ -1056,14 +1056,15 @@ pub fn approval_path(root: &Path, approval_id: &str) -> Result<PathBuf> {
     Ok(approval_dir(root).join(format!("{approval_id}.json")))
 }
 
-/// Load one approval record. A missing record is `Ok(None)`; a corrupt or
-/// unsupported record is an explicit error, never a silent reset.
-pub fn load_approval(root: &Path, approval_id: &str) -> Result<Option<ApprovalRecord>> {
+/// A strict raw read of the legacy projection, without consulting the replay
+/// authority.
+pub(crate) fn load_approval_raw(root: &Path, approval_id: &str) -> Result<Option<ApprovalRecord>> {
     let path = approval_path(root, approval_id)?;
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let text = fs::read_to_string(&path).map_err(|error| GearError::read(&path, error))?;
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(GearError::read(&path, error)),
+    };
     let record: ApprovalRecord = serde_json::from_str(&text).map_err(|error| {
         GearError::config(format!("approval {approval_id} is corrupt: {error}"))
     })?;
@@ -1071,10 +1072,25 @@ pub fn load_approval(root: &Path, approval_id: &str) -> Result<Option<ApprovalRe
     Ok(Some(record))
 }
 
+/// Load one approval record.
+///
+/// Once the replay authority is initialized it is the read source; only before
+/// first initialization is the legacy projection consulted. A missing record
+/// is `Ok(None)`; a corrupt/unsupported record or an unreadable authority is
+/// an explicit error, never a silent reset.
+pub fn load_approval(root: &Path, approval_id: &str) -> Result<Option<ApprovalRecord>> {
+    match crate::orchestration::replay::read_authoritative_snapshot(root)? {
+        Some(snapshot) => Ok(snapshot.approvals.get(approval_id).cloned()),
+        None => load_approval_raw(root, approval_id),
+    }
+}
+
 /// Persist one approval record atomically, then enforce bounded retention.
 pub fn save_approval(root: &Path, record: &ApprovalRecord) -> Result<PathBuf> {
     validate_approval(&record.approval_id, record)?;
     crate::runtime::install::ensure_gitignore(root)?;
+    // The replay authority is committed before the compatibility projection.
+    crate::orchestration::replay::record_approval_update(root, record)?;
     let path = approval_path(root, &record.approval_id)?;
     let value = serde_json::to_value(record)
         .map_err(|error| GearError::config(format!("cannot serialize approval record: {error}")))?;
@@ -1114,15 +1130,32 @@ pub fn resolve_approval(
     Ok(record)
 }
 
-/// List every readable approval record, newest request first. Corrupt records
-/// are surfaced, never silently dropped.
-pub fn list_approvals(root: &Path) -> LoadedApprovals {
+/// A strict raw scan of the legacy projection, without consulting the replay
+/// authority. A missing directory is empty; a directory read error propagates.
+/// Per-record corruption is surfaced as an issue, never silently dropped.
+pub(crate) fn list_approvals_raw(root: &Path) -> Result<LoadedApprovals> {
     let mut loaded = LoadedApprovals::default();
     let dir = approval_dir(root);
-    let Ok(entries) = fs::read_dir(dir) else {
-        return loaded;
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(loaded),
+        Err(error) => {
+            return Err(GearError::io(
+                format!("cannot read approval directory {}", dir.display()),
+                error,
+            ))
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            GearError::io(
+                format!(
+                    "cannot read an approval directory entry in {}",
+                    dir.display()
+                ),
+                error,
+            )
+        })?;
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
@@ -1130,7 +1163,7 @@ pub fn list_approvals(root: &Path) -> LoadedApprovals {
         let Some(name) = path.file_stem().and_then(|value| value.to_str()) else {
             continue;
         };
-        match load_approval(root, name) {
+        match load_approval_raw(root, name) {
             Ok(Some(record)) => loaded.approvals.push(record),
             Ok(None) => {}
             Err(error) => loaded.issues.push(ApprovalIssue {
@@ -1139,19 +1172,66 @@ pub fn list_approvals(root: &Path) -> LoadedApprovals {
             }),
         }
     }
-    loaded.approvals.sort_by(|left, right| {
+    sort_approvals(&mut loaded.approvals);
+    Ok(loaded)
+}
+
+fn sort_approvals(approvals: &mut [ApprovalRecord]) {
+    approvals.sort_by(|left, right| {
         right
             .requested_at
             .cmp(&left.requested_at)
             .then_with(|| right.approval_id.cmp(&left.approval_id))
     });
-    loaded
+}
+
+/// List every readable approval record, newest request first.
+///
+/// Once the replay authority is initialized it is the read source. An
+/// initialized-but-unreadable authority fails closed by surfacing a single
+/// blocking issue rather than an empty list of approvals. Corrupt legacy
+/// projections are surfaced the same way before initialization.
+pub fn list_approvals(root: &Path) -> LoadedApprovals {
+    match crate::orchestration::replay::read_authoritative_snapshot(root) {
+        Ok(Some(snapshot)) => {
+            let mut approvals: Vec<ApprovalRecord> = snapshot.approvals.into_values().collect();
+            sort_approvals(&mut approvals);
+            LoadedApprovals {
+                approvals,
+                issues: Vec::new(),
+            }
+        }
+        Ok(None) => match list_approvals_raw(root) {
+            Ok(loaded) => loaded,
+            Err(error) => LoadedApprovals {
+                approvals: Vec::new(),
+                issues: vec![ApprovalIssue {
+                    file: approval_dir(root).display().to_string(),
+                    detail: redact(&format!("approval projection could not be read: {error}")),
+                }],
+            },
+        },
+        Err(error) => LoadedApprovals {
+            approvals: Vec::new(),
+            issues: vec![ApprovalIssue {
+                file: crate::orchestration::replay::state_path(root)
+                    .display()
+                    .to_string(),
+                detail: redact(&format!("replay authority is unreadable: {error}")),
+            }],
+        },
+    }
 }
 
 /// Keep only the newest [`MAX_APPROVALS`] records, never dropping a pending
-/// one while a resolved record could be pruned instead.
+/// one while a resolved record could be pruned instead. This prunes the
+/// compatibility projection on disk; the authority applies the same rule when
+/// it applies an approval upsert.
 fn prune_approvals(root: &Path) -> Result<()> {
-    let loaded = list_approvals(root);
+    let loaded = match list_approvals_raw(root) {
+        Ok(loaded) => loaded,
+        Err(_) => return Ok(()),
+    };
     if loaded.approvals.len() <= MAX_APPROVALS {
         return Ok(());
     }
@@ -1178,7 +1258,7 @@ fn prune_approvals(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_approval(expected_id: &str, record: &ApprovalRecord) -> Result<()> {
+pub(crate) fn validate_approval(expected_id: &str, record: &ApprovalRecord) -> Result<()> {
     if record.schema_version != APPROVAL_SCHEMA_VERSION {
         return Err(GearError::config(format!(
             "approval {} has unsupported schema_version {}",
