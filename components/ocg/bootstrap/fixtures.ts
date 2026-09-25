@@ -10,6 +10,7 @@ import type {
   BootstrapModel,
   BootstrapOnboarding,
   BootstrapProfile,
+  BootstrapProvider,
   BootstrapResource,
   BootstrapState,
   OnboardingStageId,
@@ -243,6 +244,342 @@ function baseProfiles(): BootstrapProfile[] {
   ];
 }
 
+/**
+ * Deterministic Control Center fixture. It exercises provider reachability,
+ * explicit unknown vs unavailable, per-model capability support (unknown is not
+ * unsupported), variants, the same model name on two providers, assigned and
+ * unassigned routes, overrides, fallbacks, warnings, and a future worker role.
+ * No credential material is represented.
+ */
+function controlProviders(): BootstrapProvider[] {
+  return [
+    {
+      id: "opencode-zen",
+      label: "OpenCode Zen",
+      state: "connected",
+      detail: "Reported ready for this workspace.",
+      authRequired: false,
+      endpointLabel: "zen",
+      endpointType: "hosted",
+      plan: "Included resource",
+      economics: { kind: "subscription", detail: "Included with the workspace resource." },
+      capacity: { status: "known", detail: "Best-effort shared capacity." },
+      discoveredModelCount: 1,
+      capabilities: ["streaming", "tools"],
+      lastCheckedAt: "2026-09-25T09:00:00Z",
+    },
+    {
+      id: "command-code",
+      label: "Command Code",
+      state: "connected",
+      detail: "Reported ready for this workspace.",
+      authRequired: false,
+      endpointLabel: "command",
+      endpointType: "hosted",
+      plan: "Contributor account",
+      economics: { kind: "subscription", detail: "Provider-owned plan economics." },
+      capacity: { status: "unknown", detail: "Quota was not reported." },
+      discoveredModelCount: 2,
+      capabilities: ["streaming", "tools", "reasoning"],
+      lastCheckedAt: "2026-09-25T08:58:00Z",
+    },
+    {
+      id: "opencode-go",
+      label: "OpenCode Go",
+      state: "degraded",
+      detail: "Reachable but reporting elevated latency.",
+      authRequired: false,
+      endpointLabel: "go",
+      endpointType: "hosted",
+      plan: "Free / low-cost resource",
+      economics: { kind: "free", detail: "Included usage; provider limits apply." },
+      capacity: { status: "known", detail: "Elevated latency observed." },
+      discoveredModelCount: 2,
+      capabilities: ["streaming"],
+      lastCheckedAt: "2026-09-25T08:55:00Z",
+      warnings: ["Latency is elevated; fallback coverage is recommended."],
+    },
+    {
+      id: "future-provider",
+      label: "Future Provider",
+      state: "auth-required",
+      detail: "Authentication is delegated to the provider runtime.",
+      authRequired: true,
+      endpointLabel: "future",
+      endpointType: "hosted",
+      plan: "Not reported",
+      economics: { kind: "unknown", detail: "Pricing not reported." },
+      capacity: { status: "unknown", detail: "Capacity not reported." },
+      discoveredModelCount: 1,
+      lastCheckedAt: "2026-09-25T08:50:00Z",
+    },
+    {
+      id: "unreported-provider",
+      label: "Unreported Provider",
+      state: "unknown",
+      detail: "Provider state was not reported; it is not treated as offline.",
+      authRequired: false,
+      endpointType: "unknown",
+      capacity: { status: "unknown", detail: "Last check did not report capacity." },
+      discoveredModelCount: 1,
+    },
+    {
+      id: "offline-provider",
+      label: "Offline Provider",
+      state: "unavailable",
+      detail: "Reported unavailable for this workspace.",
+      authRequired: false,
+      endpointType: "hosted",
+      plan: "Not reported",
+      economics: { kind: "unknown", detail: "Pricing not reported." },
+      capacity: { status: "unknown", detail: "Provider is unavailable." },
+      discoveredModelCount: 1,
+      warnings: ["This provider is explicitly unavailable and is not selected for routing."],
+    },
+  ];
+}
+
+function controlModels(): BootstrapModel[] {
+  return [
+    {
+      id: "zen-muse",
+      provider: "OpenCode Zen",
+      providerId: "opencode-zen",
+      model: "Muse Spark 1.3 Contributor Free",
+      status: "available",
+      capabilities: ["streaming", "tools"],
+      variants: ["free", "standard"],
+      capabilitySupport: {
+        streaming: "supported",
+        tools: "supported",
+        reasoning: "unsupported",
+        vision: "unknown",
+      },
+      provenanceNote: "Reported by the local runtime.",
+      displayName: "Muse Spark 1.3 Contributor Free",
+      contextWindow: 128000,
+      economics: { kind: "subscription", detail: "Included resource; unit price not reported." },
+      latencyObservation: { status: "known", detail: "Typical response observed." },
+    },
+    {
+      id: "command-muse",
+      provider: "Command Code",
+      providerId: "command-code",
+      model: "Muse Spark 1.3 Contributor",
+      status: "available",
+      capabilities: ["streaming", "tools", "reasoning"],
+      variants: ["mid", "high"],
+      capabilitySupport: {
+        streaming: "supported",
+        tools: "supported",
+        reasoning: "supported",
+        vision: "unknown",
+        audio: "unsupported",
+      },
+      provenanceNote: "Reported by the local runtime.",
+      displayName: "Muse Spark 1.3 Contributor",
+      contextWindow: 200000,
+      economics: { kind: "subscription", detail: "Provider-owned plan economics." },
+      latencyObservation: { status: "known", detail: "Typical response observed." },
+    },
+    {
+      id: "command-deepseek",
+      provider: "Command Code",
+      providerId: "command-code",
+      model: "DeepSeek V4.1 Flash",
+      status: "available",
+      capabilities: ["streaming", "tools"],
+      variants: ["standard", "deep"],
+      capabilitySupport: {
+        streaming: "supported",
+        tools: "supported",
+        vision: "unknown",
+      },
+      contextWindow: 128000,
+      latencyObservation: { status: "unknown" },
+    },
+    {
+      id: "go-deepseek",
+      provider: "OpenCode Go",
+      providerId: "opencode-go",
+      model: "DeepSeek V4.1 Flash",
+      status: "available",
+      capabilities: ["streaming"],
+      variants: ["standard"],
+      capabilitySupport: {
+        streaming: "supported",
+        tools: "unknown",
+      },
+      contextWindow: 128000,
+      latencyObservation: { status: "known", detail: "Elevated latency from degraded provider." },
+    },
+    {
+      id: "go-spacebunny",
+      provider: "OpenCode Go",
+      providerId: "opencode-go",
+      model: "Space Bunny Free",
+      status: "unavailable",
+      capabilities: [],
+      variants: ["standard", "deep"],
+      capabilitySupport: { streaming: "unknown" },
+      provenanceNote: "Reported unavailable by the provider.",
+      latencyObservation: { status: "unknown", detail: "Provider did not provide a latency observation." },
+    },
+    {
+      id: "future-model",
+      provider: "Future Provider",
+      providerId: "future-provider",
+      model: "Future Reasoner Preview",
+      status: "pending",
+      capabilities: [],
+      variants: [],
+      capabilitySupport: {},
+      provenanceNote: "Discovered but not yet authorized.",
+    },
+    {
+      id: "unreported-model",
+      provider: "Unreported Provider",
+      providerId: "unreported-provider",
+      model: "Unreported Model",
+      status: "unknown",
+      capabilities: [],
+      variants: [],
+      capabilitySupport: { tools: "unknown", vision: "unsupported" },
+      provenanceNote: "Only the model name was reported.",
+    },
+    {
+      id: "offline-model",
+      provider: "Offline Provider",
+      providerId: "offline-provider",
+      model: "Retired Model",
+      status: "unavailable",
+      capabilities: [],
+      variants: [],
+      capabilitySupport: {},
+      provenanceNote: "Reported unavailable by the provider.",
+    },
+  ];
+}
+
+function controlCapabilities(): BootstrapCapability[] {
+  return [
+    { id: "streaming", label: "Streaming responses", status: "available" },
+    { id: "tools", label: "Tool activity", status: "available" },
+    { id: "workers", label: "Parallel workers", status: "available" },
+    { id: "vision", label: "Image input", status: "unknown" },
+    { id: "audio", label: "Audio input", status: "unknown" },
+  ];
+}
+
+function controlProfiles(): BootstrapProfile[] {
+  return [
+    {
+      id: "balanced",
+      label: "Balanced",
+      tier: "balanced",
+      rationale: "Balances capability and spend for most work. Explore falls back while its provider is degraded.",
+      modelIds: ["command-muse", "command-deepseek", "zen-muse"],
+      recommended: true,
+      source: "recommended",
+      routes: [
+        { id: "balanced-lead-low", roleKind: "lead", roleId: "lead-low", roleLabel: "Lead Low", tier: "economy", modelId: "zen-muse", variant: "free" },
+        { id: "balanced-lead", roleKind: "lead", roleId: "lead", roleLabel: "Lead", tier: "balanced", modelId: "command-muse", variant: "mid" },
+        { id: "balanced-lead-high", roleKind: "lead", roleId: "lead-high", roleLabel: "Lead High", tier: "quality", modelId: "command-muse", variant: "high" },
+        {
+          id: "balanced-explore",
+          roleKind: "worker",
+          roleId: "explore",
+          roleLabel: "Explore",
+          modelId: "go-deepseek",
+          variant: "standard",
+          fallback: true,
+          fallbackModelId: "zen-muse",
+          warning: "Primary provider is degraded; Explore is using the fallback model.",
+        },
+        { id: "balanced-verify", roleKind: "worker", roleId: "verify", roleLabel: "Verify", modelId: "zen-muse", variant: "standard" },
+        { id: "balanced-docs", roleKind: "worker", roleId: "docs", roleLabel: "Docs", modelId: "command-deepseek" },
+      ],
+    },
+    {
+      id: "lean-local",
+      label: "Lean local",
+      tier: "economy",
+      rationale: "Uses only the free local model for every role.",
+      modelIds: ["zen-muse"],
+      recommended: false,
+      source: "customized",
+      routes: [
+        { id: "lean-lead", roleKind: "lead", roleId: "lead", roleLabel: "Lead", tier: "economy", modelId: "zen-muse", variant: "free" },
+        { id: "lean-explore", roleKind: "worker", roleId: "explore", roleLabel: "Explore", modelId: "zen-muse" },
+        { id: "lean-docs", roleKind: "worker", roleId: "docs", roleLabel: "Docs", modelId: "zen-muse" },
+      ],
+    },
+    {
+      id: "custom-quality",
+      label: "Custom quality",
+      tier: "quality",
+      rationale: "Prefers the stronger model per role. Explore is intentionally unassigned.",
+      modelIds: ["command-muse", "command-deepseek", "zen-muse"],
+      recommended: false,
+      advanced: true,
+      source: "customized",
+      routes: [
+        { id: "custom-lead", roleKind: "lead", roleId: "lead", roleLabel: "Lead", tier: "quality", modelId: "command-muse", variant: "high", overridden: true },
+        { id: "custom-explore", roleKind: "worker", roleId: "explore", roleLabel: "Explore", modelId: null, overridden: true },
+        { id: "custom-build", roleKind: "worker", roleId: "build", roleLabel: "Build", modelId: "command-deepseek", variant: "deep", overridden: true },
+        {
+          id: "custom-verify",
+          roleKind: "worker",
+          roleId: "verify",
+          roleLabel: "Verify",
+          modelId: "go-spacebunny",
+          fallback: true,
+          fallbackModelId: "zen-muse",
+        },
+        { id: "custom-synthesize", roleKind: "worker", roleId: "synthesize", roleLabel: "Synthesize", modelId: "future-model" },
+      ],
+    },
+    {
+      id: "strict-quality",
+      label: "Strict quality",
+      tier: "quality",
+      rationale: "Pins the lead to a single model and refuses to fall back.",
+      modelIds: ["go-spacebunny", "command-muse"],
+      recommended: false,
+      source: "customized",
+      routes: [
+        { id: "strict-lead", roleKind: "lead", roleId: "lead", roleLabel: "Lead", tier: "quality", modelId: "go-spacebunny", variant: "deep" },
+        { id: "strict-verify", roleKind: "worker", roleId: "verify", roleLabel: "Verify", modelId: "command-muse" },
+      ],
+    },
+    {
+      id: "exploratory",
+      label: "Exploratory",
+      tier: "balanced",
+      rationale: "Tries an unreported provider; every fact stays unknown until the runtime reports it.",
+      modelIds: ["unreported-model"],
+      recommended: false,
+      source: "customized",
+      routes: [
+        { id: "explore-lead", roleKind: "lead", roleId: "lead", roleLabel: "Lead", tier: "balanced", modelId: "unreported-model" },
+        { id: "explore-worker", roleKind: "worker", roleId: "explore", roleLabel: "Explore", modelId: "unreported-model" },
+      ],
+    },
+  ];
+}
+
+/** Deterministic Control Center state reusing the shared bootstrap inventory. */
+function profilesModels(): BootstrapState {
+  return {
+    ...localReady(),
+    providers: controlProviders(),
+    capabilities: controlCapabilities(),
+    models: controlModels(),
+    profiles: controlProfiles(),
+    activeProfileId: "balanced",
+  };
+}
+
 function localReady(): BootstrapState {
   return {
     access: localAccess(),
@@ -446,6 +783,8 @@ export function createBootstrapFixture(scenario: ScenarioId): BootstrapState {
       return onboardingDiscovery();
     case "onboarding-ready":
       return onboardingReady();
+    case "profiles-models":
+      return profilesModels();
     default:
       // Every pre-existing scenario predates remote access and stays local-ready.
       return localReady();

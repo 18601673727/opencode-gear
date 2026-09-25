@@ -49,6 +49,7 @@ export const SCENARIO_IDS: readonly ScenarioId[] = [
   "onboarding-connection-failure",
   "onboarding-discovery",
   "onboarding-ready",
+  "profiles-models",
 ];
 
 export function resolveScenario(value: string | undefined | null): ScenarioId {

@@ -5,11 +5,14 @@ import {
   Code2,
   FlaskConical,
   LifeBuoy,
+  MessageSquare,
   PenTool,
   Plus,
   Search,
   Server,
   Settings,
+  SlidersHorizontal,
+  Table2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -32,6 +35,14 @@ const GROUP_ICON: Record<WorkType, typeof Search> = {
   devops: Server,
 };
 
+export type WorkspaceTarget = "chat" | "ledger" | "control-center";
+
+const WORKSPACE_NAV: { target: WorkspaceTarget; label: string; icon: typeof Search }[] = [
+  { target: "chat", label: "Chat", icon: MessageSquare },
+  { target: "control-center", label: "Control Center", icon: SlidersHorizontal },
+  { target: "ledger", label: "Resource Ledger", icon: Table2 },
+];
+
 type OcgSidebarProps = {
   sessions: ChatSession[];
   activeSessionId: string;
@@ -40,6 +51,11 @@ type OcgSidebarProps = {
   onSelect: (id: string) => void;
   onNewChat: () => void;
   runtimeStatus: RuntimeStatus;
+  /** Active top-level workspace, used to highlight the navigation group. */
+  activeWorkspace?: WorkspaceTarget;
+  onOpenChat?: () => void;
+  onOpenLedger?: () => void;
+  onOpenControlCenter?: () => void;
 };
 
 const RUNTIME_LABEL: Record<RuntimeStatus["state"], string> = {
@@ -91,7 +107,18 @@ export function OcgSidebar({
   onSelect,
   onNewChat,
   runtimeStatus,
+  activeWorkspace = "chat",
+  onOpenChat,
+  onOpenLedger,
+  onOpenControlCenter,
 }: OcgSidebarProps) {
+  const navHandlers: Record<WorkspaceTarget, (() => void) | undefined> = {
+    chat: onOpenChat,
+    ledger: onOpenLedger,
+    "control-center": onOpenControlCenter,
+  };
+  const hasNav = Boolean(onOpenChat || onOpenLedger || onOpenControlCenter);
+
   if (collapsed) {
     return (
       <TooltipProvider delay={100}>
@@ -102,6 +129,26 @@ export function OcgSidebar({
           <RailButton label="New chat" onClick={onNewChat}>
             <Plus className="size-4" />
           </RailButton>
+          {hasNav && (
+            <>
+              <div className="my-2 h-px w-8 bg-border" aria-hidden="true" />
+              {WORKSPACE_NAV.map((item) => {
+                const Icon = item.icon;
+                const handler = navHandlers[item.target];
+                if (!handler) return null;
+                return (
+                  <RailButton
+                    key={item.target}
+                    label={item.label}
+                    active={activeWorkspace === item.target}
+                    onClick={handler}
+                  >
+                    <Icon className="size-4" />
+                  </RailButton>
+                );
+              })}
+            </>
+          )}
           <div className="my-2 h-px w-8 bg-border" aria-hidden="true" />
           <div className="flex min-h-0 flex-1 flex-col items-center gap-1 overflow-y-auto">
             {GROUP_ORDER.map((group) => {
@@ -168,6 +215,37 @@ export function OcgSidebar({
             <TooltipContent side="right">Collapse sidebar</TooltipContent>
           </Tooltip>
         </div>
+
+        {hasNav && (
+          <nav aria-label="Workspace navigation" className="px-2 pb-2">
+            <ul className="flex flex-col gap-px">
+              {WORKSPACE_NAV.map((item) => {
+                const Icon = item.icon;
+                const handler = navHandlers[item.target];
+                if (!handler) return null;
+                const active = activeWorkspace === item.target;
+                return (
+                  <li key={item.target}>
+                    <button
+                      type="button"
+                      onClick={handler}
+                      aria-current={active ? "page" : undefined}
+                      className={cn(
+                        "group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] leading-5 transition-colors",
+                        active
+                          ? "bg-muted font-medium text-foreground"
+                          : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+                      )}
+                    >
+                      <Icon className="size-3.5 shrink-0" aria-hidden="true" />
+                      <span className="min-w-0 flex-1 truncate">{item.label}</span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </nav>
+        )}
 
         <div className="px-3 pb-2">
           <Button

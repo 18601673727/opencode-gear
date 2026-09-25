@@ -39,7 +39,8 @@ export type ScenarioId =
   | "onboarding-auth-required"
   | "onboarding-connection-failure"
   | "onboarding-discovery"
-  | "onboarding-ready";
+  | "onboarding-ready"
+  | "profiles-models";
 
 export type RuntimeSnapshot = {
   scenario: ScenarioId;
@@ -76,4 +77,9 @@ export interface OcgRuntimeClient {
   completeOnboarding?(): Promise<void>;
   /** Mock recovery for an actionable bootstrap failure. */
   retryBootstrap?(): Promise<void>;
+  /**
+   * Frontend-only active profile selection. Updates the normalized bootstrap
+   * snapshot and emits `bootstrap.updated`; it never persists or writes config.
+   */
+  setActiveProfile?(profileId: string): Promise<void>;
 }

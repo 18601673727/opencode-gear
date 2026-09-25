@@ -18,6 +18,7 @@ type RuntimeContextValue = {
   setOnboardingStage: (stage: OnboardingStageId) => Promise<void>;
   completeOnboarding: () => Promise<void>;
   retryBootstrap: () => Promise<void>;
+  setActiveProfile: (profileId: string) => Promise<void>;
 };
 
 const RuntimeContext = createContext<RuntimeContextValue | null>(null);
@@ -52,6 +53,9 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
   const retryBootstrap = useCallback(async () => {
     await client.retryBootstrap?.();
   }, [client]);
+  const setActiveProfile = useCallback(async (profileId: string) => {
+    await client.setActiveProfile?.(profileId);
+  }, [client]);
 
   const value = useMemo(
     () => ({
@@ -64,8 +68,9 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
       setOnboardingStage,
       completeOnboarding,
       retryBootstrap,
+      setActiveProfile,
     }),
-    [cancel, client, completeOnboarding, createSession, requestAccessHandoff, retryBootstrap, sendMessage, setOnboardingStage, snapshot],
+    [cancel, client, completeOnboarding, createSession, requestAccessHandoff, retryBootstrap, sendMessage, setActiveProfile, setOnboardingStage, snapshot],
   );
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;
 }

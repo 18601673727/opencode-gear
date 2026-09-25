@@ -142,6 +142,18 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
     this.updateBootstrap(resolveBootstrapRetry(this.snapshot.bootstrap));
   }
 
+  /**
+   * Frontend-only profile selection. Only a profile that exists in the
+   * normalized state can become active, and nothing is written outside the
+   * in-memory snapshot.
+   */
+  async setActiveProfile(profileId: string): Promise<void> {
+    const profile = this.snapshot.bootstrap.profiles.find((item) => item.id === profileId);
+    if (!profile) return;
+    if (this.snapshot.bootstrap.activeProfileId === profile.id) return;
+    this.updateBootstrap({ ...this.snapshot.bootstrap, activeProfileId: profile.id });
+  }
+
   async createSession(input: CreateSessionInput): Promise<ChatSession> {
     const id = `mock-session-${Date.now()}-${this.nextId++}`;
     const session: ChatSession = {

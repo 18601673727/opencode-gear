@@ -8,22 +8,38 @@ import { MissionView } from "../mission/mission-view";
 import { OcgSidebar } from "../sidebar/ocg-sidebar";
 import { OcgTopbar } from "../topbar/ocg-topbar";
 import { ResourceLedgerSurface } from "../resource-ledger/resource-ledger-surface";
+import { ControlCenterSurface } from "../control-center/control-center-surface";
+import type { ControlCenterView } from "../control-center/domain";
 import { OcgRuntimeProvider, useOcgRuntime } from "../runtime/runtime-context";
 import type { ScenarioId } from "../runtime/runtime-types";
 import type { InspectorMode } from "../observability/inspector-state";
 
-export type WorkspaceView = "chat" | "ledger";
+export type WorkspaceView = "chat" | "ledger" | "control-center";
 
-export function AppShell({ scenario, view = "chat" }: { scenario: ScenarioId; view?: WorkspaceView }) {
+export function AppShell({
+  scenario,
+  view = "chat",
+  controlCenterView = "profiles",
+}: {
+  scenario: ScenarioId;
+  view?: WorkspaceView;
+  controlCenterView?: ControlCenterView;
+}) {
   return (
     <OcgRuntimeProvider scenario={scenario}>
-      <RuntimeWorkspace view={view} />
+      <RuntimeWorkspace view={view} controlCenterView={controlCenterView} />
     </OcgRuntimeProvider>
   );
 }
 
-export function RuntimeWorkspace({ view = "chat" }: { view?: WorkspaceView }) {
-  const { snapshot, createSession, sendMessage } = useOcgRuntime();
+export function RuntimeWorkspace({
+  view = "chat",
+  controlCenterView = "profiles",
+}: {
+  view?: WorkspaceView;
+  controlCenterView?: ControlCenterView;
+}) {
+  const { snapshot, createSession, sendMessage, setActiveProfile } = useOcgRuntime();
   const router = useRouter();
   const [activeSessionId, setActiveSessionId] = useState("design-pwa-shell");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -46,6 +62,7 @@ export function RuntimeWorkspace({ view = "chat" }: { view?: WorkspaceView }) {
   const activeSessionKey = activeSession?.id;
   const activeWorkType = activeSession?.workType;
   const isLedger = view === "ledger";
+  const isControlCenter = view === "control-center";
 
   const handleNewChat = useCallback(async () => {
     if (!activeWorkType) return;
@@ -57,7 +74,9 @@ export function RuntimeWorkspace({ view = "chat" }: { view?: WorkspaceView }) {
   const selectSession = useCallback((id: string) => {
     setActiveSessionId(id);
     setMobileNavOpen(false);
-  }, []);
+    // Session selection is a chat action; leave other workspace views.
+    if (view !== "chat") router.push("/");
+  }, [router, view]);
 
   // The provider owns runtime data. This callback only adapts the presentational ChatView contract.
   const handleSendMessage = useCallback(
@@ -65,11 +84,27 @@ export function RuntimeWorkspace({ view = "chat" }: { view?: WorkspaceView }) {
     [activeSessionKey, sendMessage],
   );
 
+  const handleOpenChat = useCallback(() => {
+    setMobileNavOpen(false);
+    setMobileMissionOpen(false);
+    if (view !== "chat") router.push("/");
+  }, [router, view]);
+
   const handleOpenLedger = useCallback(() => {
     setMobileNavOpen(false);
     setMobileMissionOpen(false);
-    router.push(isLedger ? "/" : "/resource-ledger");
-  }, [isLedger, router]);
+    router.push(view === "ledger" ? "/" : "/resource-ledger");
+  }, [router, view]);
+
+  const handleOpenControlCenter = useCallback(() => {
+    setMobileNavOpen(false);
+    setMobileMissionOpen(false);
+    router.push(view === "control-center" ? "/" : "/?scenario=profiles-models");
+  }, [router, view]);
+
+  const handleSelectProfile = useCallback((profileId: string) => {
+    void setActiveProfile(profileId);
+  }, [setActiveProfile]);
 
   if (!activeSession) return null;
 
@@ -87,6 +122,10 @@ export function RuntimeWorkspace({ view = "chat" }: { view?: WorkspaceView }) {
       onSelect={selectSession}
       onNewChat={handleNewChat}
       runtimeStatus={snapshot.status}
+      activeWorkspace={view}
+      onOpenChat={handleOpenChat}
+      onOpenLedger={handleOpenLedger}
+      onOpenControlCenter={handleOpenControlCenter}
     />
   );
 
@@ -128,6 +167,10 @@ export function RuntimeWorkspace({ view = "chat" }: { view?: WorkspaceView }) {
             onSelect={selectSession}
             onNewChat={handleNewChat}
             runtimeStatus={snapshot.status}
+            activeWorkspace={view}
+            onOpenChat={handleOpenChat}
+            onOpenLedger={handleOpenLedger}
+            onOpenControlCenter={handleOpenControlCenter}
           />
         </aside>
       </div>
@@ -137,18 +180,30 @@ export function RuntimeWorkspace({ view = "chat" }: { view?: WorkspaceView }) {
           session={activeSession}
           sidebarCollapsed={sidebarCollapsed}
           missionOpen={missionOpen}
-          missionControls={!isLedger}
+          missionControls={!isLedger && !isControlCenter}
           ledgerActive={isLedger}
+          controlCenterActive={isControlCenter}
           onToggleSidebar={() => setSidebarCollapsed((value) => !value)}
           onToggleMission={() => setMissionMode((value) => value === "collapsed" ? "docked" : "collapsed")}
           onOpenMobileSidebar={() => setMobileNavOpen(true)}
           onOpenMobileMission={() => setMobileMissionOpen(true)}
           onOpenLedger={handleOpenLedger}
+          onOpenControlCenter={handleOpenControlCenter}
           runtimeStatus={snapshot.status}
         />
         {isLedger ? (
           <main aria-label="Resource ledger" className="flex min-h-0 flex-1 overflow-hidden">
             <ResourceLedgerSurface ledger={snapshot.resourceLedger} />
+          </main>
+        ) : isControlCenter ? (
+          <main aria-label="Control Center" className="flex min-h-0 flex-1 overflow-hidden">
+            <ControlCenterSurface
+              key={controlCenterView}
+              bootstrap={snapshot.bootstrap}
+              ledger={snapshot.resourceLedger}
+              initialView={controlCenterView}
+              onSelectProfile={handleSelectProfile}
+            />
           </main>
         ) : (
           <main aria-label="OCG workspace" className="flex min-h-0 flex-1">
@@ -178,7 +233,7 @@ export function RuntimeWorkspace({ view = "chat" }: { view?: WorkspaceView }) {
         )}
       </div>
 
-      {!isLedger && (
+      {!isLedger && !isControlCenter && (
         <div
           className={cn("fixed inset-0 z-50 lg:hidden", !mobileMissionOpen && "pointer-events-none")}
           aria-hidden={!mobileMissionOpen}

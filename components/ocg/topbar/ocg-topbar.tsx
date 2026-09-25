@@ -6,6 +6,7 @@ import {
   MoreHorizontal,
   PanelLeft,
   PanelRight,
+  SlidersHorizontal,
   Table2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -21,11 +22,14 @@ type OcgTopbarProps = {
   missionControls?: boolean;
   /** Highlights the ledger action while the ledger workspace is the active view. */
   ledgerActive?: boolean;
+  /** Highlights the Control Center action while it is the active view. */
+  controlCenterActive?: boolean;
   onToggleSidebar: () => void;
   onToggleMission: () => void;
   onOpenMobileSidebar: () => void;
   onOpenMobileMission: () => void;
   onOpenLedger?: () => void;
+  onOpenControlCenter?: () => void;
   runtimeStatus: RuntimeStatus;
 };
 
@@ -42,11 +46,13 @@ export function OcgTopbar({
   missionOpen,
   missionControls = true,
   ledgerActive = false,
+  controlCenterActive = false,
   onToggleSidebar,
   onToggleMission,
   onOpenMobileSidebar,
   onOpenMobileMission,
   onOpenLedger,
+  onOpenControlCenter,
   runtimeStatus,
 }: OcgTopbarProps) {
   return (
@@ -128,6 +134,19 @@ export function OcgTopbar({
           title={ledgerActive ? "Open chat workspace" : "Open resource ledger"}
         >
           <Table2 className="size-4" />
+        </Button>
+      )}
+
+      {onOpenControlCenter && (
+        <Button
+          variant={controlCenterActive ? "secondary" : "ghost"}
+          size="icon-xs"
+          onClick={onOpenControlCenter}
+          aria-label={controlCenterActive ? "Close Control Center" : "Open Control Center"}
+          aria-current={controlCenterActive ? "page" : undefined}
+          title={controlCenterActive ? "Close Control Center" : "Open Control Center"}
+        >
+          <SlidersHorizontal className="size-4" />
         </Button>
       )}
 
