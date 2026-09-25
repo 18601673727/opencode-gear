@@ -29,6 +29,7 @@ function history(): AttentionItem[] {
       updatedAt: "2026-09-24T15:10:00Z",
       source: "policy",
       destination: "resource-ledger",
+      projectId: "zhuju",
       missionId: "mission-ledger",
       missionTitle: "Resource ledger inspector",
       approval: {
@@ -63,6 +64,7 @@ function history(): AttentionItem[] {
       updatedAt: "2026-09-24T11:20:00Z",
       source: "policy",
       destination: "logs",
+      projectId: "route-lace",
       approval: {
         id: "appr-history-external",
         type: "external-action",
@@ -91,6 +93,7 @@ function history(): AttentionItem[] {
       updatedAt: "2026-09-23T16:05:00Z",
       source: "configuration",
       destination: "settings",
+      projectId: "zhuju",
       approval: null,
       blocked: null,
       resolution: { outcome: "resolved", at: "2026-09-23T16:05:00Z" },
@@ -114,6 +117,7 @@ function overviewApprovals(): AttentionItem[] {
       updatedAt: "2026-09-25T09:10:00Z",
       source: "policy",
       destination: "mission-control",
+      projectId: "zhuju",
       missionId: "design-pwa-shell",
       missionTitle: "Consolidate OCG frontend architecture",
       approval: {
@@ -152,6 +156,7 @@ function overviewApprovals(): AttentionItem[] {
       missionTitle: "Consolidate OCG frontend architecture",
       taskId: "resource-ledger",
       taskTitle: "Connect Ledger context",
+      projectId: "zhuju",
       approval: {
         id: "appr-retry-ledger",
         type: "retry-escalation",
@@ -187,6 +192,7 @@ function overviewApprovals(): AttentionItem[] {
       updatedAt: DECISION_AT,
       source: "mission",
       destination: "mission-control",
+      projectId: "route-lace",
       missionId: "mission-deploy",
       missionTitle: "Deploy readiness",
       approval: {
@@ -220,6 +226,7 @@ function overviewApprovals(): AttentionItem[] {
       updatedAt: "2026-09-25T09:15:00Z",
       source: "runtime",
       destination: "logs",
+      projectId: "zhuju",
       missionId: "design-pwa-shell",
       missionTitle: "Consolidate OCG frontend architecture",
       taskId: "resource-ledger",

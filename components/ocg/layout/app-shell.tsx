@@ -21,6 +21,14 @@ import { AttentionSurface } from "../attention/attention-surface";
 import { createAttentionQueue } from "../attention/fixtures";
 import { isUnresolved } from "../attention/domain";
 import { selectAttentionItems } from "../attention/selectors";
+import { ProjectProvider, useProject } from "../project/project-context";
+import {
+  selectProjectAttentionQueue,
+  resolveSelectedSessionId,
+  selectProjectSessions,
+  selectProjectSnapshot,
+} from "../project/selectors";
+import { withProjectParam, type ProjectId } from "../project/domain";
 
 export type WorkspaceView = "chat" | "home" | "attention" | "ledger" | "control-center" | "mission-control" | "logs" | "settings";
 
@@ -28,14 +36,18 @@ export function AppShell({
   scenario,
   view = "chat",
   controlCenterView = "profiles",
+  initialProjectId,
 }: {
   scenario: ScenarioId;
   view?: WorkspaceView;
   controlCenterView?: ControlCenterView;
+  initialProjectId?: ProjectId;
 }) {
   return (
     <OcgRuntimeProvider scenario={scenario}>
-      <RuntimeWorkspace view={view} controlCenterView={controlCenterView} />
+      <ProjectProvider initialProjectId={initialProjectId}>
+        <RuntimeWorkspace view={view} controlCenterView={controlCenterView} />
+      </ProjectProvider>
     </OcgRuntimeProvider>
   );
 }
@@ -47,13 +59,28 @@ export function RuntimeWorkspace({
   view?: WorkspaceView;
   controlCenterView?: ControlCenterView;
 }) {
-  const { snapshot, createSession, sendMessage, setActiveProfile } = useOcgRuntime();
+  const { snapshot: runtimeSnapshot, createSession, sendMessage, setActiveProfile, cancel } = useOcgRuntime();
+  const {
+    activeProjectId,
+    projects,
+    setActiveProject,
+    registerProjectSession,
+    activeProjectSessionIds,
+  } = useProject();
   const router = useRouter();
   const [activeSessionId, setActiveSessionId] = useState("design-pwa-shell");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [missionMode, setMissionMode] = useState<InspectorMode>("docked");
   const [mobileMissionOpen, setMobileMissionOpen] = useState(false);
+
+  // Project-scoped projection of the shared runtime snapshot. Every surface
+  // below consumes this, so project switches cannot leak sessions, missions,
+  // executions, or ledger entries across projects.
+  const snapshot = useMemo(
+    () => selectProjectSnapshot(runtimeSnapshot, activeProjectId, activeProjectSessionIds),
+    [runtimeSnapshot, activeProjectId, activeProjectSessionIds],
+  );
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -77,25 +104,40 @@ export function RuntimeWorkspace({
   const isHome = view === "home";
   const isAttention = view === "attention";
 
+  // Project-scoped fixture queue plus the scoped snapshot. Snapshot-derived
+  // items come from the scoped snapshot; fixture items are filtered by the
+  // explicit projectId tag.
+  const attentionQueue = useMemo(
+    () => selectProjectAttentionQueue(createAttentionQueue(snapshot.scenario), activeProjectId),
+    [snapshot.scenario, activeProjectId],
+  );
+
   // Quiet unresolved-attention badge for product navigation. Derived from
   // the same normalized selectors as the Attention surface itself.
   const attentionCount = useMemo(
-    () => selectAttentionItems(snapshot, createAttentionQueue(snapshot.scenario)).filter(isUnresolved).length,
-    [snapshot],
+    () => selectAttentionItems(snapshot, attentionQueue).filter(isUnresolved).length,
+    [snapshot, attentionQueue],
+  );
+
+  const withProject = useCallback(
+    (path: string, projectId: ProjectId = activeProjectId) => withProjectParam(path, projectId),
+    [activeProjectId],
   );
 
   const handleNewChat = useCallback(async () => {
     if (!activeWorkType) return;
     const session = await createSession({ workType: activeWorkType });
+    // Register before selecting so the new chat stays in the current project.
+    registerProjectSession(session.id);
     setActiveSessionId(session.id);
     setMobileNavOpen(false);
-  }, [activeWorkType, createSession]);
+  }, [activeWorkType, createSession, registerProjectSession]);
 
   const selectSession = useCallback((id: string) => {
     setActiveSessionId(id);
     setMobileNavOpen(false);
-    if (view !== "chat") router.push("/");
-  }, [router, view]);
+    if (view !== "chat") router.push(withProject("/"));
+  }, [router, view, withProject]);
 
   const handleSendMessage = useCallback(
     (content: string) => activeSessionKey ? sendMessage(activeSessionKey, { content }) : undefined,
@@ -105,54 +147,76 @@ export function RuntimeWorkspace({
   const handleOpenChat = useCallback(() => {
     setMobileNavOpen(false);
     setMobileMissionOpen(false);
-    if (view !== "chat") router.push("/");
-  }, [router, view]);
+    if (view !== "chat") router.push(withProject("/"));
+  }, [router, view, withProject]);
 
   const handleOpenHome = useCallback(() => {
     setMobileNavOpen(false);
     setMobileMissionOpen(false);
-    if (view !== "home") router.push("/?scenario=home-overview");
-  }, [router, view]);
+    if (view !== "home") router.push(withProject("/?scenario=home-overview"));
+  }, [router, view, withProject]);
 
   const handleOpenAttention = useCallback(() => {
     setMobileNavOpen(false);
     setMobileMissionOpen(false);
-    if (view !== "attention") router.push("/?scenario=attention-overview");
-  }, [router, view]);
+    if (view !== "attention") router.push(withProject("/?scenario=attention-overview"));
+  }, [router, view, withProject]);
 
   const handleOpenLedger = useCallback(() => {
     setMobileNavOpen(false);
     setMobileMissionOpen(false);
-    router.push(view === "ledger" ? "/" : "/resource-ledger");
-  }, [router, view]);
+    router.push(view === "ledger" ? withProject("/") : withProject("/resource-ledger"));
+  }, [router, view, withProject]);
 
   const handleOpenControlCenter = useCallback(() => {
     setMobileNavOpen(false);
     setMobileMissionOpen(false);
-    router.push(view === "control-center" ? "/" : "/?scenario=profiles-models");
-  }, [router, view]);
+    router.push(view === "control-center" ? withProject("/") : withProject("/?scenario=profiles-models"));
+  }, [router, view, withProject]);
 
   const handleOpenMissionControl = useCallback(() => {
     setMobileNavOpen(false);
     setMobileMissionOpen(false);
-    router.push(isMissionControl ? "/" : "/?scenario=mission-control");
-  }, [isMissionControl, router]);
+    router.push(isMissionControl ? withProject("/") : withProject("/?scenario=mission-control"));
+  }, [isMissionControl, router, withProject]);
 
   const handleOpenLogs = useCallback(() => {
     setMobileNavOpen(false);
     setMobileMissionOpen(false);
-    router.push(isLogs ? "/" : "/?scenario=logs-live");
-  }, [isLogs, router]);
+    router.push(isLogs ? withProject("/") : withProject("/?scenario=logs-live"));
+  }, [isLogs, router, withProject]);
 
   const handleOpenSettings = useCallback(() => {
     setMobileNavOpen(false);
     setMobileMissionOpen(false);
-    router.push(isSettings ? "/" : "/settings");
-  }, [isSettings, router]);
+    router.push(isSettings ? withProject("/") : withProject("/settings"));
+  }, [isSettings, router, withProject]);
 
   const handleSelectProfile = useCallback((profileId: string) => {
     void setActiveProfile(profileId);
   }, [setActiveProfile]);
+
+  // Switching projects closes mobile overlays, cancels any in-flight stream,
+  // persists the new selection, and keeps the URL in sync so a refresh keeps
+  // the operator in the same project.
+  const handleProjectChange = useCallback((id: ProjectId) => {
+    setMobileNavOpen(false);
+    setMobileMissionOpen(false);
+    if (activeSessionKey) void cancel(activeSessionKey);
+    // Reset the active session to one the target project owns so a stale
+    // selection cannot survive the switch.
+    const nextSessionId = resolveSelectedSessionId(
+      null,
+      selectProjectSessions(runtimeSnapshot.sessions, id),
+    );
+    setActiveSessionId(nextSessionId ?? "");
+    setActiveProject(id);
+    if (typeof window !== "undefined") {
+      const url = new URL(window.location.href);
+      url.searchParams.set("project", id);
+      router.replace(`${url.pathname}${url.search}`);
+    }
+  }, [activeSessionKey, cancel, router, runtimeSnapshot.sessions, setActiveProject]);
 
   if (!activeSession) return null;
 
@@ -170,6 +234,9 @@ export function RuntimeWorkspace({
       onSelect={selectSession}
       onNewChat={handleNewChat}
       runtimeStatus={snapshot.status}
+      projects={projects}
+      activeProjectId={activeProjectId}
+      onProjectChange={handleProjectChange}
       activeWorkspace={view}
       attentionCount={attentionCount}
       onOpenChat={handleOpenChat}
@@ -221,6 +288,9 @@ export function RuntimeWorkspace({
             onSelect={selectSession}
             onNewChat={handleNewChat}
             runtimeStatus={snapshot.status}
+            projects={projects}
+            activeProjectId={activeProjectId}
+            onProjectChange={handleProjectChange}
             activeWorkspace={view}
             attentionCount={attentionCount}
             onOpenChat={handleOpenChat}
@@ -264,12 +334,12 @@ export function RuntimeWorkspace({
         />
         {isLedger ? (
           <main aria-label="Resource ledger" className="flex min-h-0 flex-1 overflow-hidden">
-            <ResourceLedgerSurface ledger={snapshot.resourceLedger} />
+            <ResourceLedgerSurface key={activeProjectId} ledger={snapshot.resourceLedger} />
           </main>
         ) : isControlCenter ? (
           <main aria-label="Control Center" className="flex min-h-0 flex-1 overflow-hidden">
             <ControlCenterSurface
-              key={controlCenterView}
+              key={`${activeProjectId}:${controlCenterView}`}
               bootstrap={snapshot.bootstrap}
               ledger={snapshot.resourceLedger}
               initialView={controlCenterView}
@@ -280,8 +350,9 @@ export function RuntimeWorkspace({
           <main aria-label="Mission Control" className="flex min-h-0 flex-1 overflow-hidden">
             {snapshot.executionBySession[activeSession.id] ? (
               <MissionControlSurface
+                key={`${activeProjectId}:${activeSession.id}`}
                 execution={snapshot.executionBySession[activeSession.id]!}
-                onOpenInspector={() => router.push("/")}
+                onOpenInspector={() => router.push(withProject("/"))}
               />
             ) : (
               <div className="flex flex-1 items-center justify-center p-6 text-[12px] text-muted-foreground">No Mission execution is available.</div>
@@ -289,15 +360,20 @@ export function RuntimeWorkspace({
           </main>
         ) : isLogs ? (
           <main aria-label="Logs and diagnostics" className="flex min-h-0 flex-1 overflow-hidden">
-            <LogsSurface key={snapshot.scenario} snapshot={snapshot} />
+            <LogsSurface
+              key={`${activeProjectId}:${snapshot.scenario}`}
+              snapshot={snapshot}
+              projectId={activeProjectId}
+            />
           </main>
         ) : isSettings ? (
           <main aria-label="Settings" className="flex min-h-0 flex-1 overflow-hidden">
-            <SettingsSurface snapshot={snapshot} />
+            <SettingsSurface key={activeProjectId} snapshot={snapshot} />
           </main>
         ) : isHome ? (
           <main aria-label="Workspace home" className="flex min-h-0 flex-1 overflow-hidden">
             <HomeSurface
+              key={activeProjectId}
               snapshot={snapshot}
               onOpenChat={handleOpenChat}
               onOpenAttention={handleOpenAttention}
@@ -311,7 +387,9 @@ export function RuntimeWorkspace({
         ) : isAttention ? (
           <main aria-label="Attention and approvals" className="flex min-h-0 flex-1 overflow-hidden">
             <AttentionSurface
+              key={activeProjectId}
               snapshot={snapshot}
+              queue={attentionQueue}
               onOpenChat={handleOpenChat}
               onOpenMissionControl={handleOpenMissionControl}
               onOpenControlCenter={handleOpenControlCenter}
@@ -324,7 +402,7 @@ export function RuntimeWorkspace({
           <main aria-label="OCG workspace" className="flex min-h-0 flex-1">
             <div className="flex min-w-0 flex-1 flex-col">
               <ChatView
-                key={activeSession.id}
+                key={`${activeProjectId}:${activeSession.id}`}
                 session={activeSession}
                 messages={messages}
                 runtimeStatus={snapshot.status}

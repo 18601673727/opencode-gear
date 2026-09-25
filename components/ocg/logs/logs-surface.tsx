@@ -17,6 +17,8 @@ import {
   type LogTimeWindow,
 } from "./domain";
 import type { RuntimeSnapshot } from "../runtime/runtime-types";
+import type { ProjectId } from "../project/domain";
+import { selectProject } from "../project/domain";
 
 const INITIAL_LIVE_ENTRIES = 3;
 const HISTORY_LIMIT = 120;
@@ -142,12 +144,12 @@ function LogDetail({ entry, onClose }: { entry: LogEntry | undefined; onClose?: 
   );
 }
 
-export function LogsSurface({ snapshot }: { snapshot: RuntimeSnapshot }) {
+export function LogsSurface({ snapshot, projectId }: { snapshot: RuntimeSnapshot; projectId?: ProjectId }) {
   const baseEntries = useMemo(
     () => snapshot.scenario === "logs-live"
-      ? createLogsLiveFixture()
+      ? createLogsLiveFixture(projectId)
       : deriveRuntimeLogEntries(snapshot, snapshot.sessions[0]?.id ?? "workspace"),
-    [snapshot],
+    [projectId, snapshot],
   );
   const live = snapshot.scenario === "logs-live";
   const nextIndex = useRef(live ? INITIAL_LIVE_ENTRIES : baseEntries.length);
@@ -203,7 +205,7 @@ export function LogsSurface({ snapshot }: { snapshot: RuntimeSnapshot }) {
     <div className="flex min-h-0 flex-1 flex-col bg-background">
       <header className="shrink-0 border-b border-border px-3 py-3 sm:px-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="min-w-0"><div className="flex items-center gap-2"><span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Diagnostics</span>{live && <span className="text-[10px] text-muted-foreground">deterministic stream</span>}</div><h1 className="mt-1 text-[16px] font-semibold tracking-tight">Logs</h1><p className="mt-0.5 text-[11px] text-muted-foreground">Normalized operational events · secrets are never shown</p></div>
+          <div className="min-w-0"><div className="flex items-center gap-2"><span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Diagnostics</span>{projectId && <span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{selectProject(projectId).name}</span>}{live && <span className="text-[10px] text-muted-foreground">deterministic stream</span>}</div><h1 className="mt-1 text-[16px] font-semibold tracking-tight">Logs</h1><p className="mt-0.5 text-[11px] text-muted-foreground">Normalized operational events · secrets are never shown</p></div>
           <div className="flex shrink-0 items-center gap-2">
             <span className="text-[10px] tabular-nums text-muted-foreground">{filteredEntries.length} of {entries.length} · bounded {HISTORY_LIMIT}</span>
             <Button variant={following ? "secondary" : "outline"} size="xs" onClick={() => following ? setFollowing(false) : scrollToLatest()} aria-pressed={following} title={following ? "Pause auto-follow" : "Resume auto-follow"}>

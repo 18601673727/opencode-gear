@@ -1,4 +1,5 @@
 import { OcgEntryGate } from "@/components/ocg/bootstrap/entry-gate";
+import { resolveProjectParam } from "@/components/ocg/project/domain";
 import { resolveScenario } from "@/components/ocg/runtime/scenarios";
 
 export default async function SettingsPage({
@@ -8,5 +9,11 @@ export default async function SettingsPage({
 }) {
   const params = await searchParams;
   const scenario = resolveScenario(typeof params.scenario === "string" ? params.scenario : "local-ready");
-  return <OcgEntryGate scenario={scenario} view="settings" />;
+  return (
+    <OcgEntryGate
+      scenario={scenario}
+      view="settings"
+      initialProjectId={resolveProjectParam(params.project)}
+    />
+  );
 }

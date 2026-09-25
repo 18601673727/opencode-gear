@@ -1,6 +1,7 @@
 import { OcgEntryGate } from "@/components/ocg/bootstrap/entry-gate";
 import type { WorkspaceView } from "@/components/ocg/layout/app-shell";
 import { resolveControlCenterView } from "@/components/ocg/control-center/domain";
+import { resolveProjectParam } from "@/components/ocg/project/domain";
 import { resolveScenario } from "@/components/ocg/runtime/scenarios";
 
 export default async function Home({
@@ -21,6 +22,14 @@ export default async function Home({
   const controlCenterView = resolveControlCenterView(
     typeof params.view === "string" ? params.view : undefined,
   );
+  const initialProjectId = resolveProjectParam(params.project);
 
-  return <OcgEntryGate scenario={scenario} view={view} controlCenterView={controlCenterView} />;
+  return (
+    <OcgEntryGate
+      scenario={scenario}
+      view={view}
+      controlCenterView={controlCenterView}
+      initialProjectId={initialProjectId}
+    />
+  );
 }

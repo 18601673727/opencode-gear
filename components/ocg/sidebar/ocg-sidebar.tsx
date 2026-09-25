@@ -29,6 +29,9 @@ import {
 } from "@/components/ui/tooltip";
 import type { ChatSession, RuntimeStatus, WorkType } from "../types";
 import { WORK_TYPE_LABEL } from "../types";
+import { ProjectSwitcher } from "../project/project-switcher";
+import type { ProjectId, ProjectSummary } from "../project/domain";
+import { DEFAULT_PROJECT_ID, PROJECTS } from "../project/domain";
 
 const GROUP_ORDER: WorkType[] = ["research", "coding", "design", "devops"];
 
@@ -61,6 +64,10 @@ type OcgSidebarProps = {
   runtimeStatus: RuntimeStatus;
   /** Active top-level workspace, used to highlight the navigation group. */
   activeWorkspace?: WorkspaceTarget;
+  /** Project switcher inputs. The switcher renders only when onChange is given. */
+  projects?: readonly ProjectSummary[];
+  activeProjectId?: ProjectId;
+  onProjectChange?: (id: ProjectId) => void;
   /** Unresolved attention count shown as a quiet badge next to Attention. */
   attentionCount?: number;
   onOpenChat?: () => void;
@@ -123,6 +130,9 @@ export function OcgSidebar({
   onNewChat,
   runtimeStatus,
   activeWorkspace = "chat",
+  projects = PROJECTS,
+  activeProjectId = DEFAULT_PROJECT_ID,
+  onProjectChange,
   attentionCount = 0,
   onOpenChat,
   onOpenHome,
@@ -152,6 +162,14 @@ export function OcgSidebar({
           <RailButton label="Expand sidebar" onClick={onToggle}>
             <ChevronsLeft className="size-4 rotate-180" />
           </RailButton>
+          {onProjectChange && (
+            <ProjectSwitcher
+              projects={projects}
+              activeProjectId={activeProjectId}
+              collapsed
+              onChange={onProjectChange}
+            />
+          )}
           <RailButton label="New chat" onClick={onNewChat}>
             <Plus className="size-4" />
           </RailButton>
@@ -227,7 +245,7 @@ export function OcgSidebar({
           </div>
           <div className="min-w-0 flex-1">
             <p className="truncate text-[13px] font-semibold tracking-tight">
-              OCG Workspace
+              OCG Server
             </p>
             <p className="truncate text-[11px] text-muted-foreground">
               local · mock state
@@ -251,6 +269,16 @@ export function OcgSidebar({
             <TooltipContent side="right">Collapse sidebar</TooltipContent>
           </Tooltip>
         </div>
+
+        {onProjectChange && (
+          <div className="px-3 pb-2">
+            <ProjectSwitcher
+              projects={projects}
+              activeProjectId={activeProjectId}
+              onChange={onProjectChange}
+            />
+          </div>
+        )}
 
         {hasNav && (
           <nav aria-label="Workspace navigation" className="px-2 pb-2">

@@ -36,7 +36,7 @@ import {
   isBlockedItem,
   isUnresolved,
 } from "./domain";
-import type { AttentionFilters } from "./selectors";
+import type { AttentionFilters, AttentionQueue } from "./selectors";
 import {
   ATTENTION_RESULT_LIMIT,
   acknowledgeAttentionItem,
@@ -60,6 +60,11 @@ export type AttentionNavigate = {
 type AttentionSurfaceProps = {
   snapshot: RuntimeSnapshot;
   initialTab?: AttentionTab;
+  /**
+   * Optional project-scoped fixture queue. When omitted the scenario queue is
+   * used, preserving the standalone behavior.
+   */
+  queue?: AttentionQueue;
 } & AttentionNavigate;
 
 const TAB_LABELS: Record<AttentionTab, string> = {
@@ -120,7 +125,7 @@ function destinationAction(destination: AttentionDestination, navigate: Attentio
 const DECISION_CLOCK = "2026-09-25T10:00:00Z";
 
 export function AttentionSurface(props: AttentionSurfaceProps) {
-  const { snapshot, initialTab = "overview" } = props;
+  const { snapshot, initialTab = "overview", queue: queueProp } = props;
   const navigate: AttentionNavigate = {
     onOpenChat: props.onOpenChat,
     onOpenMissionControl: props.onOpenMissionControl,
@@ -131,7 +136,10 @@ export function AttentionSurface(props: AttentionSurfaceProps) {
   };
 
   // Fixture queue is stable per scenario; decisions mutate local state only.
-  const queue = useMemo(() => createAttentionQueue(snapshot.scenario), [snapshot.scenario]);
+  const queue = useMemo(
+    () => queueProp ?? createAttentionQueue(snapshot.scenario),
+    [queueProp, snapshot.scenario],
+  );
   const baseItems = useMemo(() => selectAttentionItems(snapshot, queue), [snapshot, queue]);
   const [overrides, setOverrides] = useState<Record<string, AttentionItem>>({});
   const items = useMemo(

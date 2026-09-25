@@ -10,6 +10,8 @@
  * Fixture-driven only. No backend contract is implied.
  */
 
+import type { ProjectId } from "../project/domain";
+
 export type AttentionKind =
   | "approval"
   | "budget"
@@ -129,6 +131,11 @@ export type AttentionItem = {
   updatedAt: string;
   source: AttentionSource;
   destination: AttentionDestination;
+  /**
+   * Owning project for fixture-owned attention items. Snapshot-derived items
+   * leave this unset and are scoped by the project snapshot instead.
+   */
+  projectId?: ProjectId;
   missionId?: string;
   missionTitle?: string;
   taskId?: string;

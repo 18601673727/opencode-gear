@@ -181,8 +181,8 @@ function fixtureEntry(entry: LogEntry): LogEntry {
 }
 
 /** Deterministic, display-safe sequence used by ?scenario=logs-live. */
-export function createLogsLiveFixture(): LogEntry[] {
-  return [
+export function createLogsLiveFixture(projectScope?: string): LogEntry[] {
+  const entries = [
     fixtureEntry({ id: "logs-startup", timestamp: at(0), level: "info", source: "OCG Core", category: "startup", message: "Workspace runtime initialized", sessionId: "logs-live-session", correlationId: "corr-logs-live" }),
     fixtureEntry({ id: "logs-mission-start", timestamp: at(1), level: "info", source: "Mission", category: "lifecycle", message: "Mission started: diagnose provider recovery", missionId: "mission-logs-live", sessionId: "logs-live-session", correlationId: "corr-logs-live" }),
     fixtureEntry({ id: "logs-worker-invocation", timestamp: at(2), level: "info", source: "Worker", category: "invocation", message: "Worker invocation started", missionId: "mission-logs-live", taskId: "task-provider-health", workerId: "verify", workerRole: "Verify", provider: "OpenCode Zen", model: "Muse Spark 1.3 Contributor Free", invocationId: "invoke-verify-01", sessionId: "logs-live-session" }),
@@ -193,6 +193,9 @@ export function createLogsLiveFixture(): LogEntry[] {
     fixtureEntry({ id: "logs-recovery", timestamp: at(7), level: "info", source: "Runtime", category: "recovery", message: "Provider health recovered; retry may continue", missionId: "mission-logs-live", workerId: "verify", workerRole: "Verify", provider: "OpenCode Zen", model: "Muse Spark 1.3 Contributor Free", fields: { health: "ready" } }),
     fixtureEntry({ id: "logs-complete", timestamp: at(8), level: "info", source: "Mission", category: "lifecycle", message: "Mission completed successfully", missionId: "mission-logs-live", sessionId: "logs-live-session", correlationId: "corr-logs-live", fields: { completedTasks: 1, failedAttempts: 1 } }),
   ];
+  if (!projectScope) return entries;
+  const sessionId = `logs-${projectScope}-session`;
+  return entries.map((entry) => ({ ...entry, sessionId }));
 }
 
 /** Build a useful read-only log view for non-stream scenarios. */
