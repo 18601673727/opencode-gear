@@ -555,7 +555,7 @@ budget:
 | --- | --- | --- | --- |
 | `currency` | unset | 1–8 ASCII letters/digits | Accounting currency. Required when a limit or an estimate is set; OCG never guesses or converts a currency (no FX). |
 | `hardLimitMicros` | unset | positive integer | Default hard Mission budget in micro-units (10⁻⁶ of `currency`). Materialized once into each Mission as a `system_default` limit; a later config edit never silently changes an existing durable limit. |
-| `estimatedOperationCostMicros` | unset | positive integer | Bounded pre-authorization estimate for one provider-costly operation. Without it, a hard-budgeted provider-costly action is deferred (`mission_cost_unknown`) rather than assumed free. |
+| `estimatedOperationCostMicros` | unset | positive integer | Pre-authorization estimate for an existing provider-costly operation, not a guaranteed provider charge ceiling. Without it, a hard-budgeted provider-costly action is deferred (`mission_cost_unknown`) rather than assumed free. For migrated gateway dispatch, an estimate does not authorize a hard-capped request. |
 | `requireQuota` | `false` | boolean | Require a fresh, authoritative quota fact before a provider-costly action. When required, an exhausted/unknown/stale quota defers instead of assuming unlimited capacity. |
 
 There is deliberately no `budget.enabled` flag: a configured hard limit is

@@ -31,6 +31,16 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde_yaml_ng = "0.10.0"
 fs2 = "0.4"
+# Phase 3B-1 provider transport substrate. Pinned to the exact versions the
+# aimux 0.3.0 conformance probe was run against; `default-features = false`
+# drops the realtime/WebSocket surface (chat completions only).
+aimux-core = "=0.3.0"
+aimux-providers = { version = "=0.3.0", default-features = false }
+# `RetryConfig` is only re-exported transitively; the transport disables retries
+# at construction as well as per call.
+aimux-provider-utils = "=0.3.0"
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "time", "net"] }
 
 [profile.release]
 lto = true

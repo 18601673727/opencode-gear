@@ -28,6 +28,8 @@ pub mod preflight;
 pub mod process;
 pub mod project;
 pub mod prompt;
+pub mod provider_gateway;
+pub mod provider_transport;
 pub mod proxy;
 pub mod report;
 pub mod reports;

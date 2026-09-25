@@ -23,6 +23,8 @@ use crate::process::{
     SystemStaticProxy,
 };
 use crate::project;
+use crate::provider_gateway::{GatewayRoute, ProviderGateway};
+use crate::provider_transport::ProviderTransportConfig;
 use crate::proxy::{ProxyScheme, ProxySelection, ProxySource};
 use crate::report;
 use crate::runtime::compat::{self, LeadSelection, RuntimeAdapter, SessionClient};
@@ -1997,6 +1999,122 @@ fn launch(
     } else {
         None
     };
+    let mut gateway = None;
+    let mut migrated_env = None;
+    if coding_session && adapter.major() == compat::Major::V2 {
+        if let Some(routes) = effective
+            .data
+            .get("provider_transport")
+            .and_then(Value::as_object)
+        {
+            if routes.len() != 1 {
+                return Err(Failure::Gear(GearError::config("provider_transport requires exactly one explicitly migrated route per invocation")));
+            }
+            let (provider, settings) = routes.iter().next().expect("checked nonempty");
+            if settings.get("ownership").and_then(Value::as_str) != Some("ocg_native") {
+                return Err(Failure::Gear(GearError::config(
+                    "provider_transport ownership must be ocg_native",
+                )));
+            }
+            let source = resolved
+                .get_mut("provider")
+                .and_then(Value::as_object_mut)
+                .and_then(|all| all.get_mut(provider))
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    Failure::Gear(GearError::config(
+                        "migrated provider is not configured in OpenCode",
+                    ))
+                })?;
+            let model = settings
+                .get("model")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    Failure::Gear(GearError::config("provider_transport.model is required"))
+                })?;
+            let known = source
+                .get("models")
+                .and_then(Value::as_object)
+                .is_some_and(|models| {
+                    models.iter().any(|(key, spec)| {
+                        spec.get("id")
+                            .or_else(|| spec.get("modelID"))
+                            .and_then(Value::as_str)
+                            .unwrap_or(key)
+                            == model
+                    })
+                });
+            if !known {
+                return Err(Failure::Gear(GearError::config(
+                    "migrated upstream model is not configured",
+                )));
+            }
+            let base_env = settings
+                .get("base_url_env")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    Failure::Gear(GearError::config(
+                        "provider_transport.base_url_env is required",
+                    ))
+                })?;
+            let key_env = settings
+                .get("api_key_env")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    Failure::Gear(GearError::config(
+                        "provider_transport.api_key_env is required",
+                    ))
+                })?;
+            let valid_env = |name: &str| {
+                !name.is_empty()
+                    && name.len() <= 80
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            };
+            if !valid_env(base_env) || !valid_env(key_env) {
+                return Err(Failure::Gear(GearError::config(
+                    "invalid provider_transport environment variable name",
+                )));
+            }
+            let base = std::env::var(base_env).map_err(|_| {
+                Failure::Gear(GearError::config(
+                    "migrated upstream base URL is unavailable",
+                ))
+            })?;
+            let credential = std::env::var(key_env).map_err(|_| {
+                Failure::Gear(GearError::config(
+                    "migrated upstream credential is unavailable",
+                ))
+            })?;
+            if !base.starts_with("https://") && !base.starts_with("http://127.0.0.1:") {
+                return Err(Failure::Gear(GearError::config(
+                    "migrated upstream must use HTTPS or numeric loopback",
+                )));
+            }
+            let budget = crate::orchestration::budget::BudgetConfig::from_config(&effective.data)
+                .map_err(Failure::Gear)?;
+            let owned = ProviderGateway::start(
+                project_root.to_path_buf(),
+                invocation_dir.to_string_lossy().to_string(),
+                GatewayRoute {
+                    provider: provider.clone(),
+                    model: model.to_string(),
+                    upstream: ProviderTransportConfig::new(base, credential),
+                },
+                budget,
+            )
+            .map_err(Failure::Gear)?;
+            // Do not let provider-specific headers, original credentials, or
+            // alternate endpoints escape into OpenCode's runtime state.
+            source.insert(
+                "options".into(),
+                json!({"baseURL":owned.url(),"apiKey":owned.token()}),
+            );
+            gateway = Some(owned);
+            migrated_env = Some((base_env.to_string(), key_env.to_string()));
+        }
+    }
     let content = serde_json::to_string(&resolved).map_err(|error| {
         Failure::Gear(GearError::config(format!(
             "cannot serialize the OpenCode config: {error}"
@@ -2049,11 +2167,31 @@ fn launch(
                     model::lead_contract(&effective.data, level).map_err(Failure::Gear)?;
                 let lead = LeadSelection::from_contract(&contract);
                 let plugin_env = if plugin_active {
-                    runtime_plugin_env(effective, project_root, level, adapter)
-                        .map_err(Failure::Gear)?
+                    let mut vars = runtime_plugin_env(effective, project_root, level, adapter)
+                        .map_err(Failure::Gear)?;
+                    if let Some(gateway) = &gateway {
+                        vars.push((
+                            OsString::from("OPENCODE_GEAR_PROVIDER_INVOCATION"),
+                            OsString::from(gateway.invocation()),
+                        ));
+                        vars.push((
+                            OsString::from("OPENCODE_GEAR_PROVIDER_ID"),
+                            OsString::from(&gateway.provider_id()),
+                        ));
+                    }
+                    if let Some((base, key)) = &migrated_env {
+                        vars.push((OsString::from(base), OsString::new()));
+                        vars.push((OsString::from(key), OsString::new()));
+                    }
+                    vars
                 } else {
                     Vec::new()
                 };
+                if gateway.is_some() && !plugin_active {
+                    return Err(Failure::Gear(GearError::config(
+                        "migrated provider requires the V2 correlation plugin",
+                    )));
+                }
                 let runtime = compat::v2_server::OwnedV2Server::start(
                     &selection.path,
                     &content,
@@ -2061,6 +2199,11 @@ fn launch(
                     &proxy_env,
                 )
                 .map_err(Failure::Gear)?;
+                if let Some(gateway) = &gateway {
+                    gateway
+                        .attach_runtime(runtime.registration().clone())
+                        .map_err(Failure::Gear)?;
+                }
                 let mut client = compat::v2_client::V2SessionClient::connect(
                     runtime.registration(),
                     invocation_dir.to_string_lossy(),
@@ -2090,11 +2233,25 @@ fn launch(
     // generated `file://` plugin would be broken, so fail clearly instead of
     // launching an integration that cannot work. A non-coding session (for
     // example `ocg models`) skips this entirely.
-    let extra_env = if plugin_active {
+    let mut extra_env = if plugin_active {
         runtime_plugin_env(effective, project_root, level, adapter).map_err(Failure::Gear)?
     } else {
         Vec::new()
     };
+    if let Some(gateway) = &gateway {
+        extra_env.push((
+            OsString::from("OPENCODE_GEAR_PROVIDER_INVOCATION"),
+            OsString::from(gateway.invocation()),
+        ));
+        extra_env.push((
+            OsString::from("OPENCODE_GEAR_PROVIDER_ID"),
+            OsString::from(gateway.provider_id()),
+        ));
+    }
+    if let Some((base, key)) = &migrated_env {
+        extra_env.push((OsString::from(base), OsString::new()));
+        extra_env.push((OsString::from(key), OsString::new()));
+    }
     if let Some(runtime) = v2_runtime {
         let target_session = runtime_target_session.as_deref().unwrap_or_default();
         let private_args = private_server_args(args, runtime.url(), target_session);

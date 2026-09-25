@@ -964,6 +964,20 @@ export default {
       });
     }));
 
+    // Provider Gateway correlation only. Ownership and economic admission
+    // are decided by Rust after authoritative lineage lookup, never here.
+    registrations.push(await ctx.session.hook("model.request", (event) => {
+      const invocation = process.env.OPENCODE_GEAR_PROVIDER_INVOCATION;
+      const provider = process.env.OPENCODE_GEAR_PROVIDER_ID;
+      if (!invocation || !provider || event?.model?.providerID !== provider) return;
+      if (!event || typeof event.sessionID !== "string" || !event.headers) return;
+      if (!/^[A-Za-z0-9_-]{1,120}$/.test(event.sessionID)) return;
+      event.headers["x-ocg-session"] = event.sessionID;
+      event.headers["x-ocg-request-kind"] = String(event.kind || "unknown").slice(0, 32);
+      event.headers["x-ocg-invocation"] = invocation;
+      event.headers["x-ocg-logical-operation"] = invocation;
+    }));
+
     // The `context` hook fires for the agent loop of every session, including
     // tool-driven continuations, and its changes apply only to the outgoing
     // model call — never to persisted history. The event carries the session's

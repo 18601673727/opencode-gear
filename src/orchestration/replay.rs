@@ -47,6 +47,12 @@
 //! never stored here.
 
 use crate::error::{GearError, Result};
+use crate::orchestration::budget::{
+    BudgetConfig, CostBasis, QuotaFacts, SpendAction, SpendAssessment,
+};
+use crate::orchestration::dispatch::{
+    DispatchId, DispatchRecord, DispatchState, DispatchUsage, MAX_DISPATCHES,
+};
 use crate::orchestration::mission::{self, Mission};
 use crate::orchestration::policy::{self, ApprovalRecord, MAX_APPROVALS};
 use crate::resources::{self, ResourceObservation, MAX_RESOURCES};
@@ -92,6 +98,8 @@ pub struct AuthoritativeSnapshot {
     pub missions: BTreeMap<String, Mission>,
     pub approvals: BTreeMap<String, ApprovalRecord>,
     pub resources: BTreeMap<String, ResourceObservation>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dispatches: BTreeMap<String, DispatchRecord>,
 }
 
 /// A normalized upsert of one durable domain value.
@@ -120,6 +128,9 @@ pub enum DomainEvent {
     ResourceReplace {
         resources: BTreeMap<String, ResourceObservation>,
     },
+    DispatchUpsert {
+        dispatch: DispatchRecord,
+    },
 }
 
 impl DomainEvent {
@@ -130,6 +141,14 @@ impl DomainEvent {
             Self::ApprovalUpsert { .. } => "approval_upsert",
             Self::ResourceUpsert { .. } => "resource_upsert",
             Self::ResourceReplace { .. } => "resource_replace",
+            Self::DispatchUpsert { dispatch } => match dispatch.state {
+                DispatchState::Reserved => "dispatch_reserved",
+                DispatchState::DispatchStarted => "dispatch_started",
+                DispatchState::Completed => "dispatch_completed",
+                DispatchState::Unresolved => "dispatch_unresolved",
+                DispatchState::KnownNotDispatched | DispatchState::Failed => "dispatch_blocked",
+                DispatchState::Settled => "dispatch_settled",
+            },
         }
     }
 }
@@ -210,6 +229,189 @@ pub struct SnapshotService {
 }
 
 impl SnapshotService {
+    /// Compare current ownership and atomically reserve one distinct network
+    /// attempt with its Dispatch record. A failure cannot authorize a send.
+    pub fn reserve_dispatch(
+        &self,
+        mut dispatch: DispatchRecord,
+        config: &BudgetConfig,
+        quota: QuotaFacts,
+    ) -> Result<(SpendAssessment, DispatchRecord)> {
+        dispatch.validate()?;
+        if dispatch.state != DispatchState::Reserved || dispatch.reservation_id.is_some() {
+            return Err(GearError::config(
+                "dispatch must enter as a fresh reservation",
+            ));
+        }
+        let _lock = ReplayLock::acquire(&self.root)?;
+        let mut document = read_document(&self.root)?;
+        if document
+            .snapshot
+            .dispatches
+            .contains_key(dispatch.id.as_str())
+        {
+            return Err(GearError::config("DispatchId was already admitted"));
+        }
+        let mission = document
+            .snapshot
+            .missions
+            .get(&dispatch.mission_id)
+            .ok_or_else(|| GearError::config("no current Mission for provider dispatch"))?;
+        if mission.is_terminal()
+            || mission.generation != dispatch.generation
+            || mission.session_id.as_deref() != Some(&dispatch.root_id)
+        {
+            return Err(GearError::config("provider dispatch owner is stale"));
+        }
+        let mut mission = mission.clone();
+        // The configurable operation estimate is NOT a provider-enforced upper
+        // bound. An estimate cannot authorize a hard-capped network attempt.
+        let assessment = mission.admit_spend(
+            config,
+            SpendAction::ProviderDispatch,
+            dispatch.id.as_str(),
+            CostBasis::Unknown,
+            quota,
+            dispatch.created_at,
+        );
+        if !assessment.is_allowed() {
+            return Ok((assessment, dispatch));
+        }
+        dispatch.reservation_id = assessment.reservation_id.clone();
+        if mission != document.snapshot.missions[&dispatch.mission_id] {
+            append_to_document(
+                &mut document,
+                DomainEvent::MissionUpsert { mission },
+                self.retention,
+            )?;
+        }
+        append_to_document(
+            &mut document,
+            DomainEvent::DispatchUpsert {
+                dispatch: dispatch.clone(),
+            },
+            self.retention,
+        )?;
+        write_document(&self.root, &document)?;
+        Ok((assessment, dispatch))
+    }
+
+    /// Claim the network send in durable state; it can succeed only once.
+    pub fn start_dispatch(&self, id: &DispatchId, now: i64) -> Result<DispatchRecord> {
+        let _lock = ReplayLock::acquire(&self.root)?;
+        let mut document = read_document(&self.root)?;
+        let mut dispatch = document
+            .snapshot
+            .dispatches
+            .get(id.as_str())
+            .ok_or_else(|| GearError::config("unknown DispatchId"))?
+            .clone();
+        if dispatch.state != DispatchState::Reserved {
+            return Err(GearError::config("DispatchId cannot send twice"));
+        }
+        let mission = document
+            .snapshot
+            .missions
+            .get(&dispatch.mission_id)
+            .ok_or_else(|| GearError::config("dispatch Mission missing"))?;
+        if mission.is_terminal()
+            || mission.generation != dispatch.generation
+            || mission.session_id.as_deref() != Some(&dispatch.root_id)
+        {
+            return Err(GearError::config(
+                "dispatch Mission root is no longer current",
+            ));
+        }
+        dispatch.state = DispatchState::DispatchStarted;
+        dispatch.updated_at = now;
+        append_to_document(
+            &mut document,
+            DomainEvent::DispatchUpsert {
+                dispatch: dispatch.clone(),
+            },
+            self.retention,
+        )?;
+        write_document(&self.root, &document)?;
+        Ok(dispatch)
+    }
+
+    /// Record a terminal attempt. An uncertain attempt retains its reservation.
+    pub fn finish_dispatch(
+        &self,
+        id: &DispatchId,
+        state: DispatchState,
+        usage: Option<DispatchUsage>,
+        failure: Option<&str>,
+        now: i64,
+    ) -> Result<bool> {
+        if !matches!(
+            state,
+            DispatchState::Settled
+                | DispatchState::Unresolved
+                | DispatchState::KnownNotDispatched
+                | DispatchState::Failed
+        ) {
+            return Err(GearError::config("invalid dispatch completion state"));
+        }
+        let _lock = ReplayLock::acquire(&self.root)?;
+        let mut document = read_document(&self.root)?;
+        let mut dispatch = document
+            .snapshot
+            .dispatches
+            .get(id.as_str())
+            .ok_or_else(|| GearError::config("unknown DispatchId"))?
+            .clone();
+        if dispatch.state == state {
+            return Ok(false);
+        }
+        if dispatch.state != DispatchState::DispatchStarted {
+            return Err(GearError::config(
+                "dispatch not started or already finished",
+            ));
+        }
+        let mut mission = document
+            .snapshot
+            .missions
+            .get(&dispatch.mission_id)
+            .ok_or_else(|| GearError::config("dispatch Mission missing"))?
+            .clone();
+        if mission.generation != dispatch.generation {
+            return Err(GearError::config("dispatch Mission generation changed"));
+        }
+        if let Some(reservation) = &dispatch.reservation_id {
+            match state {
+                DispatchState::Settled => {
+                    mission.settle_spend(reservation, None, now)?;
+                }
+                DispatchState::Unresolved | DispatchState::Failed => {
+                    mission.mark_spend_unresolved(reservation, now);
+                }
+                DispatchState::KnownNotDispatched => {
+                    mission.release_spend(reservation, now);
+                }
+                _ => unreachable!(),
+            }
+        }
+        dispatch.state = state;
+        dispatch.updated_at = now;
+        dispatch.usage = usage;
+        dispatch.failure_class = failure.map(str::to_string);
+        dispatch.validate()?;
+        if mission != document.snapshot.missions[&dispatch.mission_id] {
+            append_to_document(
+                &mut document,
+                DomainEvent::MissionUpsert { mission },
+                self.retention,
+            )?;
+        }
+        append_to_document(
+            &mut document,
+            DomainEvent::DispatchUpsert { dispatch },
+            self.retention,
+        )?;
+        write_document(&self.root, &document)?;
+        Ok(true)
+    }
     /// Open the replay authority, bootstrapping from existing durable domains
     /// on first use. A previously initialized store whose document is missing
     /// fails closed.
@@ -644,6 +846,7 @@ fn bootstrap_snapshot(root: &Path) -> Result<AuthoritativeSnapshot> {
         missions,
         approvals,
         resources: resource_map,
+        dispatches: BTreeMap::new(),
     };
     validate_snapshot(&snapshot)?;
     Ok(snapshot)
@@ -756,6 +959,30 @@ impl AuthoritativeSnapshot {
                 }
                 self.resources = resources.clone();
                 enforce_resource_bound(&mut self.resources);
+                Ok(true)
+            }
+            DomainEvent::DispatchUpsert { dispatch } => {
+                if self.dispatches.get(dispatch.id.as_str()) == Some(dispatch) {
+                    return Ok(false);
+                }
+                let mut candidate = self.dispatches.clone();
+                candidate.insert(dispatch.id.as_str().to_string(), dispatch.clone());
+                if candidate.len() > MAX_DISPATCHES {
+                    let excess = candidate.len() - MAX_DISPATCHES;
+                    let mut terminal: Vec<_> = candidate
+                        .values()
+                        .filter(|item| !item.state.is_live())
+                        .map(|item| (item.updated_at, item.id.as_str().to_string()))
+                        .collect();
+                    terminal.sort();
+                    if terminal.len() < excess {
+                        return Err(GearError::config("live dispatch retention bound reached"));
+                    }
+                    for (_, id) in terminal.into_iter().take(excess) {
+                        candidate.remove(&id);
+                    }
+                }
+                self.dispatches = candidate;
                 Ok(true)
             }
         }
@@ -967,6 +1194,15 @@ fn validate_document(document: &ReplayDocument) -> Result<()> {
 }
 
 fn validate_snapshot(snapshot: &AuthoritativeSnapshot) -> Result<()> {
+    if snapshot.dispatches.len() > MAX_DISPATCHES {
+        return Err(GearError::config("dispatch retention bound exceeded"));
+    }
+    for (id, dispatch) in &snapshot.dispatches {
+        dispatch.validate()?;
+        if id != dispatch.id.as_str() {
+            return Err(GearError::config("dispatch key mismatch"));
+        }
+    }
     for (key, mission) in &snapshot.missions {
         if key != &mission.mission_id {
             return Err(GearError::config(
@@ -1024,6 +1260,7 @@ fn validate_event(event: &DomainEvent) -> Result<()> {
             }
             Ok(())
         }
+        DomainEvent::DispatchUpsert { dispatch } => dispatch.validate(),
     }
 }
 
@@ -1178,6 +1415,97 @@ fn retained_len(root: &Path) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn attempt(id: &str, execution: &str) -> DispatchRecord {
+        DispatchRecord {
+            id: DispatchId::new(id.to_string()).unwrap(),
+            mission_id: "task-0000000000000001".to_string(),
+            generation: 1,
+            logical_operation: "turn-1".to_string(),
+            execution_id: execution.to_string(),
+            root_id: "session-1".to_string(),
+            provider: "fixture".to_string(),
+            model: "fixture-model".to_string(),
+            reservation_id: None,
+            state: DispatchState::Reserved,
+            created_at: 2,
+            updated_at: 2,
+            usage: None,
+            cost_provenance: "unknown".to_string(),
+            failure_class: None,
+        }
+    }
+
+    #[test]
+    fn uncapped_dispatch_attempts_share_one_durable_mission() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = SnapshotService::open(dir.path()).unwrap();
+        service
+            .append(DomainEvent::MissionUpsert {
+                mission: mission(1, 1),
+            })
+            .unwrap();
+        let config = BudgetConfig::default();
+        let (allowed, root) = service
+            .reserve_dispatch(
+                attempt("dsp-root-1", "session-1"),
+                &config,
+                QuotaFacts::unknown(),
+            )
+            .unwrap();
+        assert!(allowed.is_allowed());
+        let root = service.start_dispatch(&root.id, 3).unwrap();
+        assert!(
+            service.start_dispatch(&root.id, 3).is_err(),
+            "one id cannot send twice"
+        );
+        let (allowed_worker, _) = service
+            .reserve_dispatch(
+                attempt("dsp-worker-1", "worker-1"),
+                &config,
+                QuotaFacts::unknown(),
+            )
+            .unwrap();
+        assert!(allowed_worker.is_allowed());
+        assert_eq!(service.snapshot().unwrap().dispatches.len(), 2);
+        assert!(service
+            .finish_dispatch(
+                &root.id,
+                DispatchState::Unresolved,
+                None,
+                Some("midstream_disconnect"),
+                4
+            )
+            .unwrap());
+        assert!(!service
+            .finish_dispatch(&root.id, DispatchState::Unresolved, None, None, 4)
+            .unwrap());
+    }
+
+    #[test]
+    fn unknown_required_cost_blocks_before_dispatch_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = SnapshotService::open(dir.path()).unwrap();
+        service
+            .append(DomainEvent::MissionUpsert {
+                mission: mission(1, 1),
+            })
+            .unwrap();
+        let config = BudgetConfig {
+            currency: Some("USD".into()),
+            hard_limit_micros: Some(100),
+            ..BudgetConfig::default()
+        };
+        let (blocked, _) = service
+            .reserve_dispatch(
+                attempt("dsp-unknown-1", "worker-1"),
+                &config,
+                QuotaFacts::unknown(),
+            )
+            .unwrap();
+        assert!(!blocked.is_allowed());
+        assert!(service.snapshot().unwrap().dispatches.is_empty());
+    }
 
     fn mission(index: u64, now: i64) -> Mission {
         Mission::admit(&format!("task-{index:016}"), "task", "session-1", now)

@@ -931,7 +931,7 @@ The top-level `budget` key configures the boundary:
 budget:
   currency: USD                    # required when a limit or estimate is set
   hardLimitMicros: 5000000         # default hard Mission budget, micro-units
-  estimatedOperationCostMicros: 100000  # bounded pre-authorization estimate
+  estimatedOperationCostMicros: 100000  # estimate, not a guaranteed cost ceiling
   requireQuota: false              # require a fresh quota fact
 ```
 
@@ -955,9 +955,21 @@ Interactive root and worker model turns are dispatched by OpenCode itself, not
 by an OCG process. OpenCode 2.0.15 exposes a synchronous pre-provider
 `session.hook("model.request")` (throwing from it resulted in zero provider
 POSTs), and worker ownership can now be resolved there through runtime lineage.
-No interactive admission, provider transport, or spend gate is wired in this
-phase. That path remains explicitly not gated; the enforceable boundary is the
-existing OCG-owned execution path plus the engine-level configuration OCG exports.
+OCG now has a Provider Transport Gateway foundation for explicitly migrated
+OpenAI-compatible routes. Its invocation-scoped loopback transport uses aimux,
+resolves root and worker Mission ownership through runtime lineage, and records
+dispatch attempts in the durable replay authority. It accepts only supported
+streaming requests, keeps upstream credentials out of OpenCode, strips internal
+correlation headers before upstream dispatch, and disables aimux retries.
+
+This foundation does not establish universal migrated Hard Budget enforcement.
+`estimatedOperationCostMicros` is not a trustworthy upper bound on provider
+charges: hard-budgeted migrated dispatch remains fail-closed when no trustworthy
+cost ceiling is available, even if an estimate is configured. Reservation
+unification between existing continuation admission and the gateway is not yet
+complete; this phase does not claim to prevent double reservation on migrated
+continuation/resume traffic. Routes not explicitly migrated continue to use
+OpenCode's own provider dispatch.
 
 ### Inspection
 

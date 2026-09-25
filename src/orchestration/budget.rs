@@ -176,12 +176,15 @@ pub enum SpendAction {
     /// OCG-initiated operation that is `DefinitelyProviderCostly` today: the V2
     /// adapter injects a synthetic provider message with `resume: true`.
     ResumeContinuation,
+    /// One migrated provider network attempt, including root and worker turns.
+    ProviderDispatch,
 }
 
 impl SpendAction {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ResumeContinuation => "resume_continuation",
+            Self::ProviderDispatch => "provider_dispatch",
         }
     }
 }

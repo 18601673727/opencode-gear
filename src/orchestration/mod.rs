@@ -27,6 +27,7 @@ pub mod config;
 pub mod context_governor;
 pub mod control;
 pub mod controller;
+pub mod dispatch;
 pub mod handoff;
 pub mod mission;
 pub mod plugin;
