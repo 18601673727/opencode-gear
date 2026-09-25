@@ -1,0 +1,302 @@
+"use client";
+
+import {
+  ChevronsLeft,
+  Code2,
+  FlaskConical,
+  LifeBuoy,
+  PenTool,
+  Plus,
+  Search,
+  Server,
+  Settings,
+} from "lucide-react";
+import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
+import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import type { ChatSession, RuntimeStatus, WorkType } from "../types";
+import { WORK_TYPE_LABEL } from "../types";
+
+const GROUP_ORDER: WorkType[] = ["research", "coding", "design", "devops"];
+
+const GROUP_ICON: Record<WorkType, typeof Search> = {
+  research: FlaskConical,
+  coding: Code2,
+  design: PenTool,
+  devops: Server,
+};
+
+type OcgSidebarProps = {
+  sessions: ChatSession[];
+  activeSessionId: string;
+  collapsed: boolean;
+  onToggle: () => void;
+  onSelect: (id: string) => void;
+  onNewChat: () => void;
+  runtimeStatus: RuntimeStatus;
+};
+
+const RUNTIME_LABEL: Record<RuntimeStatus["state"], string> = {
+  connected: "Runtime ready · local mock",
+  connecting: "Runtime connecting · local mock",
+  disconnected: "Runtime disconnected · local mock",
+  failed: "Runtime failed · local mock",
+};
+
+function RailButton({
+  label,
+  onClick,
+  children,
+  active = false,
+}: {
+  label: string;
+  onClick?: () => void;
+  children: React.ReactNode;
+  active?: boolean;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <button
+            type="button"
+            aria-label={label}
+            title={label}
+            onClick={onClick}
+            className={cn(
+              "flex size-9 items-center justify-center rounded-md border border-transparent text-muted-foreground transition-colors hover:bg-muted hover:text-foreground",
+              active && "bg-muted text-foreground",
+            )}
+          >
+            {children}
+          </button>
+        }
+      />
+      <TooltipContent side="right">{label}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+export function OcgSidebar({
+  sessions,
+  activeSessionId,
+  collapsed,
+  onToggle,
+  onSelect,
+  onNewChat,
+  runtimeStatus,
+}: OcgSidebarProps) {
+  if (collapsed) {
+    return (
+      <TooltipProvider delay={100}>
+        <div className="flex h-full w-full flex-col items-center gap-1 px-2 py-3">
+          <RailButton label="Expand sidebar" onClick={onToggle}>
+            <ChevronsLeft className="size-4 rotate-180" />
+          </RailButton>
+          <RailButton label="New chat" onClick={onNewChat}>
+            <Plus className="size-4" />
+          </RailButton>
+          <div className="my-2 h-px w-8 bg-border" aria-hidden="true" />
+          <div className="flex min-h-0 flex-1 flex-col items-center gap-1 overflow-y-auto">
+            {GROUP_ORDER.map((group) => {
+              const Icon = GROUP_ICON[group];
+              const groupActive = sessions.some(
+                (s) => s.workType === group && s.id === activeSessionId,
+              );
+              const firstInGroup = sessions.find((s) => s.workType === group);
+              return (
+                <RailButton
+                  key={group}
+                  label={WORK_TYPE_LABEL[group]}
+                  active={groupActive}
+                  onClick={() => firstInGroup && onSelect(firstInGroup.id)}
+                >
+                  <Icon className="size-4" />
+                </RailButton>
+              );
+            })}
+          </div>
+          <div className="flex flex-col items-center gap-1">
+            <RailButton label="Settings (placeholder)">
+              <Settings className="size-4" />
+            </RailButton>
+            <Avatar size="sm">
+              <AvatarFallback className="text-[11px]">OC</AvatarFallback>
+            </Avatar>
+          </div>
+        </div>
+      </TooltipProvider>
+    );
+  }
+
+  return (
+    <TooltipProvider delay={100}>
+      <div className="flex h-full w-full flex-col">
+        <div className="flex items-center gap-2 px-3 pt-3 pb-2">
+          <div className="flex size-8 shrink-0 items-center justify-center rounded-md bg-primary text-[13px] font-semibold text-primary-foreground">
+            O
+          </div>
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-[13px] font-semibold tracking-tight">
+              OCG Workspace
+            </p>
+            <p className="truncate text-[11px] text-muted-foreground">
+              local · mock state
+            </p>
+          </div>
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  onClick={onToggle}
+                  aria-label="Collapse sidebar"
+                  aria-expanded="true"
+                  title="Collapse sidebar"
+                >
+                  <ChevronsLeft className="size-4" />
+                </Button>
+              }
+            />
+            <TooltipContent side="right">Collapse sidebar</TooltipContent>
+          </Tooltip>
+        </div>
+
+        <div className="px-3 pb-2">
+          <Button
+            variant="default"
+            size="sm"
+            className="w-full justify-start"
+            onClick={onNewChat}
+          >
+            <Plus className="size-3.5" data-icon="inline-start" />
+            New chat
+          </Button>
+          <div
+            className="mt-2 flex items-center gap-2 rounded-md border border-border bg-muted/40 px-2.5 py-1.5 text-[12px] text-muted-foreground"
+            title="Session search is a placeholder in Phase 1"
+          >
+            <Search className="size-3.5 shrink-0" aria-hidden="true" />
+            <span className="truncate">Search sessions…</span>
+            <kbd className="ml-auto rounded border border-border bg-background px-1 text-[10px]">
+              ⌘K
+            </kbd>
+          </div>
+        </div>
+
+        <nav
+          aria-label="Chat sessions grouped by work type"
+          className="min-h-0 flex-1 overflow-y-auto px-2 pb-2"
+        >
+          {GROUP_ORDER.map((group) => {
+            const Icon = GROUP_ICON[group];
+            const items = sessions.filter((s) => s.workType === group);
+            return (
+              <section key={group} aria-label={WORK_TYPE_LABEL[group]} className="mt-1">
+                <h2 className="flex items-center gap-1.5 px-2 pt-3 pb-1 text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">
+                  <Icon className="size-3.5" aria-hidden="true" />
+                  {WORK_TYPE_LABEL[group]}
+                </h2>
+                <ul className="flex flex-col gap-px">
+                  {items.map((session) => {
+                    const active = session.id === activeSessionId;
+                    return (
+                      <li key={session.id}>
+                        <button
+                          type="button"
+                          onClick={() => onSelect(session.id)}
+                          aria-current={active ? "true" : undefined}
+                          className={cn(
+                            "group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] leading-5 transition-colors",
+                            active
+                              ? "bg-muted font-medium text-foreground"
+                              : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+                          )}
+                        >
+                          <span
+                            aria-hidden="true"
+                            className={cn(
+                              "h-4 w-0.5 shrink-0 rounded-full",
+                              active ? "bg-foreground" : "bg-transparent group-hover:bg-border",
+                            )}
+                          />
+                          <span className="min-w-0 flex-1 truncate">
+                            {session.title}
+                          </span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </section>
+            );
+          })}
+        </nav>
+
+        <div className="border-t border-border px-3 py-2.5">
+          <div className="flex items-center gap-1.5 text-[12px] text-muted-foreground">
+             <span
+               className={cn(
+                 "size-1.5 rounded-full",
+                 runtimeStatus.state === "connected" && "bg-emerald-500",
+                 runtimeStatus.state === "connecting" && "animate-pulse bg-amber-500",
+                 runtimeStatus.state === "disconnected" && "bg-muted-foreground",
+                 runtimeStatus.state === "failed" && "bg-red-500",
+               )}
+               aria-hidden="true"
+             />
+             <span className="truncate">{RUNTIME_LABEL[runtimeStatus.state]}</span>
+          </div>
+          <div className="mt-2 flex items-center gap-2">
+            <Avatar size="sm">
+              <AvatarFallback className="text-[11px]">OC</AvatarFallback>
+            </Avatar>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-[12px] font-medium">Operator</p>
+              <p className="truncate text-[11px] text-muted-foreground">
+                local profile
+              </p>
+            </div>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    aria-label="Open settings (placeholder)"
+                    title="Settings (placeholder)"
+                  >
+                    <Settings className="size-4" />
+                  </Button>
+                }
+              />
+              <TooltipContent side="top">Settings (placeholder)</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    aria-label="Help (placeholder)"
+                    title="Help (placeholder)"
+                  >
+                    <LifeBuoy className="size-4" />
+                  </Button>
+                }
+              />
+              <TooltipContent side="top">Help (placeholder)</TooltipContent>
+            </Tooltip>
+          </div>
+        </div>
+      </div>
+    </TooltipProvider>
+  );
+}

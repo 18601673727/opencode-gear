@@ -16,6 +16,19 @@ bun dev
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
+## Runtime scenarios
+
+The UI currently runs against a local OCG-owned mock runtime. Inspect a fixture with
+`?scenario=`; unknown values fall back to `normal-chat`:
+
+```text
+normal-chat · long-stream · tool-heavy · worker-parallel
+build-failed · retry-success · mission-complete · budget-exhausted
+runtime-disconnected · runtime-connecting · runtime-failed · permission-required
+```
+
+For example: `http://localhost:3000/?scenario=worker-parallel`.
+
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
