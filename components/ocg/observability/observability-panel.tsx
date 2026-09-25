@@ -44,11 +44,11 @@ import {
 import type { InspectorMode, InspectorTab } from "./inspector-state";
 import { restoreWorkerSelection } from "./inspector-state";
 
-const CHART_ESTIMATED = "#b7791f";
-const CHART_REPORTED = "#2563eb";
-const CHART_BAR = "#64748b";
-const CHART_SELECTED = "#1d4ed8";
-const CHART_GRID = "#e2e8f0";
+const CHART_ESTIMATED = "var(--chart-4)";
+const CHART_REPORTED = "var(--chart-2)";
+const CHART_BAR = "var(--chart-3)";
+const CHART_SELECTED = "var(--primary)";
+const CHART_GRID = "var(--border)";
 
 export type MissionInspectorProps = {
   mission: Mission;
@@ -301,8 +301,8 @@ function TimelineChart({ observability }: { observability: RuntimeObservability 
         <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 320, height: 160 }} minWidth={48} minHeight={120} debounce={50}>
           <LineChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke={CHART_GRID} vertical={false} />
-            <XAxis dataKey="timestamp" tick={{ fontSize: 9, fill: "#64748b" }} axisLine={false} tickLine={false} interval="preserveStartEnd" minTickGap={20} />
-            <YAxis domain={[0, "auto"]} tick={{ fontSize: 9, fill: "#64748b" }} axisLine={false} tickLine={false} width={38} tickFormatter={(value) => formatTokens({ value: Number(value), provenance: "reported" })} />
+            <XAxis dataKey="timestamp" tick={{ fontSize: 9, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} interval="preserveStartEnd" minTickGap={20} />
+            <YAxis domain={[0, "auto"]} tick={{ fontSize: 9, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} width={38} tickFormatter={(value) => formatTokens({ value: Number(value), provenance: "reported" })} />
             <Tooltip formatter={(value, name) => [`${value ?? "—"} tokens`, name === "estimatedTotal" ? "Estimated" : name === "reportedTotal" ? "Reported" : "Cumulative"]} labelFormatter={(label) => `Elapsed ${label}`} />
             <Line type="monotone" dataKey="total" name="Cumulative" stroke={CHART_REPORTED} strokeWidth={2} dot={{ r: 2, fill: CHART_REPORTED }} activeDot={{ r: 4 }} connectNulls={false} isAnimationActive={false} />
             <Line type="monotone" dataKey="estimatedTotal" name="Estimated" stroke={CHART_ESTIMATED} strokeWidth={2} strokeDasharray="5 4" dot={false} connectNulls={false} isAnimationActive={false} />
@@ -324,8 +324,8 @@ function WorkerBreakdown({ workers, selectedWorkerId }: { workers: WorkerRuntime
         <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 320, height: 160 }} minWidth={48} minHeight={120} debounce={50}>
           <BarChart data={data} layout="vertical" margin={{ top: 2, right: 8, left: 4, bottom: 2 }}>
             <CartesianGrid strokeDasharray="3 3" stroke={CHART_GRID} horizontal={false} />
-            <XAxis type="number" tick={{ fontSize: 9, fill: "#64748b" }} axisLine={false} tickLine={false} />
-            <YAxis type="category" dataKey="name" width={76} tick={{ fontSize: 9, fill: "#64748b" }} axisLine={false} tickLine={false} />
+            <XAxis type="number" tick={{ fontSize: 9, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} />
+            <YAxis type="category" dataKey="name" width={76} tick={{ fontSize: 9, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} />
             <Tooltip formatter={(value) => [`${value ?? "—"} tokens`, "Total"]} />
             <Bar dataKey="tokens" radius={[0, 3, 3, 0]} barSize={12} isAnimationActive={false}>
               {data.map((item) => <Cell key={item.workerId} fill={item.workerId === selectedWorkerId ? CHART_SELECTED : CHART_BAR} />)}

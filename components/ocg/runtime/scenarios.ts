@@ -53,6 +53,7 @@ export const SCENARIO_IDS: readonly ScenarioId[] = [
   "onboarding-ready",
   "profiles-models",
   "mission-control",
+  "logs-live",
 ];
 
 export function resolveScenario(value: string | undefined | null): ScenarioId {

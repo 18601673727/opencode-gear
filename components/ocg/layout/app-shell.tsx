@@ -10,12 +10,14 @@ import { OcgTopbar } from "../topbar/ocg-topbar";
 import { ResourceLedgerSurface } from "../resource-ledger/resource-ledger-surface";
 import { ControlCenterSurface } from "../control-center/control-center-surface";
 import { MissionControlSurface } from "../mission-control/mission-control-surface";
+import { LogsSurface } from "../logs/logs-surface";
+import { SettingsSurface } from "../settings/settings-surface";
 import type { ControlCenterView } from "../control-center/domain";
 import { OcgRuntimeProvider, useOcgRuntime } from "../runtime/runtime-context";
 import type { ScenarioId } from "../runtime/runtime-types";
 import type { InspectorMode } from "../observability/inspector-state";
 
-export type WorkspaceView = "chat" | "ledger" | "control-center" | "mission-control";
+export type WorkspaceView = "chat" | "ledger" | "control-center" | "mission-control" | "logs" | "settings";
 
 export function AppShell({
   scenario,
@@ -65,6 +67,8 @@ export function RuntimeWorkspace({
   const isLedger = view === "ledger";
   const isControlCenter = view === "control-center";
   const isMissionControl = view === "mission-control";
+  const isLogs = view === "logs";
+  const isSettings = view === "settings";
 
   const handleNewChat = useCallback(async () => {
     if (!activeWorkType) return;
@@ -110,6 +114,18 @@ export function RuntimeWorkspace({
     router.push(isMissionControl ? "/" : "/?scenario=mission-control");
   }, [isMissionControl, router]);
 
+  const handleOpenLogs = useCallback(() => {
+    setMobileNavOpen(false);
+    setMobileMissionOpen(false);
+    router.push(isLogs ? "/" : "/?scenario=logs-live");
+  }, [isLogs, router]);
+
+  const handleOpenSettings = useCallback(() => {
+    setMobileNavOpen(false);
+    setMobileMissionOpen(false);
+    router.push(isSettings ? "/" : "/settings");
+  }, [isSettings, router]);
+
   const handleSelectProfile = useCallback((profileId: string) => {
     void setActiveProfile(profileId);
   }, [setActiveProfile]);
@@ -135,6 +151,8 @@ export function RuntimeWorkspace({
       onOpenLedger={handleOpenLedger}
       onOpenControlCenter={handleOpenControlCenter}
       onOpenMissionControl={handleOpenMissionControl}
+      onOpenLogs={handleOpenLogs}
+      onOpenSettings={handleOpenSettings}
     />
   );
 
@@ -181,6 +199,8 @@ export function RuntimeWorkspace({
             onOpenLedger={handleOpenLedger}
             onOpenControlCenter={handleOpenControlCenter}
             onOpenMissionControl={handleOpenMissionControl}
+            onOpenLogs={handleOpenLogs}
+            onOpenSettings={handleOpenSettings}
           />
         </aside>
       </div>
@@ -190,10 +210,12 @@ export function RuntimeWorkspace({
           session={activeSession}
           sidebarCollapsed={sidebarCollapsed}
           missionOpen={missionOpen}
-          missionControls={!isLedger && !isControlCenter && !isMissionControl}
+          missionControls={!isLedger && !isControlCenter && !isMissionControl && !isLogs && !isSettings}
           ledgerActive={isLedger}
           controlCenterActive={isControlCenter}
           missionControlActive={isMissionControl}
+          logsActive={isLogs}
+          settingsActive={isSettings}
           onToggleSidebar={() => setSidebarCollapsed((value) => !value)}
           onToggleMission={() => setMissionMode((value) => value === "collapsed" ? "docked" : "collapsed")}
           onOpenMobileSidebar={() => setMobileNavOpen(true)}
@@ -201,6 +223,8 @@ export function RuntimeWorkspace({
           onOpenLedger={handleOpenLedger}
           onOpenControlCenter={handleOpenControlCenter}
           onOpenMissionControl={handleOpenMissionControl}
+          onOpenLogs={handleOpenLogs}
+          onOpenSettings={handleOpenSettings}
           runtimeStatus={snapshot.status}
         />
         {isLedger ? (
@@ -227,6 +251,14 @@ export function RuntimeWorkspace({
             ) : (
               <div className="flex flex-1 items-center justify-center p-6 text-[12px] text-muted-foreground">No Mission execution is available.</div>
             )}
+          </main>
+        ) : isLogs ? (
+          <main aria-label="Logs and diagnostics" className="flex min-h-0 flex-1 overflow-hidden">
+            <LogsSurface key={snapshot.scenario} snapshot={snapshot} />
+          </main>
+        ) : isSettings ? (
+          <main aria-label="Settings" className="flex min-h-0 flex-1 overflow-hidden">
+            <SettingsSurface snapshot={snapshot} />
           </main>
         ) : (
           <main aria-label="OCG workspace" className="flex min-h-0 flex-1">
@@ -256,7 +288,7 @@ export function RuntimeWorkspace({
         )}
       </div>
 
-      {!isLedger && !isControlCenter && !isMissionControl && (
+      {!isLedger && !isControlCenter && !isMissionControl && !isLogs && !isSettings && (
         <div
           className={cn("fixed inset-0 z-50 lg:hidden", !mobileMissionOpen && "pointer-events-none")}
           aria-hidden={!mobileMissionOpen}

@@ -12,9 +12,12 @@ export default async function Home({
   const value = typeof params.scenario === "string" ? params.scenario : undefined;
   const scenario = resolveScenario(value);
 
-  // `profiles-models` opens the Control Center by default; `view` pins a tab.
-  const view: WorkspaceView =
-    scenario === "profiles-models" ? "control-center" : scenario === "resource-ledger" ? "ledger" : scenario === "mission-control" ? "mission-control" : "chat";
+  // Scenario defaults preserve the existing workspace routes; an explicit view
+  // is also accepted for shell navigation without inventing a backend route.
+  const requestedView = typeof params.view === "string" ? params.view : undefined;
+  const view: WorkspaceView = requestedView === "settings" || requestedView === "logs"
+    ? requestedView
+    : scenario === "profiles-models" ? "control-center" : scenario === "resource-ledger" ? "ledger" : scenario === "mission-control" ? "mission-control" : scenario === "logs-live" ? "logs" : "chat";
   const controlCenterView = resolveControlCenterView(
     typeof params.view === "string" ? params.view : undefined,
   );

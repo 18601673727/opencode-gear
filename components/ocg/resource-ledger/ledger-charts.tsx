@@ -21,14 +21,14 @@ import { formatTokens } from "./format";
 import { describeTimeSeries, type ComponentTraffic, type LedgerTimePoint } from "./selectors";
 import { SectionTitle } from "./ledger-primitives";
 
-const CHART_GRID = "#e2e8f0";
+const CHART_GRID = "var(--border)";
 
 /** Horizontal stacked composition of the filtered token traffic. */
 export function StackedCompositionBar({ traffic }: { traffic: ComponentTraffic }) {
   const segments = USAGE_COMPONENTS.map((component) => ({
     component,
     value: traffic[component],
-    color: LEDGER_SERIES.find((series) => series.key === component)?.color ?? "#64748b",
+    color: LEDGER_SERIES.find((series) => series.key === component)?.color ?? "var(--chart-3)",
   })).filter((segment): segment is { component: typeof segment.component; value: number; color: string } =>
     segment.value !== null && segment.value > 0,
   );
@@ -66,7 +66,7 @@ export function StackedCompositionBar({ traffic }: { traffic: ComponentTraffic }
       <ul className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1">
         {USAGE_COMPONENTS.map((component) => {
           const value = traffic[component];
-          const color = LEDGER_SERIES.find((series) => series.key === component)?.color ?? "#64748b";
+          const color = LEDGER_SERIES.find((series) => series.key === component)?.color ?? "var(--chart-3)";
           return (
             <li key={component} className="flex min-w-0 items-center gap-1 text-[10px] text-muted-foreground">
               <span className="size-2 shrink-0 rounded-sm" style={{ backgroundColor: color }} aria-hidden />
@@ -147,7 +147,7 @@ export function TrafficChart({ points }: { points: LedgerTimePoint[] }) {
             <CartesianGrid strokeDasharray="3 3" stroke={CHART_GRID} vertical={false} />
             <XAxis
               dataKey="timestamp"
-              tick={{ fontSize: 9, fill: "#64748b" }}
+              tick={{ fontSize: 9, fill: "var(--muted-foreground)" }}
               axisLine={false}
               tickLine={false}
               minTickGap={24}
@@ -155,7 +155,7 @@ export function TrafficChart({ points }: { points: LedgerTimePoint[] }) {
             />
             <YAxis
               domain={[0, "auto"]}
-              tick={{ fontSize: 9, fill: "#64748b" }}
+              tick={{ fontSize: 9, fill: "var(--muted-foreground)" }}
               axisLine={false}
               tickLine={false}
               width={40}

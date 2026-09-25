@@ -10,6 +10,7 @@ import {
   Plus,
   Search,
   Server,
+  ScrollText,
   Settings,
   SlidersHorizontal,
   Table2,
@@ -36,13 +37,14 @@ const GROUP_ICON: Record<WorkType, typeof Search> = {
   devops: Server,
 };
 
-export type WorkspaceTarget = "chat" | "ledger" | "control-center" | "mission-control";
+export type WorkspaceTarget = "chat" | "ledger" | "control-center" | "mission-control" | "logs" | "settings";
 
 const WORKSPACE_NAV: { target: WorkspaceTarget; label: string; icon: typeof Search }[] = [
   { target: "chat", label: "Chat", icon: MessageSquare },
   { target: "control-center", label: "Control Center", icon: SlidersHorizontal },
   { target: "ledger", label: "Resource Ledger", icon: Table2 },
   { target: "mission-control", label: "Mission Control", icon: Workflow },
+  { target: "logs", label: "Logs / Diagnostics", icon: ScrollText },
 ];
 
 type OcgSidebarProps = {
@@ -59,6 +61,8 @@ type OcgSidebarProps = {
   onOpenLedger?: () => void;
   onOpenControlCenter?: () => void;
   onOpenMissionControl?: () => void;
+  onOpenLogs?: () => void;
+  onOpenSettings?: () => void;
 };
 
 const RUNTIME_LABEL: Record<RuntimeStatus["state"], string> = {
@@ -115,14 +119,18 @@ export function OcgSidebar({
   onOpenLedger,
   onOpenControlCenter,
   onOpenMissionControl,
+  onOpenLogs,
+  onOpenSettings,
 }: OcgSidebarProps) {
   const navHandlers: Record<WorkspaceTarget, (() => void) | undefined> = {
     chat: onOpenChat,
     ledger: onOpenLedger,
     "control-center": onOpenControlCenter,
     "mission-control": onOpenMissionControl,
+    logs: onOpenLogs,
+    settings: onOpenSettings,
   };
-  const hasNav = Boolean(onOpenChat || onOpenLedger || onOpenControlCenter || onOpenMissionControl);
+  const hasNav = Boolean(onOpenChat || onOpenLedger || onOpenControlCenter || onOpenMissionControl || onOpenLogs);
 
   if (collapsed) {
     return (
@@ -175,7 +183,7 @@ export function OcgSidebar({
             })}
           </div>
           <div className="flex flex-col items-center gap-1">
-            <RailButton label="Settings (placeholder)">
+            <RailButton label="Settings" onClick={onOpenSettings}>
               <Settings className="size-4" />
             </RailButton>
             <Avatar size="sm">
@@ -353,14 +361,15 @@ export function OcgSidebar({
                   <Button
                     variant="ghost"
                     size="icon-xs"
-                    aria-label="Open settings (placeholder)"
-                    title="Settings (placeholder)"
+                     aria-label="Open settings"
+                     title="Open settings"
+                     onClick={onOpenSettings}
                   >
                     <Settings className="size-4" />
                   </Button>
                 }
               />
-              <TooltipContent side="top">Settings (placeholder)</TooltipContent>
+              <TooltipContent side="top">Open settings</TooltipContent>
             </Tooltip>
             <Tooltip>
               <TooltipTrigger

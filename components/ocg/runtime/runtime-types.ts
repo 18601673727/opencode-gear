@@ -42,7 +42,8 @@ export type ScenarioId =
   | "onboarding-discovery"
   | "onboarding-ready"
   | "profiles-models"
-  | "mission-control";
+  | "mission-control"
+  | "logs-live";
 
 export type RuntimeSnapshot = {
   scenario: ScenarioId;

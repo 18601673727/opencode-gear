@@ -317,10 +317,10 @@ export type LedgerSeriesDefinition = {
 
 /** Stable series order and colors for the traffic-over-time chart toggles. */
 export const LEDGER_SERIES: readonly LedgerSeriesDefinition[] = [
-  { key: "freshInput", label: USAGE_COMPONENT_LABEL.freshInput, color: "#2563eb" },
-  { key: "cacheRead", label: USAGE_COMPONENT_LABEL.cacheRead, color: "#0d9488" },
-  { key: "cacheWrite", label: USAGE_COMPONENT_LABEL.cacheWrite, color: "#7c3aed" },
-  { key: "output", label: USAGE_COMPONENT_LABEL.output, color: "#c2410c" },
-  { key: "reasoning", label: USAGE_COMPONENT_LABEL.reasoning, color: "#b45309" },
-  { key: "total", label: "Total", color: "#0f172a" },
+  { key: "freshInput", label: USAGE_COMPONENT_LABEL.freshInput, color: "var(--chart-2)" },
+  { key: "cacheRead", label: USAGE_COMPONENT_LABEL.cacheRead, color: "var(--chart-1)" },
+  { key: "cacheWrite", label: USAGE_COMPONENT_LABEL.cacheWrite, color: "var(--chart-3)" },
+  { key: "output", label: USAGE_COMPONENT_LABEL.output, color: "var(--chart-4)" },
+  { key: "reasoning", label: USAGE_COMPONENT_LABEL.reasoning, color: "var(--chart-5)" },
+  { key: "total", label: "Total", color: "var(--foreground)" },
 ];

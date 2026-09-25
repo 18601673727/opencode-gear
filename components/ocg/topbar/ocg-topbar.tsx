@@ -6,7 +6,9 @@ import {
   MoreHorizontal,
   PanelLeft,
   PanelRight,
+  ScrollText,
   SlidersHorizontal,
+  Settings,
   Table2,
   Workflow,
 } from "lucide-react";
@@ -26,6 +28,8 @@ type OcgTopbarProps = {
   /** Highlights the Control Center action while it is the active view. */
   controlCenterActive?: boolean;
   missionControlActive?: boolean;
+  logsActive?: boolean;
+  settingsActive?: boolean;
   onToggleSidebar: () => void;
   onToggleMission: () => void;
   onOpenMobileSidebar: () => void;
@@ -33,6 +37,8 @@ type OcgTopbarProps = {
   onOpenLedger?: () => void;
   onOpenControlCenter?: () => void;
   onOpenMissionControl?: () => void;
+  onOpenLogs?: () => void;
+  onOpenSettings?: () => void;
   runtimeStatus: RuntimeStatus;
 };
 
@@ -51,6 +57,8 @@ export function OcgTopbar({
   ledgerActive = false,
   controlCenterActive = false,
   missionControlActive = false,
+  logsActive = false,
+  settingsActive = false,
   onToggleSidebar,
   onToggleMission,
   onOpenMobileSidebar,
@@ -58,6 +66,8 @@ export function OcgTopbar({
   onOpenLedger,
   onOpenControlCenter,
   onOpenMissionControl,
+  onOpenLogs,
+  onOpenSettings,
   runtimeStatus,
 }: OcgTopbarProps) {
   return (
@@ -165,6 +175,32 @@ export function OcgTopbar({
           title={missionControlActive ? "Close Mission Control" : "Open Mission Control"}
         >
           <Workflow className="size-4" />
+        </Button>
+      )}
+
+      {onOpenLogs && (
+        <Button
+          variant={logsActive ? "secondary" : "ghost"}
+          size="icon-xs"
+          onClick={onOpenLogs}
+          aria-label={logsActive ? "Close Logs" : "Open Logs and diagnostics"}
+          aria-current={logsActive ? "page" : undefined}
+          title={logsActive ? "Close Logs" : "Open Logs and diagnostics"}
+        >
+          <ScrollText className="size-4" />
+        </Button>
+      )}
+
+      {onOpenSettings && (
+        <Button
+          variant={settingsActive ? "secondary" : "ghost"}
+          size="icon-xs"
+          onClick={onOpenSettings}
+          aria-label={settingsActive ? "Close Settings" : "Open Settings"}
+          aria-current={settingsActive ? "page" : undefined}
+          title={settingsActive ? "Close Settings" : "Open Settings"}
+        >
+          <Settings className="size-4" />
         </Button>
       )}
 
