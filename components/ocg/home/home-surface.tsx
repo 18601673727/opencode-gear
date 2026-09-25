@@ -29,6 +29,7 @@ import type { RuntimeSnapshot } from "../runtime/runtime-types";
 type HomeSurfaceProps = {
   snapshot: RuntimeSnapshot;
   onOpenChat: () => void;
+  onOpenAttention: () => void;
   onOpenMissionControl: () => void;
   onOpenControlCenter: () => void;
   onOpenLedger: () => void;
@@ -101,8 +102,8 @@ export function HomeSurface(props: HomeSurfaceProps) {
           </Button>
         </section>
 
-        {/* Attention */}
-        <AttentionSection items={attention} onNavigate={attentionHandlers} onOpenControlCenter={props.onOpenControlCenter} />
+        {/* Attention summary — View all navigates to the Attention Center. */}
+        <AttentionSection items={attention} onNavigate={attentionHandlers} onOpenAttention={props.onOpenAttention} />
 
         {/* Main grid */}
         <div className="grid gap-5 lg:grid-cols-[1fr_320px] xl:grid-cols-[1fr_380px]">
@@ -128,7 +129,7 @@ export function HomeSurface(props: HomeSurfaceProps) {
 // Attention section
 // ---------------------------------------------------------------------------
 
-function AttentionSection({ items, onNavigate, onOpenControlCenter }: { items: AttentionItem[]; onNavigate: Record<AttentionItem["destination"], () => void>; onOpenControlCenter: () => void }) {
+function AttentionSection({ items, onNavigate, onOpenAttention }: { items: AttentionItem[]; onNavigate: Record<AttentionItem["destination"], () => void>; onOpenAttention: () => void }) {
   if (items.length === 0) {
     return (
       <section aria-label="Attention">
@@ -145,7 +146,7 @@ function AttentionSection({ items, onNavigate, onOpenControlCenter }: { items: A
     <section aria-label="Attention items">
       <div className="mb-2 flex items-center justify-between">
         <h2 className="text-[13px] font-semibold tracking-wider uppercase text-muted-foreground">Attention</h2>
-        <Button variant="ghost" size="xs" onClick={onOpenControlCenter}>
+        <Button variant="ghost" size="xs" onClick={onOpenAttention}>
           View all <ArrowRight className="ml-1 size-3" />
         </Button>
       </div>

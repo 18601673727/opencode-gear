@@ -5,6 +5,7 @@ import {
   Code2,
   FlaskConical,
   Home,
+  Bell,
   LifeBuoy,
   MessageSquare,
   PenTool,
@@ -38,10 +39,11 @@ const GROUP_ICON: Record<WorkType, typeof Search> = {
   devops: Server,
 };
 
-export type WorkspaceTarget = "home" | "chat" | "ledger" | "control-center" | "mission-control" | "logs" | "settings";
+export type WorkspaceTarget = "home" | "attention" | "chat" | "ledger" | "control-center" | "mission-control" | "logs" | "settings";
 
 const WORKSPACE_NAV: { target: WorkspaceTarget; label: string; icon: typeof Search }[] = [
   { target: "home", label: "Home", icon: Home },
+  { target: "attention", label: "Attention", icon: Bell },
   { target: "chat", label: "Chat", icon: MessageSquare },
   { target: "control-center", label: "Control Center", icon: SlidersHorizontal },
   { target: "ledger", label: "Resource Ledger", icon: Table2 },
@@ -59,8 +61,11 @@ type OcgSidebarProps = {
   runtimeStatus: RuntimeStatus;
   /** Active top-level workspace, used to highlight the navigation group. */
   activeWorkspace?: WorkspaceTarget;
+  /** Unresolved attention count shown as a quiet badge next to Attention. */
+  attentionCount?: number;
   onOpenChat?: () => void;
   onOpenHome?: () => void;
+  onOpenAttention?: () => void;
   onOpenLedger?: () => void;
   onOpenControlCenter?: () => void;
   onOpenMissionControl?: () => void;
@@ -118,8 +123,10 @@ export function OcgSidebar({
   onNewChat,
   runtimeStatus,
   activeWorkspace = "chat",
+  attentionCount = 0,
   onOpenChat,
   onOpenHome,
+  onOpenAttention,
   onOpenLedger,
   onOpenControlCenter,
   onOpenMissionControl,
@@ -128,6 +135,7 @@ export function OcgSidebar({
 }: OcgSidebarProps) {
   const navHandlers: Record<WorkspaceTarget, (() => void) | undefined> = {
     home: onOpenHome,
+    attention: onOpenAttention,
     chat: onOpenChat,
     ledger: onOpenLedger,
     "control-center": onOpenControlCenter,
@@ -135,7 +143,7 @@ export function OcgSidebar({
     logs: onOpenLogs,
     settings: onOpenSettings,
   };
-  const hasNav = Boolean(onOpenChat || onOpenHome || onOpenLedger || onOpenControlCenter || onOpenMissionControl || onOpenLogs);
+  const hasNav = Boolean(onOpenChat || onOpenHome || onOpenAttention || onOpenLedger || onOpenControlCenter || onOpenMissionControl || onOpenLogs);
 
   if (collapsed) {
     return (
@@ -157,11 +165,21 @@ export function OcgSidebar({
                 return (
                   <RailButton
                     key={item.target}
-                    label={item.label}
+                    label={item.target === "attention" && attentionCount > 0 ? `${item.label} (${attentionCount} need action)` : item.label}
                     active={activeWorkspace === item.target}
                     onClick={handler}
                   >
-                    <Icon className="size-4" />
+                    <span className="relative">
+                      <Icon className="size-4" />
+                      {item.target === "attention" && attentionCount > 0 && (
+                        <span
+                          aria-hidden="true"
+                          className="absolute -top-1 -right-1.5 min-w-[14px] rounded-full bg-muted-foreground/80 px-0.5 text-center text-[9px] leading-[14px] font-semibold text-background"
+                        >
+                          {attentionCount > 9 ? "9+" : attentionCount}
+                        </span>
+                      )}
+                    </span>
                   </RailButton>
                 );
               })}
@@ -257,6 +275,14 @@ export function OcgSidebar({
                     >
                       <Icon className="size-3.5 shrink-0" aria-hidden="true" />
                       <span className="min-w-0 flex-1 truncate">{item.label}</span>
+                      {item.target === "attention" && attentionCount > 0 && (
+                        <span
+                          aria-label={`${attentionCount} items need action`}
+                          className="shrink-0 rounded-full bg-muted px-1.5 text-[10px] font-semibold tabular-nums text-muted-foreground"
+                        >
+                          {attentionCount > 99 ? "99+" : attentionCount}
+                        </span>
+                      )}
                     </button>
                   </li>
                 );

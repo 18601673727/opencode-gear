@@ -45,7 +45,9 @@ export type ScenarioId =
   | "mission-control"
   | "logs-live"
   | "home-overview"
-  | "home-calm";
+  | "home-calm"
+  | "attention-overview"
+  | "attention-calm";
 
 export type RuntimeSnapshot = {
   scenario: ScenarioId;

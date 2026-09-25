@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  Bell,
   ChevronsLeft,
   ChevronsRight,
   Home,
@@ -32,12 +33,14 @@ type OcgTopbarProps = {
   logsActive?: boolean;
   settingsActive?: boolean;
   homeActive?: boolean;
+  attentionActive?: boolean;
   onToggleSidebar: () => void;
   onToggleMission: () => void;
   onOpenMobileSidebar: () => void;
   onOpenMobileMission: () => void;
   onOpenChat?: () => void;
   onOpenHome?: () => void;
+  onOpenAttention?: () => void;
   onOpenLedger?: () => void;
   onOpenControlCenter?: () => void;
   onOpenMissionControl?: () => void;
@@ -64,12 +67,14 @@ export function OcgTopbar({
   logsActive = false,
   settingsActive = false,
   homeActive = false,
+  attentionActive = false,
   onToggleSidebar,
   onToggleMission,
   onOpenMobileSidebar,
   onOpenMobileMission,
   onOpenChat,
   onOpenHome,
+  onOpenAttention,
   onOpenLedger,
   onOpenControlCenter,
   onOpenMissionControl,
@@ -147,6 +152,19 @@ export function OcgTopbar({
           title="Open Home"
         >
           <Home className="size-4" />
+        </Button>
+      )}
+
+      {onOpenAttention && (
+        <Button
+          variant={attentionActive ? "secondary" : "ghost"}
+          size="icon-xs"
+          onClick={onOpenAttention}
+          aria-label={attentionActive ? "Close Attention" : "Open Attention"}
+          aria-current={attentionActive ? "page" : undefined}
+          title="Open Attention"
+        >
+          <Bell className="size-4" />
         </Button>
       )}
 

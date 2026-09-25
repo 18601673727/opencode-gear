@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { ChatView } from "../chat/chat-view";
@@ -17,8 +17,12 @@ import { OcgRuntimeProvider, useOcgRuntime } from "../runtime/runtime-context";
 import type { ScenarioId } from "../runtime/runtime-types";
 import type { InspectorMode } from "../observability/inspector-state";
 import { HomeSurface } from "../home/home-surface";
+import { AttentionSurface } from "../attention/attention-surface";
+import { createAttentionQueue } from "../attention/fixtures";
+import { isUnresolved } from "../attention/domain";
+import { selectAttentionItems } from "../attention/selectors";
 
-export type WorkspaceView = "chat" | "home" | "ledger" | "control-center" | "mission-control" | "logs" | "settings";
+export type WorkspaceView = "chat" | "home" | "attention" | "ledger" | "control-center" | "mission-control" | "logs" | "settings";
 
 export function AppShell({
   scenario,
@@ -71,6 +75,14 @@ export function RuntimeWorkspace({
   const isLogs = view === "logs";
   const isSettings = view === "settings";
   const isHome = view === "home";
+  const isAttention = view === "attention";
+
+  // Quiet unresolved-attention badge for product navigation. Derived from
+  // the same normalized selectors as the Attention surface itself.
+  const attentionCount = useMemo(
+    () => selectAttentionItems(snapshot, createAttentionQueue(snapshot.scenario)).filter(isUnresolved).length,
+    [snapshot],
+  );
 
   const handleNewChat = useCallback(async () => {
     if (!activeWorkType) return;
@@ -100,6 +112,12 @@ export function RuntimeWorkspace({
     setMobileNavOpen(false);
     setMobileMissionOpen(false);
     if (view !== "home") router.push("/?scenario=home-overview");
+  }, [router, view]);
+
+  const handleOpenAttention = useCallback(() => {
+    setMobileNavOpen(false);
+    setMobileMissionOpen(false);
+    if (view !== "attention") router.push("/?scenario=attention-overview");
   }, [router, view]);
 
   const handleOpenLedger = useCallback(() => {
@@ -153,8 +171,10 @@ export function RuntimeWorkspace({
       onNewChat={handleNewChat}
       runtimeStatus={snapshot.status}
       activeWorkspace={view}
+      attentionCount={attentionCount}
       onOpenChat={handleOpenChat}
       onOpenHome={handleOpenHome}
+      onOpenAttention={handleOpenAttention}
       onOpenLedger={handleOpenLedger}
       onOpenControlCenter={handleOpenControlCenter}
       onOpenMissionControl={handleOpenMissionControl}
@@ -202,8 +222,10 @@ export function RuntimeWorkspace({
             onNewChat={handleNewChat}
             runtimeStatus={snapshot.status}
             activeWorkspace={view}
+            attentionCount={attentionCount}
             onOpenChat={handleOpenChat}
             onOpenHome={handleOpenHome}
+            onOpenAttention={handleOpenAttention}
             onOpenLedger={handleOpenLedger}
             onOpenControlCenter={handleOpenControlCenter}
             onOpenMissionControl={handleOpenMissionControl}
@@ -218,19 +240,21 @@ export function RuntimeWorkspace({
           session={activeSession}
           sidebarCollapsed={sidebarCollapsed}
           missionOpen={missionOpen}
-          missionControls={!isLedger && !isControlCenter && !isMissionControl && !isLogs && !isSettings && !isHome}
+          missionControls={!isLedger && !isControlCenter && !isMissionControl && !isLogs && !isSettings && !isHome && !isAttention}
           ledgerActive={isLedger}
           controlCenterActive={isControlCenter}
           missionControlActive={isMissionControl}
           logsActive={isLogs}
           settingsActive={isSettings}
           homeActive={isHome}
+          attentionActive={isAttention}
           onToggleSidebar={() => setSidebarCollapsed((value) => !value)}
           onToggleMission={() => setMissionMode((value) => value === "collapsed" ? "docked" : "collapsed")}
           onOpenMobileSidebar={() => setMobileNavOpen(true)}
           onOpenMobileMission={() => setMobileMissionOpen(true)}
           onOpenChat={handleOpenChat}
           onOpenHome={handleOpenHome}
+          onOpenAttention={handleOpenAttention}
           onOpenLedger={handleOpenLedger}
           onOpenControlCenter={handleOpenControlCenter}
           onOpenMissionControl={handleOpenMissionControl}
@@ -276,6 +300,19 @@ export function RuntimeWorkspace({
             <HomeSurface
               snapshot={snapshot}
               onOpenChat={handleOpenChat}
+              onOpenAttention={handleOpenAttention}
+              onOpenMissionControl={handleOpenMissionControl}
+              onOpenControlCenter={handleOpenControlCenter}
+              onOpenLedger={handleOpenLedger}
+              onOpenLogs={handleOpenLogs}
+              onOpenSettings={handleOpenSettings}
+            />
+          </main>
+        ) : isAttention ? (
+          <main aria-label="Attention and approvals" className="flex min-h-0 flex-1 overflow-hidden">
+            <AttentionSurface
+              snapshot={snapshot}
+              onOpenChat={handleOpenChat}
               onOpenMissionControl={handleOpenMissionControl}
               onOpenControlCenter={handleOpenControlCenter}
               onOpenLedger={handleOpenLedger}
@@ -311,7 +348,7 @@ export function RuntimeWorkspace({
         )}
       </div>
 
-      {!isLedger && !isControlCenter && !isMissionControl && !isLogs && !isSettings && !isHome && (
+      {!isLedger && !isControlCenter && !isMissionControl && !isLogs && !isSettings && !isHome && !isAttention && (
         <div
           className={cn("fixed inset-0 z-50 lg:hidden", !mobileMissionOpen && "pointer-events-none")}
           aria-hidden={!mobileMissionOpen}

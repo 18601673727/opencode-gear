@@ -56,6 +56,8 @@ export const SCENARIO_IDS: readonly ScenarioId[] = [
   "logs-live",
   "home-overview",
   "home-calm",
+  "attention-overview",
+  "attention-calm",
 ];
 
 export function resolveScenario(value: string | undefined | null): ScenarioId {
@@ -601,6 +603,61 @@ export function createScenarioFixture(id: ScenarioId): ScenarioFixture {
       fixture.missionsBySession = {};
       fixture.executionBySession = {};
       fixture.resourceLedger = createResourceLedgerFixture("home-calm");
+      break;
+    }
+    case "attention-overview": {
+      // Representative actionable mix: spend + retry + launch approvals,
+      // a runtime failure needing inspection, provider degradation from the
+      // shared bootstrap, real execution-blocked work, and resolved history.
+      // Reuses the home-overview mission/execution shape so cross-links stay
+      // consistent with Mission Control.
+      fixture.bootstrap = createBootstrapFixture("profiles-models");
+      fixture.missionsBySession[baseSession.id] = mission("running", {
+        title: "Consolidate OCG frontend architecture",
+        goal: "Dogfood the frontend execution inspector while preserving existing OCG surfaces.",
+        completed: 8,
+        total: 13,
+        current: "Wave 4/6",
+        tasks: [
+          { id: "t1", title: "Recon", status: "completed" },
+          { id: "t2", title: "Inventory", status: "completed" },
+          { id: "t3", title: "Foundation", status: "completed" },
+          { id: "t4", title: "Design system", status: "completed" },
+          { id: "t5", title: "Runtime boundary", status: "completed" },
+          { id: "t6", title: "Mission inspector", status: "completed" },
+          { id: "t7", title: "Onboarding", status: "completed" },
+          { id: "t8", title: "Resource ledger", status: "failed" },
+          { id: "t9", title: "Responsive", status: "active" },
+          { id: "t10", title: "Integration gate", status: "active" },
+          { id: "t11", title: "Verification follow-up", status: "pending" },
+          { id: "t12", title: "Conflict debug", status: "failed" },
+          { id: "t13", title: "Release gate", status: "pending" },
+        ],
+        workers: [
+          { id: "lead", name: "Lead", status: "active", task: "Coordinate" },
+          { id: "build", name: "Build", status: "active", task: "Resource ledger" },
+          { id: "verify", name: "Verify", status: "active", task: "Integration" },
+          { id: "debug", name: "Debug", status: "waiting", task: "Conflict" },
+        ],
+        elapsed: "55m",
+        commitment: { workers: 6, mode: "capped" },
+        budget: { spent: 4.2, limit: 25, currency: "USD", status: "within-limit" },
+      });
+      fixture.executionBySession[baseSession.id] = createMissionControlExecution();
+      fixture.resourceLedger = createResourceLedgerFixture("attention-overview");
+      break;
+    }
+    case "attention-calm": {
+      // Healthy workspace: local-ready bootstrap with the optional
+      // auth-required connection resolved, no missions, no ledger,
+      // history-only fixture queue. Empty state must look intentional.
+      fixture.bootstrap = createBootstrapFixture("local-ready");
+      fixture.bootstrap.connections = fixture.bootstrap.connections.filter(
+        (connection) => connection.state !== "auth-required",
+      );
+      fixture.missionsBySession = {};
+      fixture.executionBySession = {};
+      fixture.resourceLedger = null;
       break;
     }
   }
