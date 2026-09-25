@@ -405,10 +405,11 @@ inspection surface (`--observe` records one local runtime observation);
 `ocg doctor --effective` prints a counts/health summary, never a record dump.
 
 Resource Broker, ranking, placement, automatic failover or rotation, quota
-routing, price optimisation, hard budget enforcement, a scheduler/queue,
-distributed leases and a second runtime remain explicitly deferred. (The
-admission-only [Policy engine](#policy-admission-engine) is no longer deferred;
-it does not do any of the above.)
+routing, price optimisation, a scheduler/queue, distributed leases and a second
+runtime remain explicitly deferred. (The admission-only
+[Policy engine](#policy-admission-engine) and the mandatory
+[Mission budget](#mission-budget-and-quota-admission) are no longer deferred;
+neither does any of the above.)
 
 ## Policy admission engine
 
@@ -424,8 +425,11 @@ is the action allowed to proceed?
 It answers *whether the Reconciler's proposed action is admissible for the
 resource the Mission is already associated with*. It never answers *which
 resource is best*: it does not enumerate, rank, score, rotate, fail over or
-select, and it does not enforce a hard budget. That remains future Placement /
-Resource Broker work. The four layers stay mechanically distinct:
+select. It is the *configurable* admission layer; the mandatory economic
+boundary lives in the separate
+[Mission budget](#mission-budget-and-quota-admission) layer, which is evaluated
+unconditionally and is not gated by `policy.enabled`. The layers stay
+mechanically distinct:
 
 ```text
 Mission      durable semantic truth
@@ -448,15 +452,18 @@ Deny             never proceed for this action/context
 ```
 
 Rules are evaluated in a fixed order and aggregated by an explicit precedence —
-`Deny > RequireApproval > Defer > Allow` — so the result is independent of rule
-ordering. The winning rule is always recorded, so *why was this allowed or
-blocked?* is answerable. Every non-trivial assessment carries the decision, a
-stable `reason_code`, a bounded secret-free human reason, `evaluated_at`, the
-rule identifier, the Mission identity/generation, the proposed action, the
-relevant fact probes and the approval view. None of these fields ever contains a
-credential. There is no boolean-only API and no "engine error ⇒ Allow" path:
-evaluation over a fully typed context is pure and total, and uncertainty fails
-closed.
+`Deny > RequireApproval > Defer > Allow` — so the decision is the same no matter
+which order the rules are evaluated in. The winning rule is always recorded, and
+because two independent rules can block the same action at once, the receipt
+also retains the complete set of co-firing blocking rules (bounded and
+deterministically ordered) rather than hiding all but the winner. So *why was
+this allowed or blocked?* is answerable without losing a co-firing fact. Every
+non-trivial assessment carries the decision, a stable `reason_code`, a bounded
+secret-free human reason, `evaluated_at`, the rule identifier, the Mission
+identity/generation, the proposed action, the relevant fact probes and the
+approval view. None of these fields ever contains a credential. There is no
+boolean-only API and no "engine error ⇒ Allow" path: evaluation over a fully
+typed context is pure and total, and uncertainty fails closed.
 
 ### Rules
 
@@ -520,8 +527,10 @@ successful workflow; approval is only demanded for actions explicitly listed in
 `requireApprovalFor`. The winning decision is persisted as a compact, redacted
 Policy receipt alongside the existing reconcile receipt; `Deny`, `Defer` and
 `RequireApproval` perform no runtime side effect and keep durable state intact
-for a later tick. Hard-dollar budgets, resource ranking/selection, a rules DSL
-and executable user policy remain explicitly deferred.
+for a later tick. Resource ranking/selection, a rules DSL and executable user
+policy remain explicitly deferred. Money is *not* handled here: the hard
+economic cutoff is unconditional and lives in the
+[Mission budget](#mission-budget-and-quota-admission) layer.
 
 ## Single-node reconciliation
 
@@ -581,10 +590,11 @@ and deferred/blocked rather than treated as execution absence. No credentials,
 service URLs, or raw runtime diagnostics are persisted in receipts.
 
 The Reconciler consults the admission-only
-[Policy engine](#policy-admission-engine); Policy decides admissibility, it does
-not choose a resource. Resource Broker, placement/ranking, automatic failover,
-quota routing, hard budgets, a scheduler, a distributed controller, a second
-runtime and a generic queue remain deferred.
+[Policy engine](#policy-admission-engine) for configurable admissibility, and
+the mandatory [Mission budget](#mission-budget-and-quota-admission) layer for
+the hard economic cutoff; neither chooses a resource. Resource Broker,
+placement/ranking, automatic failover, quota routing, a scheduler, a distributed
+controller, a second runtime and a generic queue remain deferred.
 
 Orchestration is the layer that carries a task across roles. It is deliberately
 split so policy cannot drift into the wrong language:
@@ -794,6 +804,153 @@ State lives under `.opencode-gear/orchestration/` (sessions in `state.json`,
 Missions in `missions/`, bounded generic recovery artifacts in `reconcile/`) and
 the adapter under
 `.opencode-gear/orchestration/plugin/`; all of it is ignored local state.
+
+## Mission budget and quota admission
+
+The Mandatory Safety layer answers exactly one question before any
+provider-costly side effect:
+
+```text
+given this Mission's durable budget,
+      this proposed bounded spend,
+      the current quota facts,
+may OCG intentionally start this provider-costly work?
+```
+
+It is the economic cutoff, not an alert. The flow is:
+
+```text
+execution path (Reconciler / controller / bridge)
+        ↓
+mandatory economic admission        (always evaluated)
+        ↓
+reserve bounded spend / check quota (durable, before the side effect)
+        ↓
+provider-costly side effect
+        ↓
+settle actual usage                 (exactly once)
+        ↓
+durable Mission accounting          (survives restart/rollover/retry/recovery)
+```
+
+### Mandatory safety versus configurable policy
+
+The existing [Policy engine](#policy-admission-engine) is the *configurable*
+boundary: `policy.enabled = false` disables its whole rule pipeline. The
+economic layer is deliberately **not** a Policy rule. It is evaluated
+unconditionally for every provider-costly action, so **a hard budget cannot be
+bypassed with `policy.enabled = false`**, and an ordinary approval can never
+authorize exceeding a hard monetary cap — an approval is reusable authorization,
+not a lever on money. The only supported way past a cap is to explicitly change
+the hard budget itself (`ocg budget set`). The two layers co-exist: the generic
+Policy still wraps the control plane around the mandatory economic gate.
+
+### Money and the durable Mission budget
+
+Money is a fixed-point integer of micro-units in exactly one currency
+(`Money { micros: i64, currency }`); binary floats are never used for money and
+no currency is ever converted. Each Mission carries a durable
+`MissionBudget`:
+
+- `currency`, the accounting currency;
+- `hard_limit` plus `origin` (`legacy_unconfigured`, `system_default`,
+  `explicit_user_limit`);
+- `settled` (the authoritative accumulated actual spend), `reserved` and
+  `unresolved` (derived from the reservation ledger);
+- `status` (`unconfigured`, `active`, `exhausted`, `breached`);
+- the bounded reservation ledger and the last economic reason code.
+
+A configured `budget.hardLimitMicros` is materialized into a Mission exactly
+once, as `system_default`. A later configuration edit never silently changes an
+existing durable limit; only an explicit operator set changes it, and that is
+recorded as `explicit_user_limit`. Unconfigured deployments are unchanged: no
+limit means no cutoff, not a default cap, and OCG never invents a price.
+
+### Reservation state machine and idempotency
+
+Admission is pure and total. Every applicable block is evaluated and **all
+co-firing blocks are retained** (bounded, in deterministic precedence order), so
+a hard cap and an exhausted quota are both visible instead of one hiding the
+other; `Deny > Defer > Allow` selects the primary reason. Only `Allow` reaches
+the side effect.
+
+An allowed provider-costly action records a durable reservation *before* the
+call. The reservation id is deterministic over
+`(mission_id, generation, action, operation_id)`, so a crash, restart, retry,
+rollover or recovery pass that replays the same operation finds the existing
+reservation instead of reserving again. Re-admitting a live or already-settled
+reservation is idempotent: it neither double-counts against the hard limit nor
+re-checks a quota that already authorized it. The outcomes are explicit:
+
+```text
+reserved   authorized; counts against the hard cap
+settled    settled exactly once; released into `settled`
+released   proven not to have reached the provider; no longer counts
+```
+
+A settlement is recorded once; a duplicate settlement is a no-op. An actual
+amount larger than the reservation is recorded in full as a breach — it is
+never clamped — and all further paid work is denied. An **uncertain dispatch
+keeps its reservation** (marked unresolved) rather than optimistically releasing
+it; only a proven-not-dispatched result releases it. A refusal that happens
+before any dispatch performs no runtime call and leaves durable state intact for
+a later tick.
+
+### Quota
+
+When `budget.requireQuota` is set, a fresh authoritative quota fact must
+authorize the action. The gate is purely factual: known and sufficient allows;
+exhausted, unknown or stale defers, with the expected reset time attached when
+known. `ResourceHealth::Available` from the registry is reachability and
+observability evidence, **not** quota or capacity, and it never satisfies the
+quota gate. There is no resource substitution: a missing or unusable quota fact
+defers rather than silently failing over to another resource. The facts are
+read fail-soft from the descriptive Resource Registry; a missing record is
+`unknown`, never unlimited.
+
+### Configuration
+
+The top-level `budget` key configures the boundary:
+
+```yaml
+budget:
+  currency: USD                    # required when a limit or estimate is set
+  hardLimitMicros: 5000000         # default hard Mission budget, micro-units
+  estimatedOperationCostMicros: 100000  # bounded pre-authorization estimate
+  requireQuota: false              # require a fresh quota fact
+```
+
+There is deliberately no `budget.enabled` flag: a configured hard limit is
+always enforced, and the absence of a limit is the absence of a cap. A limit or
+an estimate without a currency, an unknown currency, or a non-positive amount is
+a configuration error. Without `estimatedOperationCostMicros`, a hard-budgeted
+provider-costly action defers with `mission_cost_unknown` rather than assuming
+the call is free.
+
+### Provider-costly audit and the interactive gap
+
+The gate is applied to each *current* OCG-initiated operation whose provider
+cost is known. Today exactly one such operation is `DefinitelyProviderCostly`:
+resuming a bounded continuation, which the V2 adapter performs by injecting a
+synthetic provider message (`resume: true`). Creating, preparing and staging an
+execution, and context/health observation, are local or transport-only and do
+not by themselves establish provider work.
+
+Interactive root and worker model turns are dispatched by OpenCode itself, not
+by an OCG process, and OCG has no proven pre-provider abort at that seam. That
+path is therefore reported explicitly as not gated rather than claimed to be
+covered; the enforceable boundary is the OCG-owned execution path plus the
+engine-level configuration OCG exports.
+
+### Inspection
+
+`ocg budget [--json]` shows each Mission's durable budget (currency, hard limit
+and origin, settled/reserved/unresolved micro-units, status and last reason);
+`ocg budget set --mission <id> --limit <micros> --currency <code>` is the only
+supported way to raise or replace a hard cap. Both are read-only or explicitly
+scoped, bounded and redacted. The reconcile and Policy receipts embed a compact
+budget projection and the economic reason, and the Policy receipt retains all
+co-firing blocking rules.
 
 ## Verification, distillation and checkpoints
 

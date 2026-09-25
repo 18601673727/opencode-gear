@@ -39,6 +39,10 @@
 //! foundation.
 
 use crate::error::{GearError, Result};
+use crate::orchestration::budget::{
+    self, BudgetConfig, CostBasis, MissionBudget, MissionBudgetReceipt, Money, QuotaFacts,
+    SpendAction, SpendAssessment, SpendDecision,
+};
 use crate::orchestration::handoff::{HandoffFinding, HandoffVerification, Role, Transition};
 use crate::orchestration::state::{Attempts, OrchestrationPhase, SessionState};
 use crate::runtime::lifecycle::RuntimeExecutionId;
@@ -378,6 +382,9 @@ pub struct MissionReconcileReceipt {
     /// The bounded Policy projection for this pass, when Policy was evaluated.
     /// It is additive to schema version 1; old records deserialize as `None`.
     pub policy: Option<MissionPolicyReceipt>,
+    /// The bounded mandatory economic projection for this pass, when the
+    /// economic admission boundary was evaluated. Additive to schema 1.
+    pub budget: Option<MissionBudgetReceipt>,
 }
 
 /// The durable, bounded projection of one Policy assessment. It is a plain
@@ -399,6 +406,9 @@ pub struct MissionPolicyReceipt {
     pub approval_id: Option<String>,
     /// Bounded `kind=status` fact summaries the winning rule used.
     pub required_facts: Vec<String>,
+    /// Bounded `rule=decision` summaries for every non-allow co-firing rule, so
+    /// a hard cap and an exhausted quota are never silently reduced to one.
+    pub blocking: Vec<String>,
 }
 
 /// Durable reconcile intent and its current local phase. The bounded
@@ -510,6 +520,11 @@ pub struct Mission {
     /// ignored for terminal Missions.
     #[serde(default)]
     pub reconcile: MissionReconcileState,
+    /// Additive mandatory economic accounting. It is not phase semantics; the
+    /// hard budget and its reservations survive restart, rollover, retries and
+    /// recovery.
+    #[serde(default)]
+    pub budget: MissionBudget,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -546,6 +561,7 @@ impl Default for Mission {
             event_index: Vec::new(),
             rollover: MissionRolloverState::default(),
             reconcile: MissionReconcileState::default(),
+            budget: MissionBudget::default(),
             created_at: 0,
             updated_at: 0,
         }
@@ -787,6 +803,18 @@ impl Mission {
                 .take(16)
                 .map(|fact| bounded_reconcile_text(fact, 64))
                 .collect();
+            policy.blocking = policy
+                .blocking
+                .iter()
+                .take(8)
+                .map(|block| bounded_reconcile_text(block, 64))
+                .collect();
+        }
+        if let Some(budget) = receipt.budget.as_mut() {
+            budget.status = bounded_reconcile_text(&budget.status, 32);
+            budget.origin = bounded_reconcile_text(&budget.origin, 32);
+            budget.currency = bounded_reconcile_text(&budget.currency, 16);
+            budget.reason = budget.reason.as_deref().map(redact_reconcile_reason);
         }
         let changed = self.reconcile.last_receipt.as_ref().is_none_or(|previous| {
             previous.generation != receipt.generation
@@ -796,6 +824,7 @@ impl Mission {
                 || previous.reason != receipt.reason
                 || previous.result != receipt.result
                 || previous.policy != receipt.policy
+                || previous.budget != receipt.budget
         });
         if changed {
             self.reconcile.last_receipt = Some(receipt.clone());
@@ -803,6 +832,140 @@ impl Mission {
             self.updated_at = receipt.timestamp;
         }
         changed
+    }
+
+    /// Evaluate and durably reserve the bounded spend for one provider-costly
+    /// action. This is the mandatory economic admission boundary: it runs
+    /// independently of `policy.enabled` and can never be satisfied by a
+    /// generic approval. An `Allow` with a hard limit records a reservation
+    /// exactly once; a `Defer` or `Deny` mutates nothing.
+    pub fn admit_spend(
+        &mut self,
+        config: &BudgetConfig,
+        action: SpendAction,
+        operation_id: &str,
+        estimate: CostBasis,
+        quota: QuotaFacts,
+        now: i64,
+    ) -> SpendAssessment {
+        let configured_limit = config.hard_limit_micros.is_some();
+        let materialized = self.budget.materialize_config(config);
+        // A hard budget is configured but is not in force for this Mission
+        // (for example the Mission already accounts in a different currency and
+        // OCG never performs FX conversion). Absence of an enforceable limit
+        // must never become an uncapped admission: fail closed.
+        if configured_limit && self.budget.hard_limit.is_none() {
+            let conflict = !self.budget.currency.is_empty()
+                && config
+                    .currency
+                    .as_deref()
+                    .is_some_and(|currency| currency != self.budget.currency);
+            if conflict {
+                let assessment = budget::SpendAssessment::configured_but_unenforceable(
+                    &self.budget,
+                    budget::REASON_CURRENCY,
+                    "a hard Mission budget is configured in another currency and cannot be applied without FX conversion",
+                );
+                let reason_changed =
+                    self.budget.reason.as_deref() != Some(assessment.reason_code.as_str());
+                self.budget.reason = Some(assessment.reason_code.clone());
+                if reason_changed {
+                    self.revision = self.revision.saturating_add(1);
+                    self.updated_at = now;
+                }
+                return assessment;
+            }
+        }
+        // A live or settled reservation for exactly this operation means the
+        // bounded spend is already authorized and accounted. Re-admission is
+        // idempotent: it never double-counts and never re-reserves.
+        let existing = self
+            .budget
+            .reservation_for(action, &self.mission_id, self.generation, operation_id)
+            .filter(|reservation| reservation.state != budget::ReservationState::Released)
+            .map(|reservation| reservation.reservation_id.clone());
+        let already_reserved = existing.is_some();
+        let request = budget::SpendRequest {
+            action,
+            operation_id,
+            estimate,
+            quota,
+            already_reserved,
+        };
+        let mut assessment = budget::admit(&self.budget, config.require_quota, &request);
+        let mut mutated = materialized;
+        if let Some(id) = existing {
+            assessment.reservation_id = Some(id);
+        }
+        if assessment.decision == SpendDecision::Allow {
+            if let Some(amount) = assessment.amount.clone() {
+                let id =
+                    budget::reservation_id(action, &self.mission_id, self.generation, operation_id);
+                mutated |= self.budget.reserve(
+                    action,
+                    &self.mission_id,
+                    self.generation,
+                    operation_id,
+                    amount,
+                    now,
+                );
+                assessment.reservation_id = Some(id);
+            }
+        }
+        let reason_changed = self.budget.reason.as_deref() != Some(assessment.reason_code.as_str());
+        self.budget.reason = Some(assessment.reason_code.clone());
+        if mutated || reason_changed {
+            self.revision = self.revision.saturating_add(1);
+            self.updated_at = now;
+        }
+        assessment
+    }
+
+    /// Settle a bounded spend exactly once against real or estimated actual
+    /// usage. Actual overage is recorded, never clamped.
+    pub fn settle_spend(
+        &mut self,
+        reservation_id: &str,
+        actual: Option<Money>,
+        now: i64,
+    ) -> Result<bool> {
+        let changed = self.budget.settle(reservation_id, actual, now)?;
+        if changed {
+            self.revision = self.revision.saturating_add(1);
+            self.updated_at = now;
+        }
+        Ok(changed)
+    }
+
+    /// Release a reservation that is proven not to have reached the provider.
+    pub fn release_spend(&mut self, reservation_id: &str, now: i64) -> bool {
+        let changed = self.budget.release(reservation_id, now);
+        if changed {
+            self.revision = self.revision.saturating_add(1);
+            self.updated_at = now;
+        }
+        changed
+    }
+
+    /// Retain a reservation whose dispatch outcome is uncertain.
+    pub fn mark_spend_unresolved(&mut self, reservation_id: &str, now: i64) -> bool {
+        let changed = self.budget.mark_unresolved(reservation_id, now);
+        if changed {
+            self.revision = self.revision.saturating_add(1);
+            self.updated_at = now;
+        }
+        changed
+    }
+
+    /// Explicitly change the hard Mission budget. This is the only supported
+    /// way past a hard cap; an ordinary approval can never do it.
+    pub fn set_hard_budget(&mut self, amount: Money, now: i64) -> Result<bool> {
+        let changed = self.budget.set_hard_limit(amount, now)?;
+        if changed {
+            self.revision = self.revision.saturating_add(1);
+            self.updated_at = now;
+        }
+        Ok(changed)
     }
 
     /// Supersede a recoverable rollover when a new explicit user session
@@ -1639,6 +1802,31 @@ fn validate_mission(mission: &Mission) -> Result<()> {
     {
         return Err(GearError::config(
             "mission reconcile state has no operation identity",
+        ));
+    }
+    if let Some(limit) = mission.budget.hard_limit.as_ref() {
+        if limit.micros <= 0 {
+            return Err(GearError::config(
+                "mission hard budget must be a positive amount",
+            ));
+        }
+        if mission.budget.currency.is_empty() || limit.currency != mission.budget.currency {
+            return Err(GearError::config(
+                "mission budget currency is inconsistent with its hard limit",
+            ));
+        }
+    }
+    if mission.budget.settled.micros > 0
+        && !mission.budget.currency.is_empty()
+        && mission.budget.settled.currency != mission.budget.currency
+    {
+        return Err(GearError::config(
+            "mission settled spend currency is inconsistent with the budget currency",
+        ));
+    }
+    if mission.budget.reservations.len() > budget::MAX_RESERVATIONS {
+        return Err(GearError::config(
+            "mission budget retains too many reservations",
         ));
     }
     Ok(())

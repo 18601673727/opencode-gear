@@ -31,6 +31,9 @@ use crate::context::engine::{ContextEngine, PlanOutcome};
 use crate::context::freshness::{Provenance, ENGINE_VERSION, SCHEMA_VERSION};
 use crate::context::gitdiff::{snapshot_fingerprint, GitSnapshot};
 use crate::error::{GearError, Result};
+use crate::orchestration::budget::{
+    self, BudgetConfig, MissionBudgetReceipt, Money, QuotaFacts, SpendAction, SpendAssessment,
+};
 use crate::orchestration::checkpoint::{self, Checkpoint, Phase};
 use crate::orchestration::config::OrchestrationConfig;
 use crate::orchestration::context_governor::{
@@ -248,6 +251,9 @@ pub struct Controller<'a> {
     capabilities: CapabilityConfig,
     verification: VerificationConfig,
     policy: PolicyConfig,
+    /// The mandatory economic configuration. It is not gated by
+    /// `policy.enabled`: a configured hard Mission budget is always enforced.
+    budget: BudgetConfig,
     git: &'a dyn GitHost,
     clock: &'a dyn Clock,
 }
@@ -269,6 +275,7 @@ impl<'a> Controller<'a> {
             capabilities,
             verification,
             policy: PolicyConfig::default(),
+            budget: BudgetConfig::default(),
             git,
             clock,
         }
@@ -281,8 +288,131 @@ impl<'a> Controller<'a> {
         self
     }
 
+    /// Attach the mandatory economic configuration. There is no `enabled`
+    /// switch: an unconfigured budget simply has no cap, and a configured one
+    /// is always enforced independently of Policy.
+    pub fn with_budget(mut self, budget: BudgetConfig) -> Self {
+        self.budget = budget;
+        self
+    }
+
     pub fn policy(&self) -> &PolicyConfig {
         &self.policy
+    }
+
+    pub fn budget(&self) -> &BudgetConfig {
+        &self.budget
+    }
+
+    /// Mandatory economic admission for one provider-costly action.
+    ///
+    /// This is the economic safety boundary and is deliberately *not* part of
+    /// the optional Policy pipeline: it is evaluated independently of
+    /// `policy.enabled`, and a generic approval can never satisfy it. The only
+    /// way past a hard cap is to change the hard budget itself.
+    ///
+    /// It loads the Mission fresh, materializes the configured hard budget
+    /// exactly once, evaluates the bounded spend, and durably records a
+    /// reservation before returning an `Allow`. If a concurrent writer would
+    /// leave an `Allow` unpersisted, the admission fails closed.
+    pub fn admit_mandatory_spend(
+        &self,
+        mission_id: &str,
+        action: SpendAction,
+        operation_id: &str,
+        quota: QuotaFacts,
+        now: i64,
+    ) -> Result<(SpendAssessment, MissionBudgetReceipt)> {
+        let Some(mut mission) = mission::load(&self.root, mission_id)? else {
+            return Err(GearError::config(
+                "Mission disappeared during mandatory economic admission",
+            ));
+        };
+        let expected_revision = mission.revision;
+        let expected_owner = mission.session_id.clone();
+        let assessment = mission.admit_spend(
+            &self.budget,
+            action,
+            operation_id,
+            self.budget.estimated_cost(),
+            quota,
+            now,
+        );
+        if mission.revision != expected_revision
+            && !mission::save_if_revision(
+                &self.root,
+                &mission,
+                expected_revision,
+                expected_owner.as_deref(),
+            )?
+            && assessment.is_allowed()
+        {
+            // A concurrent local writer won the race. An unpersisted reservation
+            // must never authorize a provider-costly side effect.
+            return Err(GearError::config(
+                "Mission changed during economic admission; the bounded spend was not durably reserved",
+            ));
+        }
+        let receipt = mission.budget.receipt();
+        Ok((assessment, receipt))
+    }
+
+    /// Settle a mandatory reservation exactly once against the bounded actual
+    /// (or the reservation amount when no actual usage is known).
+    pub fn settle_mandatory_spend(
+        &self,
+        mission_id: &str,
+        reservation_id: &str,
+        actual: Option<Money>,
+        now: i64,
+    ) -> Result<bool> {
+        let Some(mut mission) = mission::load(&self.root, mission_id)? else {
+            return Ok(false);
+        };
+        let expected_revision = mission.revision;
+        let expected_owner = mission.session_id.clone();
+        let changed = mission.settle_spend(reservation_id, actual, now)?;
+        if changed
+            && !mission::save_if_revision(
+                &self.root,
+                &mission,
+                expected_revision,
+                expected_owner.as_deref(),
+            )?
+        {
+            return Err(GearError::config(
+                "Mission changed while settling a mandatory reservation",
+            ));
+        }
+        Ok(changed)
+    }
+
+    /// Retain a reservation whose dispatch outcome is uncertain.
+    pub fn mark_mandatory_spend_unresolved(
+        &self,
+        mission_id: &str,
+        reservation_id: &str,
+        now: i64,
+    ) -> Result<bool> {
+        let Some(mut mission) = mission::load(&self.root, mission_id)? else {
+            return Ok(false);
+        };
+        let expected_revision = mission.revision;
+        let expected_owner = mission.session_id.clone();
+        let changed = mission.mark_spend_unresolved(reservation_id, now);
+        if changed
+            && !mission::save_if_revision(
+                &self.root,
+                &mission,
+                expected_revision,
+                expected_owner.as_deref(),
+            )?
+        {
+            return Err(GearError::config(
+                "Mission changed while retaining an unresolved mandatory reservation",
+            ));
+        }
+        Ok(changed)
     }
 
     pub fn root(&self) -> &Path {
@@ -409,6 +539,14 @@ impl<'a> Controller<'a> {
     fn save_mission_preserving_reconcile(&self, mission: &Mission) -> Result<()> {
         let mut candidate = mission.clone();
         if let Ok(Some(current)) = mission::load(&self.root, &candidate.mission_id) {
+            // The durable budget ledger is authoritative economic state and is
+            // written only through the CAS admission paths. A stale workflow
+            // snapshot must never erase a reservation that was recorded after
+            // the snapshot was taken, or spend could exceed the hard cap.
+            candidate.budget = current.budget.clone();
+            // Preserving a newer durable budget must not also roll the revision
+            // witness backwards and defeat a later CAS.
+            candidate.revision = candidate.revision.max(current.revision);
             let has_control_state = current.generation == candidate.generation
                 && current.reconcile.status != MissionReconcileStatus::Idle
                 && current.reconcile.operation_id.is_some();
@@ -1316,14 +1454,84 @@ impl<'a> Controller<'a> {
         state_after.state.upsert(seeded, now);
         let state_error = state::save(&self.root, &state_after.state).err();
 
+        // Mandatory economic admission before the provider-costly resume. It is
+        // independent of `policy.enabled` and cannot be satisfied by a generic
+        // approval. The cutover already happened, so a refusal leaves an Active
+        // rollover that the recovery path finishes once the budget is raised.
+        let identity = crate::orchestration::policy::resource_identity_for_profile(
+            profile,
+            Some(&runtime.identity()),
+        );
+        let quota = budget::quota_facts(&self.root, &identity, now);
+        let (assessment, _receipt) = match self.admit_mandatory_spend(
+            &artifact.mission_id,
+            SpendAction::ResumeContinuation,
+            &artifact.artifact_id,
+            quota,
+            now,
+        ) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                return Ok(ContextGovernanceResult {
+                    observation,
+                    decision: GovernorDecision {
+                        state: GovernorState::RolloverRequired,
+                        action: GovernorAction::Rollover,
+                        utilization_percent: decision.utilization_percent,
+                        rollover_allowed: false,
+                        deferred_for_boundary: false,
+                        reason: "the required economic admission could not be evaluated; recovery is pending"
+                            .to_string(),
+                    },
+                    rollover_status: Some(MissionRolloverStatus::Active),
+                    artifact_status: Some(artifact.status),
+                    artifact_id: Some(artifact.artifact_id),
+                    source_session_id: Some(source_session_id),
+                    target_session_id: Some(target_session_id),
+                    note: Some(crate::telemetry::task::redact(&error.to_string())),
+                });
+            }
+        };
+        if !assessment.is_allowed() {
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::RolloverRequired,
+                    action: GovernorAction::Rollover,
+                    utilization_percent: decision.utilization_percent,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason: "the hard Mission budget or quota defers the continuation; recovery is pending"
+                        .to_string(),
+                },
+                rollover_status: Some(MissionRolloverStatus::Active),
+                artifact_status: Some(artifact.status),
+                artifact_id: Some(artifact.artifact_id),
+                source_session_id: Some(source_session_id),
+                target_session_id: Some(target_session_id),
+                note: Some(assessment.reason.clone()),
+            });
+        }
+        let reservation_id = assessment.reservation_id.clone();
+        // The admission persisted the Mission (a reservation bumps its
+        // revision). Every completion path below reloads the Mission before its
+        // acknowledgement CAS, so no pre-dispatch local view is retained.
         if let Err(error) = runtime
             .resume_runtime_continuation(&target_execution_id, &continuation)
             .map_err(runtime_gear_error)
         {
+            // The dispatch outcome is uncertain: retain the reservation.
+            if let Some(id) = reservation_id.as_deref() {
+                let _ = self.mark_mandatory_spend_unresolved(&artifact.mission_id, id, now);
+            }
             let retry_after =
                 Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds));
             artifact.mark_failed(&error.to_string(), now, retry_after);
             rollover::save(&self.root, &artifact)?;
+            // Retaining the uncertain reservation bumped the Mission revision;
+            // reload so the failure acknowledgement CASes the current revision.
+            let mut current = mission::load(&self.root, &artifact.mission_id)?
+                .ok_or_else(|| GearError::config("Mission disappeared during rollover failure"))?;
             let expected_revision = current.revision;
             let expected_owner = current.session_id.clone();
             let _ = current.mark_rollover_failed(
@@ -1358,6 +1566,15 @@ impl<'a> Controller<'a> {
                 note: Some(crate::telemetry::task::redact(&error.to_string())),
             });
         }
+        // Settle the bounded spend exactly once on a proven dispatch.
+        if let Some(id) = reservation_id.as_deref() {
+            let _ = self.settle_mandatory_spend(&artifact.mission_id, id, None, now);
+        }
+        // Settling bumped the Mission revision; reload so the acknowledgement
+        // CASes the current revision rather than a pre-settlement one.
+        let mut current = mission::load(&self.root, &artifact.mission_id)?.ok_or_else(|| {
+            GearError::config("Mission disappeared during rollover acknowledgement")
+        })?;
         let expected_revision = current.revision;
         let expected_owner = current.session_id.clone();
         current.mark_rollover_applied(&artifact.artifact_id, &target_session_id, now)?;
@@ -1570,6 +1787,64 @@ impl<'a> Controller<'a> {
                 note: Some(crate::telemetry::task::redact(&error.to_string())),
             });
         }
+        // Mandatory economic admission before the provider-costly resume. This
+        // is independent of `policy.enabled` and cannot be satisfied by a
+        // generic approval.
+        let identity = crate::orchestration::policy::resource_identity_for_profile(
+            profile,
+            Some(&runtime.identity()),
+        );
+        let quota = budget::quota_facts(&self.root, &identity, now);
+        let (assessment, _receipt) = match self.admit_mandatory_spend(
+            &artifact.mission_id,
+            SpendAction::ResumeContinuation,
+            &artifact.artifact_id,
+            quota,
+            now,
+        ) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                return Ok(ContextGovernanceResult {
+                    observation,
+                    decision: GovernorDecision {
+                        state: GovernorState::RolloverRequired,
+                        action: GovernorAction::Continue,
+                        utilization_percent: decision.utilization_percent,
+                        rollover_allowed: false,
+                        deferred_for_boundary: false,
+                        reason: "the required economic admission could not be evaluated; the target owner is retained"
+                            .to_string(),
+                    },
+                    rollover_status: Some(MissionRolloverStatus::Active),
+                    artifact_status: Some(artifact.status),
+                    artifact_id: Some(artifact.artifact_id),
+                    source_session_id: Some(source_session_id),
+                    target_session_id: Some(target_session_id),
+                    note: Some(crate::telemetry::task::redact(&error.to_string())),
+                });
+            }
+        };
+        if !assessment.is_allowed() {
+            return Ok(ContextGovernanceResult {
+                observation,
+                decision: GovernorDecision {
+                    state: GovernorState::RolloverRequired,
+                    action: GovernorAction::Continue,
+                    utilization_percent: decision.utilization_percent,
+                    rollover_allowed: false,
+                    deferred_for_boundary: false,
+                    reason: "the hard Mission budget or quota defers the continuation; the target owner is retained"
+                        .to_string(),
+                },
+                rollover_status: Some(MissionRolloverStatus::Active),
+                artifact_status: Some(artifact.status),
+                artifact_id: Some(artifact.artifact_id),
+                source_session_id: Some(source_session_id),
+                target_session_id: Some(target_session_id),
+                note: Some(assessment.reason.clone()),
+            });
+        }
+        let reservation_id = assessment.reservation_id.clone();
         let continuation = RuntimeContinuation::new(
             artifact.prompt_id(),
             artifact.continuation.render(),
@@ -1580,6 +1855,10 @@ impl<'a> Controller<'a> {
             .resume_runtime_continuation(&target_execution_id, &continuation)
             .map_err(runtime_gear_error)
         {
+            // The dispatch outcome is uncertain: retain the reservation.
+            if let Some(id) = reservation_id.as_deref() {
+                let _ = self.mark_mandatory_spend_unresolved(&artifact.mission_id, id, now);
+            }
             let retry_after =
                 Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds));
             artifact.mark_failed(&error.to_string(), now, retry_after);
@@ -1604,6 +1883,10 @@ impl<'a> Controller<'a> {
                 target_session_id: Some(target_session_id),
                 note: Some(crate::telemetry::task::redact(&error.to_string())),
             });
+        }
+        // Settle the bounded spend exactly once on a proven dispatch.
+        if let Some(id) = reservation_id.as_deref() {
+            let _ = self.settle_mandatory_spend(&artifact.mission_id, id, None, now);
         }
         artifact.mark_active(now)?;
         rollover::save(&self.root, &artifact)?;
@@ -4073,5 +4356,78 @@ mod tests {
         assert_ne!(first, changed, "a changed snapshot must hash differently");
         assert!(first.starts_with("sha256:"));
         assert_eq!(first.len(), "sha256:".len() + 64);
+    }
+
+    /// The durable budget ledger is written only through the CAS admission
+    /// paths. A stale bridge/reconcile workflow snapshot, persisted after the
+    /// reconciler recorded a reservation, must never erase that reservation or
+    /// roll the revision witness backwards.
+    #[test]
+    fn a_stale_workflow_snapshot_cannot_erase_a_durable_budget_reservation() {
+        use crate::clock::FixedClock;
+        use crate::process::FakeGitHost;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let git = FakeGitHost::new();
+        let clock = FixedClock::new(10);
+        let controller = Controller::new(
+            dir.path(),
+            OrchestrationConfig::default(),
+            ContextConfig::default(),
+            CapabilityConfig::default(),
+            VerificationConfig::default(),
+            &git,
+            &clock,
+        )
+        .with_budget(BudgetConfig {
+            currency: Some("USD".to_string()),
+            hard_limit_micros: Some(1_000_000),
+            estimated_operation_cost_micros: Some(100_000),
+            require_quota: false,
+        });
+
+        let mission_id = "task-budget-preserve-0001";
+        let mission = Mission::admit(mission_id, "preserve the durable budget", "ses_owner", 1);
+        mission::save(dir.path(), &mission).expect("seed mission");
+        let revision_before_reservation = mission.revision;
+        // The workflow snapshot a bridge turn is holding from before the
+        // reconciler reserved the bounded spend.
+        let stale = mission.clone();
+
+        let (assessment, _) = controller
+            .admit_mandatory_spend(
+                mission_id,
+                SpendAction::ResumeContinuation,
+                "op-preserve-1",
+                QuotaFacts::unknown(),
+                11,
+            )
+            .expect("admit spend");
+        assert!(assessment.is_allowed());
+        let reservation_id = assessment.reservation_id.clone().expect("reservation id");
+
+        controller
+            .save_mission_preserving_reconcile(&stale)
+            .expect("persist stale snapshot");
+
+        let reloaded = mission::load(dir.path(), mission_id)
+            .expect("load mission")
+            .expect("mission present");
+        assert_eq!(
+            reloaded.budget.reserved.micros, 100_000,
+            "a stale snapshot must not erase a live reservation"
+        );
+        assert!(
+            reloaded
+                .budget
+                .reservations
+                .iter()
+                .any(|reservation| reservation.reservation_id == reservation_id),
+            "the reserved operation must remain durably present"
+        );
+        assert!(
+            reloaded.revision > revision_before_reservation,
+            "the durable revision witness must never roll backwards"
+        );
     }
 }

@@ -109,6 +109,41 @@ fn precedence_is_strict_and_order_independent() {
 }
 
 #[test]
+fn co_firing_blocking_rules_are_all_retained_not_reduced_to_the_winner() {
+    // A terminal Mission (Deny) that also lacks a required capability (Defer)
+    // co-fires two blocking rules. Both must be retained (bounded) so the
+    // receipt never silently hides one behind the other.
+    let mut ctx = context(PolicyAction::RecoverExecution);
+    ctx.mission_status = MissionStatus::Completed;
+    ctx.capabilities = RuntimeCapabilities::NONE;
+    let assessment = evaluate(&ctx);
+    assert_eq!(assessment.decision, PolicyDecision::Deny);
+    assert_eq!(assessment.rule, "mission.terminal");
+    assert!(
+        assessment
+            .blocking
+            .iter()
+            .any(|block| block.starts_with("mission.terminal=")),
+        "{:?}",
+        assessment.blocking
+    );
+    assert!(
+        assessment
+            .blocking
+            .iter()
+            .any(|block| block.starts_with("runtime.capability=")),
+        "{:?}",
+        assessment.blocking
+    );
+    assert!(assessment.blocking.len() <= 8, "receipts stay bounded");
+
+    // The durable summary carries the same bounded blocking set.
+    let summary = assessment.summary();
+    assert_eq!(summary.blocking, assessment.blocking);
+    assert_eq!(summary.decision, "deny");
+}
+
+#[test]
 fn never_allowed_differs_from_not_safe_and_needs_approval() {
     // "never allowed": a terminal Mission.
     let mut denied = context(PolicyAction::RecoverExecution);

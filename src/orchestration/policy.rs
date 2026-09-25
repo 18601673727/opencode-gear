@@ -539,6 +539,10 @@ pub struct PolicyAssessment {
     pub required_facts: Vec<FactProbe>,
     /// Present when the effective decision is `RequireApproval`.
     pub approval: Option<ApprovalRequest>,
+    /// Bounded `rule=decision` summaries for every non-allow co-firing rule.
+    /// This retains the full blocking picture instead of only the winning rule,
+    /// so a hard cap and an exhausted quota are both visible.
+    pub blocking: Vec<String>,
 }
 
 impl PolicyAssessment {
@@ -560,6 +564,8 @@ pub struct PolicySummary {
     pub action: String,
     pub approval_id: Option<String>,
     pub required_facts: Vec<String>,
+    /// Bounded `rule=decision` summaries of every non-allow co-firing rule.
+    pub blocking: Vec<String>,
 }
 
 impl PolicySummary {
@@ -576,6 +582,7 @@ impl PolicySummary {
                 .as_ref()
                 .map(|request| request.approval_id.clone()),
             required_facts: bounded_facts(&assessment.required_facts),
+            blocking: assessment.blocking.iter().take(8).cloned().collect(),
         }
     }
 }
@@ -727,6 +734,13 @@ pub fn evaluate(context: &PolicyContext) -> PolicyAssessment {
         }
     };
 
+    let blocking: Vec<String> = outcomes
+        .iter()
+        .filter(|outcome| outcome.decision != PolicyDecision::Allow)
+        .take(8)
+        .map(|outcome| format!("{}={}", outcome.rule, outcome.decision.as_str()))
+        .collect();
+
     PolicyAssessment {
         decision,
         rule,
@@ -742,6 +756,7 @@ pub fn evaluate(context: &PolicyContext) -> PolicyAssessment {
             .map(|id| id.as_str().to_string()),
         required_facts: facts,
         approval,
+        blocking,
     }
 }
 

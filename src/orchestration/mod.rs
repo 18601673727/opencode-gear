@@ -21,6 +21,7 @@
 //!   strictly versioned and quarantined on corruption.
 
 pub mod bridge;
+pub mod budget;
 pub mod checkpoint;
 pub mod config;
 pub mod context_governor;
@@ -34,6 +35,12 @@ pub mod reconcile;
 pub mod rollover;
 pub mod state;
 
+pub use budget::{
+    admit as admit_spend, reservation_id, BudgetConfig, BudgetOrigin, BudgetStatus, CostBasis,
+    MissionBudget, MissionBudgetReceipt, Money, QuotaFacts, QuotaState, Reservation,
+    ReservationState, SpendAction, SpendAssessment, SpendBlock, SpendDecision, SpendRequest,
+    MAX_RESERVATIONS,
+};
 pub use checkpoint::{Checkpoint, CheckpointSummary, LoadedCheckpoint, Phase, Staleness};
 pub use config::OrchestrationConfig;
 pub use context_governor::{

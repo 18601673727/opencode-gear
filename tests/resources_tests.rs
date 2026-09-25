@@ -651,6 +651,7 @@ fn reconcile_result(
         result: outcome,
         timestamp: 1,
         policy: None,
+        budget: None,
     }
 }
 

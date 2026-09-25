@@ -198,6 +198,9 @@ pub enum Command {
     /// Read-only inspection of the effective Policy and the latest admission
     /// decision per durable Mission.
     Policy(Vec<OsString>),
+    /// Inspect the mandatory economic configuration and durable Mission budget,
+    /// or explicitly set a hard Mission budget (the only way past a hard cap).
+    Budget(Vec<OsString>),
     /// Read-only listing of durable, generation-bound approval requests.
     Approvals(Vec<OsString>),
     /// Resolve a pending approval as approved.
@@ -398,6 +401,7 @@ where
                     | Some("reconcile")
                     | Some("resources")
                     | Some("policy")
+                    | Some("budget")
                     | Some("approvals")
                     | Some("approve")
                     | Some("reject")
@@ -461,6 +465,7 @@ where
         Some("reconcile") => Command::Reconcile(rest),
         Some("resources") => Command::Resources(rest),
         Some("policy") => Command::Policy(rest),
+        Some("budget") => Command::Budget(rest),
         Some("approvals") => Command::Approvals(rest),
         Some("approve") => Command::Approve(rest),
         Some("reject") => Command::Reject(rest),
@@ -525,6 +530,9 @@ Commands:
   resources [--json] [--observe]
                         inspect the descriptive Resource Registry (read-only)
   policy [--json]       show the effective Policy and latest admission per Mission
+  budget [--json]       show the effective economic config and durable Mission budget
+  budget set --mission <id> --limit <micros> --currency <CUR>
+                        explicitly set a hard Mission budget (the only way past a cap)
   approvals [--json]    list durable approval requests (read-only)
   approve <id> [--note TEXT] [--json]
                         approve a pending admission request
@@ -878,6 +886,10 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
             boundary.require(&invocation_dir).map_err(Failure::Gear)?;
             policy_command(&effective, &project_root, args, cli.pretty)
         }
+        Command::Budget(args) => {
+            boundary.require(&invocation_dir).map_err(Failure::Gear)?;
+            budget_command(&effective, &project_root, args, cli.pretty)
+        }
         Command::Approvals(args) => {
             boundary.require(&invocation_dir).map_err(Failure::Gear)?;
             approvals_command(&effective, &project_root, args, cli.pretty)
@@ -952,6 +964,8 @@ fn reconcile_command(
     let verification = VerificationConfig::from_config(&effective.data).map_err(Failure::Gear)?;
     let policy = crate::orchestration::policy::PolicyConfig::from_config(&effective.data)
         .map_err(Failure::Gear)?;
+    let budget = crate::orchestration::budget::BudgetConfig::from_config(&effective.data)
+        .map_err(Failure::Gear)?;
     let contract = model::lead_contract(&effective.data, level).map_err(Failure::Gear)?;
     let profile = LeadSelection::from_contract(&contract).runtime_profile();
     let git = SystemGitHost;
@@ -965,7 +979,8 @@ fn reconcile_command(
         &git,
         &clock,
     )
-    .with_policy(policy);
+    .with_policy(policy)
+    .with_budget(budget);
 
     let print_run = |run: crate::orchestration::reconcile::ReconcileRun| {
         let value = serde_json::to_value(&run).map_err(|error| {
@@ -1404,6 +1419,251 @@ fn policy_command(
         }
     }
     Ok(0)
+}
+
+/// `ocg budget [--json]` and `ocg budget set ...`.
+///
+/// The read form is read-only: it shows the effective economic configuration
+/// and each durable Mission's accounting. The `set` form is the only supported
+/// way to raise or change a hard Mission budget; a generic approval can never do
+/// it, and no currency is ever converted.
+fn budget_command(
+    effective: &config::Effective,
+    project_root: &Path,
+    args: &[OsString],
+    pretty: bool,
+) -> std::result::Result<i32, Failure> {
+    if args.first().and_then(|arg| arg.to_str()) == Some("set") {
+        return budget_set_command(effective, project_root, &args[1..], pretty);
+    }
+    let mut json = false;
+    for arg in args {
+        match arg.to_str() {
+            Some("--json") => json = true,
+            _ => {
+                return Err(usage_failure(format!(
+                    "unknown budget option: {} (only --json, or 'set', is supported)",
+                    arg.to_string_lossy()
+                )))
+            }
+        }
+    }
+    validate::require_valid(effective).map_err(Failure::Gear)?;
+    let config = crate::orchestration::budget::BudgetConfig::from_config(&effective.data)
+        .map_err(Failure::Gear)?;
+
+    let (summaries, corrupt) = crate::orchestration::mission::list(project_root);
+    let mut budgets = Vec::new();
+    for summary in &summaries {
+        let Ok(Some(mission)) =
+            crate::orchestration::mission::load(project_root, &summary.mission_id)
+        else {
+            continue;
+        };
+        budgets.push((
+            summary.mission_id.clone(),
+            mission.generation,
+            mission.budget.receipt(),
+        ));
+    }
+
+    if json {
+        let value = json!({
+            "configured": config.hard_limit_micros.is_some(),
+            "currency": config.currency,
+            "hard_limit_micros": config.hard_limit_micros,
+            "estimated_operation_cost_micros": config.estimated_operation_cost_micros,
+            "require_quota": config.require_quota,
+            "fingerprint": config.fingerprint(),
+            "corrupt_missions": corrupt,
+            "missions": budgets
+                .iter()
+                .map(|(mission_id, generation, budget)| {
+                    json!({
+                        "mission_id": mission_id,
+                        "generation": generation,
+                        "status": budget.status,
+                        "origin": budget.origin,
+                        "currency": budget.currency,
+                        "hard_limit_micros": budget.hard_limit_micros,
+                        "settled_micros": budget.settled_micros,
+                        "reserved_micros": budget.reserved_micros,
+                        "unresolved_micros": budget.unresolved_micros,
+                        "reason": budget.reason,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        });
+        print_json(&value, pretty);
+    } else {
+        match (config.hard_limit_micros, config.currency.as_deref()) {
+            (Some(limit), Some(currency)) => {
+                println!("default hard budget: {limit} micros {currency}")
+            }
+            _ => println!("default hard budget: none (no economic cutoff)"),
+        }
+        println!(
+            "estimated provider-costly operation: {}",
+            match (
+                config.estimated_operation_cost_micros,
+                config.currency.as_deref()
+            ) {
+                (Some(estimate), Some(currency)) => format!("{estimate} micros {currency}"),
+                _ => "unknown (a hard-budgeted provider-costly action defers)".to_string(),
+            }
+        );
+        println!("require quota: {}", config.require_quota);
+        if corrupt > 0 {
+            println!("corrupt Missions: {corrupt} (skipped)");
+        }
+        if budgets.is_empty() {
+            println!("no durable Mission budgets");
+        }
+        for (mission_id, generation, budget) in &budgets {
+            println!("{mission_id} gen {generation}");
+            println!(
+                "  {} origin {} currency {}",
+                budget.status,
+                budget.origin,
+                if budget.currency.is_empty() {
+                    "unknown"
+                } else {
+                    &budget.currency
+                }
+            );
+            println!(
+                "  hard limit {} settled {} reserved {} unresolved {}",
+                budget
+                    .hard_limit_micros
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                budget.settled_micros,
+                budget.reserved_micros,
+                budget.unresolved_micros,
+            );
+            if let Some(reason) = &budget.reason {
+                println!("  reason {reason}");
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// `ocg budget set --mission <id> --limit <micros> --currency <CUR>`: the only
+/// supported way past a hard cap. It is an explicit operator change to the
+/// durable hard budget itself, never an approval.
+fn budget_set_command(
+    effective: &config::Effective,
+    project_root: &Path,
+    args: &[OsString],
+    pretty: bool,
+) -> std::result::Result<i32, Failure> {
+    let mut json = false;
+    let mut mission_id: Option<String> = None;
+    let mut limit: Option<i64> = None;
+    let mut currency: Option<String> = None;
+    let mut index = 0;
+    while index < args.len() {
+        let text = args[index].to_string_lossy().into_owned();
+        match text.as_str() {
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            "--mission" => mission_id = Some(option_value(args, "--mission", &mut index)?),
+            "--limit" => {
+                let value = option_value(args, "--limit", &mut index)?;
+                limit = Some(value.parse::<i64>().map_err(|_| {
+                    usage_failure(format!("--limit must be an integer, got '{value}'"))
+                })?);
+            }
+            "--currency" => currency = Some(option_value(args, "--currency", &mut index)?),
+            _ if text.starts_with("--mission=") => {
+                mission_id = Some(option_value(args, "--mission", &mut index)?)
+            }
+            _ if text.starts_with("--limit=") => {
+                let value = option_value(args, "--limit", &mut index)?;
+                limit = Some(value.parse::<i64>().map_err(|_| {
+                    usage_failure(format!("--limit must be an integer, got '{value}'"))
+                })?);
+            }
+            _ if text.starts_with("--currency=") => {
+                currency = Some(option_value(args, "--currency", &mut index)?)
+            }
+            _ => return Err(usage_failure(format!("unknown budget set option: {text}"))),
+        }
+    }
+    let mission_id = mission_id.ok_or_else(|| usage_failure("--mission <id> is required"))?;
+    let limit = limit.ok_or_else(|| usage_failure("--limit <micros> is required"))?;
+    let currency = currency.ok_or_else(|| usage_failure("--currency <CUR> is required"))?;
+    validate::require_valid(effective).map_err(Failure::Gear)?;
+    let clock = SystemClock;
+    let now = clock.now_unix();
+    let Some(mut mission) =
+        crate::orchestration::mission::load(project_root, &mission_id).map_err(Failure::Gear)?
+    else {
+        return Err(Failure::Gear(GearError::config(format!(
+            "unknown Mission '{mission_id}'"
+        ))));
+    };
+    let expected_revision = mission.revision;
+    let expected_owner = mission.session_id.clone();
+    let amount = crate::orchestration::budget::Money::new(limit, currency);
+    if !mission
+        .set_hard_budget(amount, now)
+        .map_err(Failure::Gear)?
+    {
+        // Setting the same limit is a no-op; report the durable state.
+    }
+    if !crate::orchestration::mission::save_if_revision(
+        project_root,
+        &mission,
+        expected_revision,
+        expected_owner.as_deref(),
+    )
+    .map_err(Failure::Gear)?
+    {
+        return Err(Failure::Gear(GearError::config(
+            "Mission changed while setting the hard budget; retry later",
+        )));
+    }
+    let budget = mission.budget.receipt();
+    if json {
+        print_json(
+            &serde_json::to_value(&budget).unwrap_or(serde_json::Value::Null),
+            pretty,
+        );
+    } else {
+        println!(
+            "{mission_id} hard budget set to {} micros {}",
+            budget.hard_limit_micros.unwrap_or(limit),
+            budget.currency
+        );
+        println!("  status {} origin {}", budget.status, budget.origin);
+    }
+    Ok(0)
+}
+
+/// Read the value of `--name VALUE` or `--name=VALUE` and advance `index`.
+fn option_value(
+    args: &[OsString],
+    name: &str,
+    index: &mut usize,
+) -> std::result::Result<String, Failure> {
+    let text = args[*index].to_string_lossy().into_owned();
+    let prefix = format!("{name}=");
+    if let Some(value) = text.strip_prefix(prefix.as_str()) {
+        *index += 1;
+        if value.is_empty() {
+            return Err(usage_failure(format!("{name} needs a value")));
+        }
+        return Ok(value.to_string());
+    }
+    let value = args
+        .get(*index + 1)
+        .ok_or_else(|| usage_failure(format!("{name} needs a value")))?;
+    *index += 2;
+    Ok(value.to_string_lossy().into_owned())
 }
 
 /// `ocg approvals [--json]`: read-only listing of durable approval requests.
@@ -3912,6 +4172,19 @@ fn bridge_payload(
         Ok(config) => config,
         Err(error) => return json!({"ok": false, "error": error.to_string()}),
     };
+    // The bridge is a real execution path: `context.observe` can drive a
+    // rollover continuation resume, which is provider-costly. It must carry the
+    // same optional Policy and mandatory economic configuration as every other
+    // path, so a configured hard Mission budget is enforced here too (and is not
+    // silently replaced by the permissive constructor defaults).
+    let policy = match crate::orchestration::policy::PolicyConfig::from_config(&effective.data) {
+        Ok(config) => config,
+        Err(error) => return json!({"ok": false, "error": error.to_string()}),
+    };
+    let budget = match crate::orchestration::budget::BudgetConfig::from_config(&effective.data) {
+        Ok(config) => config,
+        Err(error) => return json!({"ok": false, "error": error.to_string()}),
+    };
     let git = SystemGitHost;
     let clock = SystemClock;
     let controller = crate::orchestration::controller::Controller::new(
@@ -3922,7 +4195,9 @@ fn bridge_payload(
         verification,
         &git,
         &clock,
-    );
+    )
+    .with_policy(policy)
+    .with_budget(budget);
     let runner = SystemCaptureRunner;
     let (telemetry_config, warnings) = telemetry_for(effective, env);
     print_telemetry_warnings(&warnings);

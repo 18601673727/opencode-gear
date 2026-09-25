@@ -535,6 +535,41 @@ v1 adapter the metadata is rendered as a plain, compact line in the appended
 context block; the v2 adapter injects the baseline without a presentation
 header.
 
+## Economic budget policy
+
+The optional top-level `budget` object is the **mandatory economic safety
+boundary**. It is deliberately separate from the optional `policy` object: it is
+always evaluated for a provider-costly action and **cannot be disabled with
+`policy.enabled: false`**, and a generic approval can never authorize exceeding a
+hard cap.
+
+```yaml
+budget:
+  currency: USD
+  hardLimitMicros: 5000000
+  estimatedOperationCostMicros: 100000
+  requireQuota: false
+```
+
+| Field | Default | Bounds | Meaning |
+| --- | --- | --- | --- |
+| `currency` | unset | 1–8 ASCII letters/digits | Accounting currency. Required when a limit or an estimate is set; OCG never guesses or converts a currency (no FX). |
+| `hardLimitMicros` | unset | positive integer | Default hard Mission budget in micro-units (10⁻⁶ of `currency`). Materialized once into each Mission as a `system_default` limit; a later config edit never silently changes an existing durable limit. |
+| `estimatedOperationCostMicros` | unset | positive integer | Bounded pre-authorization estimate for one provider-costly operation. Without it, a hard-budgeted provider-costly action is deferred (`mission_cost_unknown`) rather than assumed free. |
+| `requireQuota` | `false` | boolean | Require a fresh, authoritative quota fact before a provider-costly action. When required, an exhausted/unknown/stale quota defers instead of assuming unlimited capacity. |
+
+There is deliberately no `budget.enabled` flag: a configured hard limit is
+always enforced, and the *absence* of a limit is the absence of a cap (the
+behavior of an unconfigured deployment is unchanged). A limit or estimate
+without a currency, an unknown currency, or a non-positive amount is a
+configuration error. Money is fixed-point integer micro-units, never a binary
+float, and is never currency-converted. The durable per-Mission accounting
+(cap, origin, settled, reservations, status) survives restart, rollover, retries
+and recovery; inspect it with `ocg budget [--json]` and change the cap with
+`ocg budget set`. See
+[architecture.md](architecture.md#mission-budget-and-quota-admission) for the
+mechanism.
+
 ## Reports policy
 
 The optional top-level `reports` object controls local artifacts written from

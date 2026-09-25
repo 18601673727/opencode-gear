@@ -857,6 +857,9 @@ checkpoint list|show|save
                     inspect or record a versioned phase checkpoint
 reconcile [--once]  explicit single-node Mission convergence pass (no daemon)
 resources [--json]  readable facts about known execution resources (read-only)
+budget [--json]     durable per-Mission economic budget (read-only)
+budget set --mission <id> --limit <micros> --currency <code>
+                    explicitly set a Mission's hard monetary cap
 version             Gear, platform and the resolved OpenCode runtime
 doctor              read-only layering/config/OpenCode/proxy/runtime diagnosis
                     (--effective adds the live Configured/Resolved/Effective state)
@@ -881,6 +884,20 @@ ranks or routes a resource. `--observe` records one local runtime observation;
 otherwise only configured and previously persisted facts are shown. Configured
 facts are re-derived from the configuration rather than stored, and health
 reasons are redacted before they are written.
+
+`ocg budget [--json]` is the mandatory economic safety surface. A configured
+hard Mission budget is a cutoff, not an alert: OCG records a bounded reservation
+before a provider-costly action, settles actual usage exactly once afterwards,
+and refuses to start further paid work that could exceed the cap. The boundary
+is always evaluated — `policy.enabled: false` does not disable it, and an
+ordinary approval can never authorize spending past a hard cap. Money is
+fixed-point integer micro-units in one currency; OCG never performs currency
+conversion and never treats an unknown cost or quota as free or unlimited. The
+durable accounting survives restart, rollover, retries and recovery.
+`ocg budget [--json]` shows each Mission's cap/origin/status and settled,
+reserved and unresolved spend; `ocg budget set --mission <id> --limit <micros>
+--currency <code>` is the only supported way to raise or change a cap. See
+[architecture.md](docs/architecture.md#mission-budget-and-quota-admission).
 
 Inside the TUI, `Tab` / `Shift+Tab` cycle the three Lead agents. The cycle
 order depends on the active `default_agent`; the default configuration starts

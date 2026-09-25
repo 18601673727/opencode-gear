@@ -472,6 +472,50 @@ fn oversized_bridge_payload_is_rejected_fail_soft_without_state() {
     assert!(!project.join(".opencode-gear").exists());
 }
 
+#[test]
+fn the_bridge_path_carries_the_mandatory_budget_configuration() {
+    // `ocg __bridge context.observe` can drive a provider-costly rollover
+    // resume, so the bridge must parse the mandatory budget configuration
+    // rather than silently falling back to the permissive controller defaults.
+    // An invalid budget config therefore fails the bridge closed.
+    let dir = TestDir::new();
+    let broken_project = project(&dir);
+    write_yaml(
+        &broken_project.join(".opencode-gear.yaml"),
+        // `hardLimitMicros` without a currency is invalid.
+        &json!({"budget": {"hardLimitMicros": 1000000}}),
+    );
+    let value = bridge(&broken_project, dir.path(), "context.observe", &json!({}));
+    assert_eq!(value["ok"], json!(false));
+    assert!(
+        value["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("budget"),
+        "the bridge must consult the budget configuration: {value}"
+    );
+
+    // A valid budget config is parsed and does not fail the bridge.
+    let dir = TestDir::new();
+    let valid_project = project(&dir);
+    write_yaml(
+        &valid_project.join(".opencode-gear.yaml"),
+        &json!({"budget": {
+            "currency": "USD",
+            "hardLimitMicros": 1000000,
+            "estimatedOperationCostMicros": 100000
+        }}),
+    );
+    let value = bridge(&valid_project, dir.path(), "context.observe", &json!({}));
+    assert!(
+        !value["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("budget"),
+        "a valid budget configuration must not error: {value}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn models_does_not_require_plugin_materialization_or_a_writable_project() {

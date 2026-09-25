@@ -517,6 +517,10 @@ pub struct QuotaValue {
     pub window: Option<String>,
     pub remaining: Option<u64>,
     pub limit: Option<u64>,
+    /// When the window is expected to reset, if the source reports it. Additive
+    /// to the schema; old records deserialize as `None`. It is retained because
+    /// an exhausted quota must be able to report its reset time honestly.
+    pub reset_at: Option<i64>,
 }
 
 /// Pricing metadata, when an authoritative source exists. Never invented.

@@ -7,6 +7,7 @@
 //! next action. Planning is pure; execution and persistence are separate.
 
 use crate::error::{GearError, Result};
+use crate::orchestration::budget::{self, MissionBudgetReceipt, SpendAction, SpendAssessment};
 use crate::orchestration::context_governor::{ContextObservation, TelemetryProvenance};
 use crate::orchestration::controller::Controller;
 use crate::orchestration::mission::{
@@ -539,6 +540,11 @@ pub struct ReconcileResult {
     /// The bounded Policy projection for this pass, when Policy was evaluated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicySummary>,
+    /// The bounded mandatory economic projection for this pass, when the
+    /// economic admission boundary was evaluated. Additive; old results
+    /// deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<MissionBudgetReceipt>,
 }
 
 impl ReconcileResult {
@@ -559,6 +565,7 @@ impl ReconcileResult {
             result,
             timestamp,
             policy: None,
+            budget: None,
         }
     }
 }
@@ -896,6 +903,9 @@ pub struct Reconciler<'a, 'r> {
     /// reset at the start of every `reconcile_mission` call so a stale summary
     /// can never leak into an unrelated Mission's receipt.
     policy_summary: Option<PolicySummary>,
+    /// The mandatory economic projection for the action currently being
+    /// dispatched. Reset with `policy_summary` for the same reason.
+    budget_receipt: Option<MissionBudgetReceipt>,
 }
 
 impl<'a, 'r> Reconciler<'a, 'r> {
@@ -909,6 +919,7 @@ impl<'a, 'r> Reconciler<'a, 'r> {
             runtime: Some(runtime),
             profile,
             policy_summary: None,
+            budget_receipt: None,
         }
     }
 
@@ -918,6 +929,7 @@ impl<'a, 'r> Reconciler<'a, 'r> {
             runtime: None,
             profile,
             policy_summary: None,
+            budget_receipt: None,
         }
     }
 
@@ -951,6 +963,7 @@ impl<'a, 'r> Reconciler<'a, 'r> {
         // Reset the per-tick Policy projection first: a stale summary must never
         // leak into an unrelated Mission's receipt or result.
         self.policy_summary = None;
+        self.budget_receipt = None;
         if !self.controller.config().enabled {
             return ReconcileResult {
                 mission_id: mission_id.to_string(),
@@ -962,6 +975,7 @@ impl<'a, 'r> Reconciler<'a, 'r> {
                 result: ReconcileOutcome::Noop,
                 timestamp: now,
                 policy: None,
+                budget: None,
             };
         }
         let mission = match mission::load(self.controller.root(), mission_id) {
@@ -977,6 +991,7 @@ impl<'a, 'r> Reconciler<'a, 'r> {
                     result: ReconcileOutcome::Failed,
                     timestamp: now,
                     policy: None,
+                    budget: None,
                 };
             }
             Err(error) => {
@@ -990,6 +1005,7 @@ impl<'a, 'r> Reconciler<'a, 'r> {
                     result: ReconcileOutcome::Failed,
                     timestamp: now,
                     policy: None,
+                    budget: None,
                 };
             }
         };
@@ -1182,6 +1198,7 @@ impl<'a, 'r> Reconciler<'a, 'r> {
         // Surface the admission decision that let the action run. Non-policy
         // outcomes keep `None`.
         result.policy = self.policy_summary.clone();
+        result.budget = self.budget_receipt.clone();
         result
     }
 
@@ -1289,6 +1306,31 @@ impl<'a, 'r> Reconciler<'a, 'r> {
             Some(record) => ResourceFacts::from_record(&record),
             None => ResourceFacts::unknown(identity),
         }
+    }
+
+    /// Mandatory economic admission for the provider-costly continuation
+    /// resume. It records the bounded spend durably before the side effect and
+    /// returns `None` when the action is not admissible, in which case the
+    /// caller must not perform it. This runs independently of
+    /// `policy.enabled` and cannot be satisfied by a generic approval.
+    fn admit_continuation_spend(
+        &mut self,
+        mission: &Mission,
+        operation_id: &str,
+        now: i64,
+    ) -> Result<SpendAssessment> {
+        let runtime_identity = self.runtime.as_ref().map(|runtime| runtime.identity());
+        let identity = resource_identity_for_profile(&self.profile, runtime_identity.as_ref());
+        let quota = budget::quota_facts(self.controller.root(), &identity, now);
+        let (assessment, receipt) = self.controller.admit_mandatory_spend(
+            &mission.mission_id,
+            SpendAction::ResumeContinuation,
+            operation_id,
+            quota,
+            now,
+        )?;
+        self.budget_receipt = Some(receipt);
+        Ok(assessment)
     }
 
     fn observe_current(&self, mission: &Mission) -> RuntimeObservation {
@@ -1487,7 +1529,15 @@ impl<'a, 'r> Reconciler<'a, 'r> {
                 action: summary.action.clone(),
                 approval_id: summary.approval_id.clone(),
                 required_facts: summary.required_facts.clone(),
+                blocking: summary.blocking.clone(),
             }),
+            // The freshest durable budget projection, so the mandatory economic
+            // state is inspectable alongside the (optional) Policy decision.
+            budget: result
+                .budget
+                .clone()
+                .or_else(|| self.budget_receipt.clone())
+                .or_else(|| Some(current.budget.receipt())),
         };
         if current.record_reconcile_receipt(receipt)
             && !mission::save_if_revision(
@@ -2131,30 +2181,85 @@ impl<'a, 'r> Reconciler<'a, 'r> {
                 }
             }
             MissionReconcileStatus::Staged | MissionReconcileStatus::Resuming => {
+                // Mandatory economic admission before the one OCG-initiated
+                // provider-costly side effect. A Deny/Defer performs no runtime
+                // work; only Allow reaches the resume.
+                let assessment =
+                    match self.admit_continuation_spend(mission, &artifact.artifact_id, now) {
+                        Ok(assessment) => assessment,
+                        Err(error) => {
+                            return self.finish_deferred(
+                                mission,
+                                decision,
+                                format!(
+                                    "economic admission could not be evaluated: {}",
+                                    redact(&error.to_string())
+                                ),
+                                now,
+                            );
+                        }
+                    };
+                if !assessment.is_allowed() {
+                    return self.finish_policy(
+                        mission,
+                        decision,
+                        ReconcileOutcome::Deferred,
+                        format!(
+                            "economic admission deferred the provider-costly continuation: {}",
+                            assessment.reason
+                        ),
+                        now,
+                    );
+                }
+                let reservation_id = assessment.reservation_id.clone();
                 let runtime_result = self
                     .runtime
                     .as_deref_mut()
                     .expect("runtime presence checked above")
                     .resume_runtime_continuation(&target, &continuation);
                 match runtime_result {
-                    Ok(()) => match self.persist_artifact_phase(
-                        &mut artifact,
-                        MissionReconcileStatus::Applied,
-                        Some(&target),
-                        now,
-                    ) {
-                        Ok(()) => self
-                            .persist_phase(
-                                mission,
-                                MissionReconcileStatus::Resuming,
-                                MissionReconcileStatus::Applied,
-                                Some(&target),
+                    Ok(()) => {
+                        // Settle the bounded spend exactly once on a proven
+                        // dispatch. No provider-reported actual is available, so
+                        // the bounded reservation amount is settled.
+                        if let Some(id) = reservation_id.as_deref() {
+                            let _ = self.controller.settle_mandatory_spend(
+                                &mission.mission_id,
+                                id,
+                                None,
                                 now,
-                            )
-                            .map(|_| ()),
-                        Err(error) => Err(error),
-                    },
-                    Err(error) => Err(GearError::config(error.to_string())),
+                            );
+                        }
+                        match self.persist_artifact_phase(
+                            &mut artifact,
+                            MissionReconcileStatus::Applied,
+                            Some(&target),
+                            now,
+                        ) {
+                            Ok(()) => self
+                                .persist_phase(
+                                    mission,
+                                    MissionReconcileStatus::Resuming,
+                                    MissionReconcileStatus::Applied,
+                                    Some(&target),
+                                    now,
+                                )
+                                .map(|_| ()),
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Err(error) => {
+                        // The dispatch outcome is uncertain: retain the
+                        // reservation rather than optimistically releasing it.
+                        if let Some(id) = reservation_id.as_deref() {
+                            let _ = self.controller.mark_mandatory_spend_unresolved(
+                                &mission.mission_id,
+                                id,
+                                now,
+                            );
+                        }
+                        Err(GearError::config(error.to_string()))
+                    }
                 }
             }
             MissionReconcileStatus::Applied => Ok(()),
