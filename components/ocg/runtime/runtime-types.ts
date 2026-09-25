@@ -10,6 +10,35 @@ import type { RuntimeObservability } from "./observability";
 import type { ResourceLedger } from "../resource-ledger/types";
 import type { BootstrapState, OnboardingStageId } from "../bootstrap/types";
 import type { MissionExecution } from "../execution/domain";
+import type { ProjectId } from "../project/domain";
+import type { MissionLaunchCommand } from "../mission/draft-domain";
+
+/**
+ * Launch command produced by the pure Mission draft domain and consumed at the
+ * runtime boundary. It is intentionally transport-free: no HTTP, SSE, or
+ * backend DTO is implied.
+ */
+export type { MissionLaunchCommand } from "../mission/draft-domain";
+
+export type MissionLaunchOutcome = "accepted" | "rejected" | "requires-attention" | "failed";
+
+/**
+ * Normalized launch result. `requires-attention` is reserved for a future
+ * fixture that needs explicit operator input; the current mock runtime emits
+ * only accepted, rejected, or failed.
+ */
+export type MissionLaunchResult = {
+  outcome: MissionLaunchOutcome;
+  commandId: string;
+  draftId: string;
+  projectId: ProjectId;
+  sessionId: string;
+  missionId?: string;
+  message: string;
+  /** True when the runtime returned a previously recorded result for this command identity. */
+  duplicate: boolean;
+};
+
 
 export type ScenarioId =
   | "normal-chat"
@@ -79,6 +108,12 @@ export interface OcgRuntimeClient {
   subscribe(listener: (event: OcgRuntimeEvent) => void): () => void;
   getSnapshot(): RuntimeSnapshot;
   cancel?(sessionId: string): Promise<void>;
+  /**
+   * Frontend-only Mission launch boundary. Validates the command against the
+   * mock snapshot and, on acceptance, projects a Mission + execution into the
+   * existing per-session snapshot maps. No backend API is called.
+   */
+  launchMission?(command: MissionLaunchCommand): Promise<MissionLaunchResult>;
   /** Mock Cloudflare Access handoff. Never a real redirect or credential exchange. */
   requestAccessHandoff?(): Promise<void>;
   setOnboardingStage?(stage: OnboardingStageId): Promise<void>;

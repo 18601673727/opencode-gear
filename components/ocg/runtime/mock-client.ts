@@ -19,10 +19,20 @@ import {
 import { ONBOARDING_STAGES, type BootstrapState, type OnboardingStageId } from "../bootstrap/types";
 import type {
   CreateSessionInput,
+  MissionLaunchCommand,
+  MissionLaunchResult,
   OcgRuntimeClient,
   RuntimeSnapshot,
   ScenarioId,
 } from "./runtime-types";
+import { PROJECTS, isProjectId, type ProjectId } from "../project/domain";
+import { projectSessionIds } from "../project/fixtures";
+import {
+  createLaunchedExecution,
+  createLaunchedMission,
+  createLaunchedObservability,
+  missionIdForLaunch,
+} from "../mission/launch-fixtures";
 
 type Timer = ReturnType<typeof setTimeout>;
 
@@ -42,6 +52,8 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
   private nextId = 0;
   private snapshot: RuntimeSnapshot;
   private liveScenarioStarted = false;
+  /** Accepted launch results keyed by stable command identity for idempotency. */
+  private readonly launchResults = new Map<string, MissionLaunchResult>();
 
   constructor(scenario: ScenarioId) {
     const fixture = createScenarioFixture(scenario);
@@ -275,6 +287,102 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
     }
   }
 
+  /**
+   * Deterministic, frontend-only Mission launch.
+   *
+   * - disconnected runtimes fail without mutating the snapshot;
+   * - a session owned by another Project is rejected;
+   * - a repeated accepted command identity returns the previously recorded result;
+   * - rejected/failed attempts remain retryable if the runtime condition changes;
+   * - an accepted command atomically updates the existing per-session maps.
+   */
+  async launchMission(command: MissionLaunchCommand): Promise<MissionLaunchResult> {
+    const prior = this.launchResults.get(command.commandId);
+    if (prior) {
+      return { ...clone(prior), duplicate: true };
+    }
+
+    const result = this.resolveLaunch(command);
+    // Only an accepted projection is durable within this fixture. Adapter
+    // failures and rejections do not mutate state and must remain retryable;
+    // accepted commands are the ones that need duplicate protection.
+    if (result.outcome === "accepted") this.launchResults.set(command.commandId, clone(result));
+    this.emit({ type: "mission.launch-updated", sessionId: command.sessionId, result: clone(result) });
+    return clone(result);
+  }
+
+  private resolveLaunch(command: MissionLaunchCommand): MissionLaunchResult {
+    const base = {
+      commandId: command.commandId,
+      draftId: command.draftId,
+      projectId: command.projectId,
+      sessionId: command.sessionId,
+      duplicate: false,
+    };
+
+    if (this.snapshot.status.state !== "connected") {
+      return {
+        ...base,
+        outcome: "failed",
+        message: this.snapshot.status.detail ?? "The local runtime is not connected; launch not attempted.",
+      };
+    }
+
+    if (!isProjectId(command.projectId)) {
+      return { ...base, outcome: "rejected", message: `Unknown Project "${command.projectId}"; launch rejected.` };
+    }
+
+    const session = this.snapshot.sessions.find((item) => item.id === command.sessionId);
+    if (!session) {
+      return { ...base, outcome: "failed", message: `Unknown session "${command.sessionId}"; launch failed.` };
+    }
+
+    const owner = this.ownerProjectForSession(command.sessionId);
+    if (owner && owner !== command.projectId) {
+      return {
+        ...base,
+        outcome: "rejected",
+        message: `Project "${command.projectId}" does not own session "${command.sessionId}" (owned by "${owner}"); launch rejected.`,
+      };
+    }
+
+    if (!Number.isSafeInteger(command.hardBudgetMicros) || command.hardBudgetMicros <= 0) {
+      return { ...base, outcome: "rejected", message: "The hard budget must be a positive whole number of micros; launch rejected." };
+    }
+
+    const missionId = missionIdForLaunch(command);
+    const mission = createLaunchedMission(command, missionId);
+    const execution = createLaunchedExecution(command, missionId);
+    const observability = createLaunchedObservability(command, missionId);
+
+    // Atomic projection into the existing per-session maps. No parallel
+    // created-missions array is introduced.
+    this.snapshot = {
+      ...this.snapshot,
+      missionsBySession: { ...this.snapshot.missionsBySession, [command.sessionId]: mission },
+      executionBySession: { ...this.snapshot.executionBySession, [command.sessionId]: execution },
+      observabilityBySession: { ...this.snapshot.observabilityBySession, [command.sessionId]: observability },
+    };
+
+    this.emit({ type: "mission.updated", sessionId: command.sessionId, mission: clone(mission) });
+    this.emit({ type: "execution.updated", sessionId: command.sessionId, execution: clone(execution) });
+    this.emit({ type: "observability.updated", sessionId: command.sessionId, observability: clone(observability) });
+
+    return {
+      ...base,
+      outcome: "accepted",
+      missionId,
+      message: `Mission "${mission.title}" accepted for execution.`,
+    };
+  }
+
+  private ownerProjectForSession(sessionId: string): ProjectId | null {
+    for (const project of PROJECTS) {
+      if (projectSessionIds(project.id).includes(sessionId)) return project.id;
+    }
+    return null;
+  }
+
   private updateMessages(sessionId: string, messages: ChatMessage[]): void {
     this.snapshot = {
       ...this.snapshot,
@@ -310,6 +418,12 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
             activities: boundActivities(event.observability.activities),
           },
         },
+      };
+    }
+    if (event.type === "execution.updated") {
+      this.snapshot = {
+        ...this.snapshot,
+        executionBySession: { ...this.snapshot.executionBySession, [event.sessionId]: event.execution },
       };
     }
     for (const listener of this.listeners) listener(event);

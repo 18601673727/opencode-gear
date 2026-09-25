@@ -1,5 +1,5 @@
 import { OcgEntryGate } from "@/components/ocg/bootstrap/entry-gate";
-import type { WorkspaceView } from "@/components/ocg/layout/app-shell";
+import { resolveWorkspaceView } from "@/components/ocg/layout/view-domain";
 import { resolveControlCenterView } from "@/components/ocg/control-center/domain";
 import { resolveProjectParam } from "@/components/ocg/project/domain";
 import { resolveScenario } from "@/components/ocg/runtime/scenarios";
@@ -13,15 +13,11 @@ export default async function Home({
   const value = typeof params.scenario === "string" ? params.scenario : undefined;
   const scenario = resolveScenario(value);
 
-  // Scenario defaults preserve the existing workspace routes; an explicit view
-  // is also accepted for shell navigation without inventing a backend route.
+  // An explicit view preserves the current scenario/runtime instance. When no
+  // view is given, the existing scenario-derived defaults still apply.
   const requestedView = typeof params.view === "string" ? params.view : undefined;
-  const view: WorkspaceView = requestedView === "settings" || requestedView === "logs"
-    ? requestedView
-    : scenario === "home-overview" || scenario === "home-calm" ? "home" : scenario === "attention-overview" || scenario === "attention-calm" ? "attention" : scenario === "profiles-models" ? "control-center" : scenario === "resource-ledger" ? "ledger" : scenario === "mission-control" ? "mission-control" : scenario === "logs-live" ? "logs" : "chat";
-  const controlCenterView = resolveControlCenterView(
-    typeof params.view === "string" ? params.view : undefined,
-  );
+  const view = resolveWorkspaceView(scenario, requestedView);
+  const controlCenterView = resolveControlCenterView(requestedView);
   const initialProjectId = resolveProjectParam(params.project);
 
   return (

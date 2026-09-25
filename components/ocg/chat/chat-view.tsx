@@ -6,10 +6,12 @@ import {
   Bot,
   Check,
   ChevronDown,
+  Command,
   Copy,
   Loader2,
   Mic,
   Paperclip,
+  Sparkles,
   User,
   Wrench,
 } from "lucide-react";
@@ -23,6 +25,14 @@ import {
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { ActivityPulse } from "../activity-pulse";
 import type { ChatMessage, ChatSession, Mission, RuntimeStatus } from "../types";
+import {
+  applyComposerSuggestion,
+  matchComposerSuggestions,
+  moveComposerSuggestionIndex,
+  parseComposerIntent,
+  type ComposerIntent,
+  type ComposerSuggestion,
+} from "../composer/domain";
 
 /* ---------- lightweight markdown rendering (no new deps) ---------- */
 
@@ -270,13 +280,16 @@ function MessageRow({ message }: { message: ChatMessage }) {
 function Composer({
   draft,
   onDraftChange,
-  onSend,
+  onIntent,
 }: {
   draft: string;
   onDraftChange: (v: string) => void;
-  onSend: () => void;
+  onIntent: (intent: ComposerIntent) => void;
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
+  const [highlight, setHighlight] = useState<{ raw: string; index: number } | null>(null);
+  const [dismissedFor, setDismissedFor] = useState<string | null>(null);
+  const [commandError, setCommandError] = useState<{ raw: string; message: string } | null>(null);
 
   useEffect(() => {
     const el = ref.current;
@@ -285,33 +298,145 @@ function Composer({
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
   }, [draft]);
 
+  const suggestions = matchComposerSuggestions(draft);
+  const suggestionsOpen = suggestions.length > 0 && dismissedFor !== draft;
+  const activeIndex = suggestionsOpen && highlight?.raw === draft && highlight.index < suggestions.length
+    ? highlight.index
+    : -1;
+  const error = commandError && commandError.raw === draft ? commandError.message : null;
   const canSend = draft.trim().length > 0;
+
+  const closeSuggestions = () => {
+    setHighlight(null);
+    setDismissedFor(draft);
+  };
+
+  const applySuggestion = (suggestion: ComposerSuggestion) => {
+    const applied = applyComposerSuggestion(suggestion);
+    setHighlight(null);
+    setDismissedFor(null);
+    setCommandError(null);
+    if (applied.action === "create-mission") {
+      onDraftChange("");
+      onIntent(parseComposerIntent(applied.text));
+      return;
+    }
+    onDraftChange(applied.text);
+    ref.current?.focus();
+  };
+
+  const submit = () => {
+    const intent = parseComposerIntent(draft);
+    if (intent.kind === "unknown-command") {
+      setDismissedFor(draft);
+      setCommandError({ raw: draft, message: intent.reason });
+      return;
+    }
+    if (intent.kind === "chat" && intent.text.length === 0) return;
+    setCommandError(null);
+    onDraftChange("");
+    onIntent(intent);
+  };
 
   return (
     <div className="shrink-0 border-t border-border bg-background px-3 pt-2 pb-2 sm:px-5 sm:pb-3">
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          onSend();
+          submit();
         }}
         className="mx-auto max-w-3xl"
       >
         <div className="rounded-lg border border-border bg-background shadow-[0_1px_2px_rgba(0,0,0,0.04)] transition-colors focus-within:border-ring">
-          <textarea
-            ref={ref}
-            value={draft}
-            onChange={(e) => onDraftChange(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-                e.preventDefault();
-                onSend();
-              }
-            }}
-            rows={1}
-            placeholder="Message OCG… (mock composer, runtime not connected)"
-            aria-label="Message OCG"
-            className="max-h-40 min-h-11 w-full resize-none bg-transparent px-3 pt-2.5 pb-1 text-[13.5px] outline-none placeholder:text-muted-foreground"
-          />
+          <div className="relative">
+            {suggestionsOpen && (
+              <ul
+                id="composer-suggestions"
+                role="listbox"
+                aria-label="Composer suggestions"
+                className="absolute inset-x-1 bottom-full z-20 mb-1 overflow-hidden rounded-md border border-border bg-popover text-popover-foreground shadow-md"
+              >
+                {suggestions.map((suggestion, index) => {
+                  const selected = activeIndex === index;
+                  return (
+                    <li key={suggestion.id} role="presentation">
+                      <button
+                        id={`composer-suggestion-${suggestion.id}`}
+                        type="button"
+                        role="option"
+                        aria-selected={selected}
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={() => applySuggestion(suggestion)}
+                        className={cn(
+                          "flex w-full items-start gap-2 px-2.5 py-2 text-left transition-colors hover:bg-muted",
+                          selected && "bg-muted",
+                        )}
+                      >
+                        <span className="mt-0.5 text-muted-foreground" aria-hidden="true">
+                          {suggestion.action === "create-mission"
+                            ? <Sparkles className="size-3.5" />
+                            : <Command className="size-3.5" />}
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block text-[12px] font-medium">{suggestion.label}</span>
+                          <span className="block truncate text-[11px] text-muted-foreground">{suggestion.description}</span>
+                        </span>
+                        {suggestion.command !== suggestion.label && (
+                          <span className="mt-0.5 shrink-0 font-mono text-[10px] text-muted-foreground">{suggestion.command.trim()}</span>
+                        )}
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+            <textarea
+              ref={ref}
+              value={draft}
+              onChange={(e) => {
+                setDismissedFor(null);
+                onDraftChange(e.target.value);
+              }}
+              onKeyDown={(e) => {
+                if (e.nativeEvent.isComposing) return;
+                if (e.key === "Escape" && suggestionsOpen) {
+                  e.preventDefault();
+                  closeSuggestions();
+                  return;
+                }
+                if (suggestionsOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+                  e.preventDefault();
+                  setHighlight({
+                    raw: draft,
+                    index: moveComposerSuggestionIndex(activeIndex, e.key === "ArrowDown" ? 1 : -1, suggestions.length),
+                  });
+                  return;
+                }
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  if (suggestionsOpen && activeIndex >= 0) {
+                    applySuggestion(suggestions[activeIndex]);
+                    return;
+                  }
+                  submit();
+                }
+              }}
+              rows={1}
+              placeholder="Message OCG… (type / for Mission commands)"
+              aria-label="Message OCG"
+              role="combobox"
+              aria-autocomplete="list"
+              aria-expanded={suggestionsOpen}
+              aria-controls={suggestionsOpen ? "composer-suggestions" : undefined}
+              aria-activedescendant={activeIndex >= 0 ? `composer-suggestion-${suggestions[activeIndex].id}` : undefined}
+              className="max-h-40 min-h-11 w-full resize-none bg-transparent px-3 pt-2.5 pb-1 text-[13.5px] outline-none placeholder:text-muted-foreground"
+            />
+          </div>
+          {error && (
+            <p role="alert" className="border-t border-border px-3 py-1.5 text-[11px] text-red-600 dark:text-red-400">
+              {error}
+            </p>
+          )}
           <div className="flex items-center gap-1 px-2 pb-2">
             <Button
               type="button"
@@ -332,7 +457,7 @@ function Composer({
               <Mic className="size-4" />
             </Button>
             <span className="ml-1 hidden text-[11px] text-muted-foreground sm:inline">
-              Enter to send · Shift+Enter for newline
+              / for Mission · Enter to send · Shift+Enter for newline
             </span>
             <Button
               type="submit"
@@ -359,9 +484,12 @@ function Composer({
 type ChatViewProps = {
   session: ChatSession;
   messages: ChatMessage[];
-  onSendMessage: (content: string) => void | Promise<void>;
   runtimeStatus: RuntimeStatus;
   mission?: Mission | null;
+  onComposerIntent: (intent: ComposerIntent) => void;
+  /** Structured command surfaces are composed by the shell, not selected here. */
+  composerSurface?: React.ReactNode;
+  composerSurfaceKey?: string | null;
 };
 
 const SUGGESTIONS = [
@@ -370,26 +498,27 @@ const SUGGESTIONS = [
   "List what Phase 2 needs from this mock state",
 ];
 
-export function ChatView({ session, messages, onSendMessage, runtimeStatus, mission }: ChatViewProps) {
+export function ChatView({
+  session,
+  messages,
+  runtimeStatus,
+  mission,
+  onComposerIntent,
+  composerSurface,
+  composerSurfaceKey,
+}: ChatViewProps) {
   const [draft, setDraft] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages.length, session.id]);
-
-  const send = () => {
-    const content = draft.trim();
-    if (!content) return;
-    void onSendMessage(content);
-    setDraft("");
-  };
+  }, [messages.length, session.id, composerSurfaceKey]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto" role="log" aria-label={`Conversation: ${session.title}`}>
-        {messages.length === 0 ? (
+        {messages.length === 0 && !composerSurface ? (
           <div className="relative mx-auto flex h-full max-w-3xl flex-col items-center justify-center px-5 py-10 text-center">
             <ActivityPulse className="size-20 opacity-80" label="OCG idle illustration" />
             <h2 className="mt-5 text-[15px] font-semibold tracking-tight">
@@ -414,30 +543,39 @@ export function ChatView({ session, messages, onSendMessage, runtimeStatus, miss
           </div>
         ) : (
           <div className="mx-auto flex max-w-3xl flex-col gap-5 px-3 py-5 sm:px-5">
-            <div className="flex items-center gap-2 text-[11px] text-muted-foreground" aria-hidden="true">
-              <span className="h-px flex-1 bg-border" />
-              <span>Today · mock history</span>
-              <span className="h-px flex-1 bg-border" />
-            </div>
+            {messages.length > 0 && (
+              <div className="flex items-center gap-2 text-[11px] text-muted-foreground" aria-hidden="true">
+                <span className="h-px flex-1 bg-border" />
+                <span>Today · mock history</span>
+                <span className="h-px flex-1 bg-border" />
+              </div>
+            )}
             {messages.map((m) => (
               <MessageRow key={m.id} message={m} />
             ))}
-            <div className="flex items-center gap-2 rounded-md border border-dashed border-border bg-muted/20 px-2.5 py-2 text-[12px] text-muted-foreground">
-              {runtimeStatus.state === "connected" ? (
-                <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
-              ) : (
-                <span className="size-1.5 rounded-full bg-muted-foreground" aria-hidden="true" />
-              )}
-              <span>
-                Runtime <span className="font-medium">{runtimeStatus.state}</span>
-                {mission ? ` · Mission ${mission.status}` : " · no Mission loaded"}
-                {runtimeStatus.detail ? ` · ${runtimeStatus.detail}` : ""}
-              </span>
-            </div>
+            {messages.length > 0 && (
+              <div className="flex items-center gap-2 rounded-md border border-dashed border-border bg-muted/20 px-2.5 py-2 text-[12px] text-muted-foreground">
+                {runtimeStatus.state === "connected" ? (
+                  <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
+                ) : (
+                  <span className="size-1.5 rounded-full bg-muted-foreground" aria-hidden="true" />
+                )}
+                <span>
+                  Runtime <span className="font-medium">{runtimeStatus.state}</span>
+                  {mission ? ` · Mission ${mission.status}` : " · no Mission loaded"}
+                  {runtimeStatus.detail ? ` · ${runtimeStatus.detail}` : ""}
+                </span>
+              </div>
+            )}
+            {composerSurface}
           </div>
         )}
       </div>
-      <Composer draft={draft} onDraftChange={setDraft} onSend={send} />
+      <Composer
+        draft={draft}
+        onDraftChange={setDraft}
+        onIntent={onComposerIntent}
+      />
     </div>
   );
 }

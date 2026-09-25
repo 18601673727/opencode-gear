@@ -1,10 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { ChatView } from "../chat/chat-view";
 import { MissionView } from "../mission/mission-view";
+import { MissionDraftSurface } from "../mission/mission-draft-surface";
 import { OcgSidebar } from "../sidebar/ocg-sidebar";
 import { OcgTopbar } from "../topbar/ocg-topbar";
 import { ResourceLedgerSurface } from "../resource-ledger/resource-ledger-surface";
@@ -29,8 +30,21 @@ import {
   selectProjectSnapshot,
 } from "../project/selectors";
 import { withProjectParam, type ProjectId } from "../project/domain";
+import { dispatchComposerIntent, type ComposerIntent } from "../composer/domain";
+import {
+  createMissionDraft,
+  draftScopeKey,
+  missionDraftReducer,
+  toMissionLaunchCommand,
+  type HardBudgetSource,
+  type MissionDraft,
+  type MissionDraftAction,
+  type MissionDraftTextField,
+} from "../mission/draft-domain";
+import type { MissionLaunchResult } from "../runtime/runtime-types";
+import type { WorkspaceView } from "./view-domain";
 
-export type WorkspaceView = "chat" | "home" | "attention" | "ledger" | "control-center" | "mission-control" | "logs" | "settings";
+export type { WorkspaceView } from "./view-domain";
 
 export function AppShell({
   scenario,
@@ -59,9 +73,10 @@ export function RuntimeWorkspace({
   view?: WorkspaceView;
   controlCenterView?: ControlCenterView;
 }) {
-  const { snapshot: runtimeSnapshot, createSession, sendMessage, setActiveProfile, cancel } = useOcgRuntime();
+  const { snapshot: runtimeSnapshot, createSession, sendMessage, setActiveProfile, cancel, launchMission } = useOcgRuntime();
   const {
     activeProjectId,
+    activeProject,
     projects,
     setActiveProject,
     registerProjectSession,
@@ -73,6 +88,12 @@ export function RuntimeWorkspace({
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [missionMode, setMissionMode] = useState<InspectorMode>("docked");
   const [mobileMissionOpen, setMobileMissionOpen] = useState(false);
+  // Mission drafts are held keyed by Project + session scope so one Project's
+  // in-progress launch can never appear in another.
+  const [missionDrafts, setMissionDrafts] = useState<Record<string, MissionDraft>>({});
+  const [visibleDraftScopes, setVisibleDraftScopes] = useState<Record<string, boolean>>({});
+  const [launchResults, setLaunchResults] = useState<Record<string, MissionLaunchResult>>({});
+  const activeDraftScopeRef = useRef<string | null>(null);
 
   // Project-scoped projection of the shared runtime snapshot. Every surface
   // below consumes this, so project switches cannot leak sessions, missions,
@@ -139,10 +160,195 @@ export function RuntimeWorkspace({
     if (view !== "chat") router.push(withProject("/"));
   }, [router, view, withProject]);
 
-  const handleSendMessage = useCallback(
-    (content: string) => activeSessionKey ? sendMessage(activeSessionKey, { content }) : undefined,
-    [activeSessionKey, sendMessage],
-  );
+  // --- Mission draft lifecycle (single pure reducer, scoped per Project) ----
+
+  const activeDraftScope = activeSession ? draftScopeKey(activeProjectId, activeSession.id) : null;
+  useEffect(() => {
+    activeDraftScopeRef.current = activeDraftScope;
+  }, [activeDraftScope]);
+  const activeDraft = activeDraftScope && visibleDraftScopes[activeDraftScope]
+    ? missionDrafts[activeDraftScope] ?? null
+    : null;
+  const activeLaunchResult = activeDraftScope ? launchResults[activeDraftScope] ?? null : null;
+
+  const dispatchDraft = useCallback((scopeKey: string, action: MissionDraftAction) => {
+    setMissionDrafts((current) => {
+      const draft = current[scopeKey];
+      if (!draft) return current;
+      const next = missionDraftReducer(draft, action);
+      if (next === draft) return current;
+      return { ...current, [scopeKey]: next };
+    });
+  }, []);
+
+  const handleCreateMissionDraft = useCallback((seed?: string) => {
+    if (!activeSession) return;
+    const scopeKey = draftScopeKey(activeProjectId, activeSession.id);
+    const existingDraft = missionDrafts[scopeKey];
+    setMissionDrafts((current) => {
+      const existing = current[scopeKey];
+      if (!existing) {
+        return {
+          ...current,
+          [scopeKey]: createMissionDraft({
+            projectId: activeProjectId,
+            sessionId: activeSession.id,
+            objective: seed,
+          }),
+        };
+      }
+      if (existing.lifecycle === "launched") {
+        // A completed draft is immutable. Opening the command again starts a
+        // new local draft identity rather than rendering a settled card whose
+        // Launch button would be a no-op.
+        return {
+          ...current,
+          [scopeKey]: createMissionDraft({
+            projectId: activeProjectId,
+            sessionId: activeSession.id,
+            objective: seed,
+            id: `${existing.id}:next`,
+          }),
+        };
+      }
+      if (seed && existing.objective.trim().length === 0) {
+        return {
+          ...current,
+          [scopeKey]: missionDraftReducer(existing, { type: "update-field", field: "objective", value: seed }),
+        };
+      }
+      return current;
+    });
+    if (existingDraft?.lifecycle === "launched") {
+      setLaunchResults((current) => {
+        if (!current[scopeKey]) return current;
+        const next = { ...current };
+        delete next[scopeKey];
+        return next;
+      });
+    }
+    setVisibleDraftScopes((current) => ({ ...current, [scopeKey]: true }));
+    setMobileNavOpen(false);
+    setMobileMissionOpen(false);
+  }, [activeProjectId, activeSession, missionDrafts]);
+
+  const handleCloseMissionDraft = useCallback(() => {
+    if (!activeDraftScope) return;
+    setVisibleDraftScopes((current) => ({ ...current, [activeDraftScope]: false }));
+  }, [activeDraftScope]);
+
+  const handleMissionDraftFieldChange = useCallback((field: MissionDraftTextField, value: string) => {
+    if (!activeDraftScope) return;
+    dispatchDraft(activeDraftScope, { type: "update-field", field, value });
+    setLaunchResults((current) => {
+      if (!current[activeDraftScope]) return current;
+      const next = { ...current };
+      delete next[activeDraftScope];
+      return next;
+    });
+  }, [activeDraftScope, dispatchDraft]);
+
+  const handleMissionDraftBudgetChange = useCallback((micros: number | null, source: HardBudgetSource) => {
+    if (!activeDraftScope) return;
+    dispatchDraft(activeDraftScope, { type: "set-hard-budget", micros, source });
+    setLaunchResults((current) => {
+      if (!current[activeDraftScope]) return current;
+      const next = { ...current };
+      delete next[activeDraftScope];
+      return next;
+    });
+  }, [activeDraftScope, dispatchDraft]);
+
+  const handleMissionDraftCommitmentChange = useCallback((value: number) => {
+    if (!activeDraftScope) return;
+    dispatchDraft(activeDraftScope, { type: "set-resource-commitment", value });
+    setLaunchResults((current) => {
+      if (!current[activeDraftScope]) return current;
+      const next = { ...current };
+      delete next[activeDraftScope];
+      return next;
+    });
+  }, [activeDraftScope, dispatchDraft]);
+
+  const handleMissionDraftValidate = useCallback(() => {
+    if (!activeDraftScope) return;
+    dispatchDraft(activeDraftScope, { type: "validate" });
+  }, [activeDraftScope, dispatchDraft]);
+
+  const handleLaunchMission = useCallback(() => {
+    if (!activeSession || !activeDraftScope) return;
+    const draft = missionDrafts[activeDraftScope];
+    if (!draft || draft.lifecycle === "launching" || draft.lifecycle === "launched") return;
+
+    const launching = missionDraftReducer(draft, { type: "start-launch" });
+    setMissionDrafts((current) => ({ ...current, [activeDraftScope]: launching }));
+    if (launching.lifecycle !== "launching") return;
+
+    const command = toMissionLaunchCommand(launching);
+    if (!command) {
+      setMissionDrafts((current) => ({
+        ...current,
+        [activeDraftScope]: missionDraftReducer(launching, {
+          type: "launch-failed",
+          message: "Draft validation failed before launch.",
+        }),
+      }));
+      return;
+    }
+
+    const settleLaunch = (result: MissionLaunchResult) => {
+      setMissionDrafts((current) => {
+        const currentDraft = current[activeDraftScope] ?? launching;
+        const settled = result.outcome === "accepted"
+          ? missionDraftReducer(currentDraft, {
+              type: "launch-succeeded",
+              missionId: result.missionId ?? command.draftId,
+              message: result.message,
+            })
+          : missionDraftReducer(currentDraft, { type: "launch-failed", message: result.message });
+        return { ...current, [activeDraftScope]: settled };
+      });
+      setLaunchResults((current) => ({ ...current, [activeDraftScope]: result }));
+
+      // A Project/session switch can happen while an adapter command is in
+      // flight. The old draft may settle in its own scope, but it must not
+      // navigate the operator away from the newly selected Project.
+      if (result.outcome === "accepted") {
+        setVisibleDraftScopes((current) => ({ ...current, [activeDraftScope]: false }));
+      }
+      if (result.outcome === "accepted" && activeDraftScopeRef.current === activeDraftScope) {
+        // Keep the same scenario so the in-memory runtime instance (and its
+        // freshly projected Mission execution) survives the navigation.
+        router.push(withProject(`/?view=mission-control&scenario=${encodeURIComponent(snapshot.scenario)}`));
+      }
+    };
+
+    void launchMission(command)
+      .then(settleLaunch)
+      .catch((error: unknown) => {
+        const message = error instanceof Error && error.message
+          ? error.message
+          : "The runtime adapter failed while launching this Mission.";
+        settleLaunch({
+          outcome: "failed",
+          commandId: command.commandId,
+          draftId: command.draftId,
+          projectId: command.projectId,
+          sessionId: command.sessionId,
+          message,
+          duplicate: false,
+        });
+      });
+  }, [activeDraftScope, activeSession, launchMission, missionDrafts, router, snapshot.scenario, withProject]);
+
+  const handleComposerIntent = useCallback((intent: ComposerIntent) => {
+    dispatchComposerIntent(intent, {
+      chat: ({ text }) => {
+        if (activeSessionKey) void sendMessage(activeSessionKey, { content: text });
+      },
+      "mission.create": ({ seed }) => handleCreateMissionDraft(seed),
+    });
+  }, [activeSessionKey, handleCreateMissionDraft, sendMessage]);
 
   const handleOpenChat = useCallback(() => {
     setMobileNavOpen(false);
@@ -407,7 +613,21 @@ export function RuntimeWorkspace({
                 messages={messages}
                 runtimeStatus={snapshot.status}
                 mission={mission}
-                onSendMessage={handleSendMessage}
+                onComposerIntent={handleComposerIntent}
+                composerSurface={activeDraft ? (
+                  <MissionDraftSurface
+                    project={activeProject}
+                    draft={activeDraft}
+                    launchResult={activeLaunchResult}
+                    onFieldChange={handleMissionDraftFieldChange}
+                    onBudgetChange={handleMissionDraftBudgetChange}
+                    onCommitmentChange={handleMissionDraftCommitmentChange}
+                    onValidate={handleMissionDraftValidate}
+                    onLaunch={handleLaunchMission}
+                    onClose={handleCloseMissionDraft}
+                  />
+                ) : null}
+                composerSurfaceKey={activeDraft?.id}
               />
             </div>
 

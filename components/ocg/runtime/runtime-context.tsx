@@ -3,7 +3,8 @@
 import { createContext, useCallback, useContext, useMemo, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import { MockOcgRuntimeClient } from "./mock-client";
-import type { CreateSessionInput, OcgRuntimeClient, ScenarioId } from "./runtime-types";
+import type { CreateSessionInput, MissionLaunchResult, OcgRuntimeClient, ScenarioId } from "./runtime-types";
+import type { MissionLaunchCommand } from "../mission/draft-domain";
 import type { ChatSession, SendMessageInput } from "../types";
 import type { RuntimeSnapshot } from "./runtime-types";
 import type { OnboardingStageId } from "../bootstrap/types";
@@ -19,6 +20,7 @@ type RuntimeContextValue = {
   completeOnboarding: () => Promise<void>;
   retryBootstrap: () => Promise<void>;
   setActiveProfile: (profileId: string) => Promise<void>;
+  launchMission: (command: MissionLaunchCommand) => Promise<MissionLaunchResult>;
 };
 
 const RuntimeContext = createContext<RuntimeContextValue | null>(null);
@@ -56,6 +58,20 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
   const setActiveProfile = useCallback(async (profileId: string) => {
     await client.setActiveProfile?.(profileId);
   }, [client]);
+  const launchMission = useCallback(async (command: MissionLaunchCommand): Promise<MissionLaunchResult> => {
+    if (!client.launchMission) {
+      return {
+        outcome: "failed",
+        commandId: command.commandId,
+        draftId: command.draftId,
+        projectId: command.projectId,
+        sessionId: command.sessionId,
+        message: "This runtime client does not support Mission launch.",
+        duplicate: false,
+      };
+    }
+    return client.launchMission(command);
+  }, [client]);
 
   const value = useMemo(
     () => ({
@@ -69,8 +85,9 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
       completeOnboarding,
       retryBootstrap,
       setActiveProfile,
+      launchMission,
     }),
-    [cancel, client, completeOnboarding, createSession, requestAccessHandoff, retryBootstrap, sendMessage, setActiveProfile, setOnboardingStage, snapshot],
+    [cancel, client, completeOnboarding, createSession, launchMission, requestAccessHandoff, retryBootstrap, sendMessage, setActiveProfile, setOnboardingStage, snapshot],
   );
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;
 }
