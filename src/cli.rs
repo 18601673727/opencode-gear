@@ -384,6 +384,11 @@ where
             continue;
         }
         if text == "-h" || text == "--help" {
+            if command_token.as_deref() == Some("config") {
+                rest.push(args[index].clone());
+                index += 1;
+                continue;
+            }
             command_token = Some("help".to_string());
             break;
         }
@@ -2412,41 +2417,259 @@ fn versions_equivalent(a: &str, b: &str) -> bool {
     }
 }
 
-/// Severity-tracked doctor output.
-///
-/// Every line is one of PASS / INFO / WARN / FAIL. Only FAIL makes `ocg doctor`
-/// exit non-zero, so a warning never fails a scripted smoke. The counters are
-/// deterministic for a fixed environment, which is what the doctor tests assert.
+/// One logical doctor section. Rendering follows this fixed order, so the layout
+/// is stable as checks are added and a check is grouped by its owner regardless
+/// of the order in which diagnostics happen to run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Environment,
+    Configuration,
+    Lead,
+    Workers,
+    Runtime,
+    Effective,
+    Infrastructure,
+}
+
+impl Section {
+    const ALL: [Section; 7] = [
+        Section::Environment,
+        Section::Configuration,
+        Section::Lead,
+        Section::Workers,
+        Section::Runtime,
+        Section::Effective,
+        Section::Infrastructure,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            Section::Environment => 0,
+            Section::Configuration => 1,
+            Section::Lead => 2,
+            Section::Workers => 3,
+            Section::Runtime => 4,
+            Section::Effective => 5,
+            Section::Infrastructure => 6,
+        }
+    }
+
+    /// Concise human-facing name; the section header is the only place these
+    /// titles appear, so they never become a check label.
+    fn title(self) -> &'static str {
+        match self {
+            Section::Environment => "Environment & Proxy",
+            Section::Configuration => "Configuration",
+            Section::Lead => "Lead",
+            Section::Workers => "Workers",
+            Section::Runtime => "Runtime",
+            Section::Effective => "Effective State",
+            Section::Infrastructure => "Project Infrastructure",
+        }
+    }
+}
+
+/// Severity of one check. The token is the stable, color-free status carrier.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DoctorStatus {
+    Pass,
+    Info,
+    Warn,
+    Fail,
+}
+
+impl DoctorStatus {
+    /// The historical string keys are the contract; unknown keys are INFO, as
+    /// before.
+    fn from_key(key: &str) -> Self {
+        match key {
+            "ok" => DoctorStatus::Pass,
+            "warn" => DoctorStatus::Warn,
+            "error" | "fail" => DoctorStatus::Fail,
+            _ => DoctorStatus::Info,
+        }
+    }
+
+    fn token(self) -> &'static str {
+        match self {
+            DoctorStatus::Pass => "PASS",
+            DoctorStatus::Info => "INFO",
+            DoctorStatus::Warn => "WARN",
+            DoctorStatus::Fail => "FAIL",
+        }
+    }
+}
+
+/// One recorded check. `continuation` carries secondary metadata (paths,
+/// provenance) that should sit on indented lines rather than stretch the
+/// primary detail.
+struct DoctorCheck {
+    status: DoctorStatus,
+    label: String,
+    detail: String,
+    continuation: Vec<String>,
+}
+
 #[derive(Default)]
-struct Doctor {
+struct DoctorCounts {
     passed: usize,
     warnings: usize,
     failures: usize,
     infos: usize,
 }
 
-impl Doctor {
-    fn line(&mut self, status: &str, label: &str, detail: &str) {
-        let token = match status {
-            "ok" => {
-                self.passed += 1;
-                "PASS"
-            }
-            "warn" => {
-                self.warnings += 1;
-                "WARN"
-            }
-            "error" | "fail" => {
-                self.failures += 1;
-                "FAIL"
-            }
-            _ => {
-                self.infos += 1;
-                "INFO"
-            }
-        };
-        println!("  {label:<18} [{token}] {detail}");
+/// Doctor output is collected as structured checks and rendered once, so the
+/// status column never depends on label length and the summary counters derive
+/// from the very checks that were rendered. Diagnostic collection and terminal
+/// rendering stay separate; only FAIL affects the exit status.
+struct Doctor {
+    current: Section,
+    sections: [Vec<DoctorCheck>; 7],
+}
+
+impl Default for Doctor {
+    fn default() -> Self {
+        Doctor {
+            current: Section::Environment,
+            sections: std::array::from_fn(|_| Vec::new()),
+        }
     }
+}
+
+/// Rendered width before a detail wraps. Chosen for ordinary terminals; a single
+/// unbreakable token (a path or URL) may still exceed it.
+const DOCTOR_WIDTH: usize = 100;
+/// Bounded label column so a long label cannot push the detail arbitrarily far.
+const DOCTOR_LABEL_MAX: usize = 28;
+/// Floor for the label column when few or short labels are present.
+const DOCTOR_LABEL_MIN: usize = 18;
+
+impl Doctor {
+    fn section(&mut self, section: Section) {
+        self.current = section;
+    }
+
+    fn line(&mut self, status: &str, label: &str, detail: &str) {
+        self.push(status, label, detail, Vec::new());
+    }
+
+    /// A check whose secondary metadata belongs on indented continuation lines.
+    fn line_with(&mut self, status: &str, label: &str, detail: &str, continuation: Vec<String>) {
+        self.push(status, label, detail, continuation);
+    }
+
+    fn push(&mut self, status: &str, label: &str, detail: &str, continuation: Vec<String>) {
+        self.sections[self.current.index()].push(DoctorCheck {
+            status: DoctorStatus::from_key(status),
+            label: label.to_string(),
+            detail: detail.to_string(),
+            continuation,
+        });
+    }
+
+    fn counts(&self) -> DoctorCounts {
+        let mut counts = DoctorCounts::default();
+        for check in self.sections.iter().flatten() {
+            match check.status {
+                DoctorStatus::Pass => counts.passed += 1,
+                DoctorStatus::Info => counts.infos += 1,
+                DoctorStatus::Warn => counts.warnings += 1,
+                DoctorStatus::Fail => counts.failures += 1,
+            }
+        }
+        counts
+    }
+
+    fn failures(&self) -> usize {
+        self.counts().failures
+    }
+
+    /// The label column is derived from the checks actually present (bounded),
+    /// not from another arbitrary fixed constant.
+    fn label_width(&self) -> usize {
+        self.sections
+            .iter()
+            .flatten()
+            .map(|check| check.label.chars().count())
+            .max()
+            .unwrap_or(DOCTOR_LABEL_MIN)
+            .clamp(DOCTOR_LABEL_MIN, DOCTOR_LABEL_MAX)
+    }
+
+    fn render(&self) {
+        let width = self.label_width();
+        println!("OpenCode Gear doctor");
+        for section in Section::ALL {
+            let checks = &self.sections[section.index()];
+            if checks.is_empty() {
+                continue;
+            }
+            // One blank line between logical sections.
+            println!();
+            println!("{}", section.title());
+            for check in checks {
+                render_check(check, width);
+            }
+        }
+        let counts = self.counts();
+        println!();
+        println!("Summary");
+        println!(
+            "  {} passed · {} warnings · {} failures · {} informational",
+            counts.passed, counts.warnings, counts.failures, counts.infos
+        );
+    }
+}
+
+/// Render one check status-first: `  [PASS] label  detail`, wrapping the detail
+/// and any continuation metadata onto aligned indented lines. Status placement
+/// never depends on label length.
+fn render_check(check: &DoctorCheck, width: usize) {
+    let prefix = format!("  [{}] ", check.status.token());
+    let label = format!("{:<width$}", check.label);
+    let detail_column = prefix.chars().count() + width + 2;
+    let indent = " ".repeat(detail_column);
+    let available = DOCTOR_WIDTH.saturating_sub(detail_column).max(24);
+    let mut bodies: Vec<String> = Vec::new();
+    if !check.detail.is_empty() {
+        bodies.extend(wrap_lines(&check.detail, available));
+    }
+    for continuation in &check.continuation {
+        bodies.extend(wrap_lines(continuation, available));
+    }
+    match bodies.split_first() {
+        None => println!("{prefix}{label}"),
+        Some((first, rest)) => {
+            println!("{prefix}{label}  {first}");
+            for line in rest {
+                println!("{indent}{line}");
+            }
+        }
+    }
+}
+
+/// Greedy whitespace wrap. An unbreakable token longer than the available width
+/// (a path, URL or identifier) is kept intact rather than split, so provenance
+/// is never corrupted.
+fn wrap_lines(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.chars().count() + 1 + word.chars().count() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 /// Whether a standard proxy variable (either spelling) is set and non-empty.
@@ -2474,8 +2697,6 @@ fn doctor_command(
     effective_state: bool,
 ) -> std::result::Result<i32, Failure> {
     let mut doctor = Doctor::default();
-    println!("OpenCode Gear doctor");
-
     let proxy = resolve_proxy(disable_proxy);
     print_proxy_diagnostics(&mut doctor, &proxy);
     print_proxy_env_diagnostics(&mut doctor, &proxy, disable_proxy);
@@ -2515,7 +2736,7 @@ fn doctor_command(
 
     // Config layering: which layer each override came from, and whether it was
     // found. This is the section a user reads when "my override does nothing".
-    println!("config layering");
+    doctor.section(Section::Configuration);
     match effective.gear_home.as_ref() {
         Some(home) => doctor.line(
             "ok",
@@ -2549,7 +2770,7 @@ fn doctor_command(
     }
 
     // The effective Lead contracts. Throttle only ever changes the Lead.
-    println!("effective Lead contracts");
+    doctor.section(Section::Lead);
     match report::throttle_rows(effective) {
         Ok(rows) => {
             for (row_level, full, variant) in rows {
@@ -2581,7 +2802,7 @@ fn doctor_command(
 
     // The Worker Router, independent of the throttle. Only role names and
     // provider/model ids are printed; no credential ever reaches this section.
-    println!("worker router (independent of throttle)");
+    doctor.section(Section::Workers);
     match model::routing_rows(&effective.data) {
         Ok(rows) => {
             for (role, agent, _provider, full) in rows {
@@ -2601,6 +2822,9 @@ fn doctor_command(
         }
     }
 
+    // Static validity belongs with the configuration it validates, even though
+    // the runtime report below needs it; the renderer groups by section.
+    doctor.section(Section::Configuration);
     let errors = validate::validate(effective);
     let static_config_valid = errors.is_empty();
     if static_config_valid {
@@ -2616,6 +2840,7 @@ fn doctor_command(
         doctor.line("fail", "static config/routing", &errors.join("; "));
     }
 
+    doctor.section(Section::Runtime);
     let clock = SystemClock;
     let policy = RuntimePolicy::from_config(&effective.data).unwrap_or_default();
     let report = match platform {
@@ -2636,23 +2861,22 @@ fn doctor_command(
     };
 
     if report.installed() {
-        doctor.line(
-            "ok",
-            "runtime",
-            &format!(
-                "{} ({}) {}",
-                describe_runtime_version(report.version.as_ref()),
-                report
-                    .source
-                    .map(|source| source.label())
-                    .unwrap_or("unknown"),
-                report
-                    .path
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_default()
-            ),
+        let source = report
+            .source
+            .map(|source| source.label())
+            .unwrap_or("unknown");
+        let detail = format!(
+            "{} ({source})",
+            describe_runtime_version(report.version.as_ref())
         );
+        // The path is secondary provenance: keep it on an indented line rather
+        // than stretching the primary runtime scan line.
+        match &report.path {
+            Some(path) => {
+                doctor.line_with("ok", "runtime", &detail, vec![path.display().to_string()])
+            }
+            None => doctor.line("ok", "runtime", &detail),
+        }
     } else if let Some(error) = &report.error {
         doctor.line("fail", "runtime", error);
     } else {
@@ -2672,7 +2896,7 @@ fn doctor_command(
     // OpenCode installation. `report` is the runtime OCG would launch; the
     // system PATH binary is reported separately so an obvious version split
     // between a managed runtime and an ambient install is visible.
-    println!("OpenCode");
+    doctor.section(Section::Runtime);
     let system_binary = process.find_in_path("opencode");
     let system_version = system_binary
         .as_ref()
@@ -2741,7 +2965,7 @@ fn doctor_command(
         }
     };
 
-    println!("runtime models");
+    doctor.section(Section::Runtime);
     // Captured for the optional effective-state check below so the catalogue is
     // probed at most once per doctor run.
     let mut runtime_content: Option<String> = None;
@@ -2860,7 +3084,7 @@ fn doctor_command(
     // Configured / Resolved / Effective. The effective state is only proven by
     // talking to a real runtime, so it is opt-in: `ocg doctor --effective`
     // starts a bounded, OCG-owned private server and terminates it again.
-    println!("runtime state");
+    doctor.section(Section::Effective);
     if effective_state {
         match build_runtime_state(
             effective,
@@ -2938,6 +3162,9 @@ fn doctor_command(
         );
     }
 
+    // Local artifacts and optional subsystems: nothing above touches them, so
+    // they share one scannable infrastructure block.
+    doctor.section(Section::Infrastructure);
     let runtime_root = Layout::new(project_root).runtime_root();
     if is_writable_dir(&runtime_root) {
         doctor.line(
@@ -3374,12 +3601,8 @@ fn doctor_command(
         Err(error) => doctor.line("warn", "orchestration", &error.to_string()),
     }
 
-    println!("doctor summary");
-    println!(
-        "  {} passed, {} warnings, {} failures ({} informational)",
-        doctor.passed, doctor.warnings, doctor.failures, doctor.infos
-    );
-    Ok(if doctor.failures == 0 { 0 } else { 1 })
+    doctor.render();
+    Ok(if doctor.failures() == 0 { 0 } else { 1 })
 }
 
 /// Proxy mode, endpoints and non-SOCKS notes. Values are always rendered
@@ -3434,7 +3657,7 @@ fn print_proxy_diagnostics(doctor: &mut Doctor, proxy: &ProxySelection) {
 /// verbatim for the child OpenCode process, and no OCG network operation
 /// depends on it.
 fn print_proxy_env_diagnostics(doctor: &mut Doctor, proxy: &ProxySelection, disable_proxy: bool) {
-    println!("environment / proxy");
+    doctor.section(Section::Environment);
     for name in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"] {
         if proxy_env_present(name) {
             doctor.line("info", name, "present (value never shown)");

@@ -838,14 +838,214 @@ fn the_project_layer_override_is_reported_explicitly() {
             "--yes",
         ],
     );
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_ne!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
     let text = stdout(&output);
-    assert!(text.contains("the project value wins"), "{text}");
-    // The user layer still records the requested change.
-    let written = read_yaml(&user);
+    assert!(text.contains("NOT EFFECTIVE"), "{text}");
+    assert!(text.contains("openai/gpt-6-astra"), "{text}");
+    assert!(!user.exists(), "shadowed user layer must not be written");
+}
+
+#[test]
+fn default_lead_scope_updates_the_effective_project_owner() {
+    let dir = TestDir::new();
+    let project = project(&dir);
+    let user = user_path(&dir);
+    write_yaml(
+        &user,
+        &json!({"throttle": {"levels": {"low": {"model": "kimi-k3"}}}}),
+    );
+    let project_file = project.join(".opencode-gear.yaml");
+    write_yaml(
+        &project_file,
+        &json!({"throttle": {"levels": {"low": {"model": "sol"}}}}),
+    );
+    let before = read_yaml(&user);
+    let output = run(
+        &project,
+        &dir,
+        &user,
+        &[
+            "config",
+            "lead",
+            "low",
+            "--model",
+            "volcengine-coding-plan/kimi-k3",
+            "--yes",
+            "--no-activate",
+        ],
+    );
     assert_eq!(
-        written["throttle"]["levels"]["low"]["model"],
+        output.status.code(),
+        Some(0),
+        "{} {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let text = stdout(&output);
+    assert!(
+        text.contains("requested: volcengine-coding-plan/kimi-k3"),
+        "{text}"
+    );
+    assert!(
+        text.contains("written:   volcengine-coding-plan/kimi-k3"),
+        "{text}"
+    );
+    assert!(
+        text.contains("effective config: volcengine-coding-plan/kimi-k3"),
+        "{text}"
+    );
+    assert!(text.contains("scope:    project (auto-selected"), "{text}");
+    assert_eq!(read_yaml(&user), before);
+    assert_eq!(
+        read_yaml(&project_file)["throttle"]["levels"]["low"]["model"],
         json!("kimi-k3")
+    );
+    let table = run(&project, &dir, &user, &["config", "lead"]);
+    assert!(stdout(&table).contains("volcengine-coding-plan/kimi-k3"));
+}
+
+#[test]
+fn provider_missing_fields_are_reported_together_and_help_is_successful() {
+    let dir = TestDir::new();
+    let project = project(&dir);
+    let user = user_path(&dir);
+    for args in [
+        vec!["config", "provider", "add-openai-compatible", "nexo-openai"],
+        vec![
+            "config",
+            "provider",
+            "add-openai-compatible",
+            "nexo-openai",
+            "--base-url",
+            "https://www.nexotoken.net/v1",
+        ],
+    ] {
+        let output = run(&project, &dir, &user, &args);
+        assert_ne!(output.status.code(), Some(0));
+        let text = stderr(&output);
+        for missing in ["--api-key-env VAR", "--model ID", "--yes"] {
+            assert!(text.contains(missing), "{text}");
+        }
+        if args.len() == 4 {
+            assert!(text.contains("--base-url URL"), "{text}");
+        }
+    }
+    for args in [
+        vec!["config", "--help"],
+        vec!["config", "lead", "--help"],
+        vec!["config", "provider", "--help"],
+        vec!["config", "provider", "add-openai-compatible", "--help"],
+    ] {
+        let output = run(&project, &dir, &user, &args);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        assert!(stdout(&output).contains("ocg config"));
+    }
+}
+
+#[test]
+fn complete_nexo_provider_command_registers_all_models_without_a_secret() {
+    let dir = TestDir::new();
+    let project = project(&dir);
+    let user = user_path(&dir);
+    let output = run(
+        &project,
+        &dir,
+        &user,
+        &[
+            "config",
+            "provider",
+            "add-openai-compatible",
+            "nexo-openai",
+            "--base-url",
+            "https://www.nexotoken.net/v1",
+            "--api-key-env",
+            "NEXO_API_KEY",
+            "--model",
+            "gpt-5.5",
+            "--model",
+            "gpt-5.6-sol",
+            "--model",
+            "gpt-5.6-terra",
+            "--model",
+            "gpt-6-astra",
+            "--model",
+            "gpt-6-luna",
+            "--model",
+            "gpt-6-sol",
+            "--yes",
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{} {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let written = read_yaml(&user);
+    let provider = &written["opencode"]["provider"]["nexo-openai"];
+    assert_eq!(provider["models"].as_object().unwrap().len(), 6);
+    assert_eq!(provider["options"]["apiKey"], json!("{env:NEXO_API_KEY}"));
+    assert!(!fs::read_to_string(&user).unwrap().contains("sk-live"));
+}
+
+#[test]
+fn interactive_lead_uses_project_owner_and_provider_registration_is_secret_free() {
+    let dir = TestDir::new();
+    let project = project(&dir);
+    let user = user_path(&dir);
+    write_yaml(
+        &project.join(".opencode-gear.yaml"),
+        &json!({"throttle": {"levels": {"low": {"model": "sol"}}}}),
+    );
+    let fake = fake_opencode(&dir, "fake-ok", Some("volcengine-coding-plan/kimi-k3"));
+    let mut child = base_command(&project, &dir, &user)
+        .env("OPENCODE_GEAR_OPENCODE_BIN", &fake)
+        .arg("config")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("wizard");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"2\nlow\nvolcengine-coding-plan/kimi-k3\n\n\ny\n0\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{} {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(stdout(&output).contains("source: project"));
+    assert_eq!(
+        read_yaml(&project.join(".opencode-gear.yaml"))["throttle"]["levels"]["low"]["model"],
+        json!("kimi-k3")
+    );
+    assert!(!user.exists());
+    let mut child = base_command(&project, &dir, &user)
+        .arg("config")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"3\nnexo-openai\nhttps://www.nexotoken.net/v1\nNEXO_API_KEY\ngpt-5.5,gpt-6-sol\n\ny\n0\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{} {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_eq!(
+        read_yaml(&user)["opencode"]["provider"]["nexo-openai"]["options"]["apiKey"],
+        json!("{env:NEXO_API_KEY}")
     );
 }
 

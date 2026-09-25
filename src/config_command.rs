@@ -59,6 +59,7 @@ pub const OPENAI_COMPATIBLE_NPM: &str = "@ai-sdk/openai-compatible";
 /// Which configuration layer a write targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
+    Auto,
     User,
     Project,
 }
@@ -66,6 +67,7 @@ pub enum Scope {
 impl Scope {
     pub fn as_str(self) -> &'static str {
         match self {
+            Scope::Auto => "auto",
             Scope::User => "user",
             Scope::Project => "project",
         }
@@ -73,6 +75,7 @@ impl Scope {
 
     fn parse(raw: &str) -> Option<Scope> {
         match raw {
+            "auto" | "effective" => Some(Scope::Auto),
             "user" => Some(Scope::User),
             "project" => Some(Scope::Project),
             _ => None,
@@ -83,6 +86,7 @@ impl Scope {
 /// One parsed `ocg config` invocation.
 #[derive(Debug)]
 pub enum Request {
+    Help(&'static str),
     /// No subcommand: the numbered menu.
     Interactive,
     /// `ocg config lead` without a level: report the effective Lead table.
@@ -190,6 +194,9 @@ pub fn parse_request(args: &[OsString]) -> Result<Request> {
     let Some(first) = words.first() else {
         return Ok(Request::Interactive);
     };
+    if first == "--help" || first == "-h" {
+        return Ok(Request::Help(CONFIG_HELP));
+    }
     match first.as_str() {
         "lead" => parse_lead(&words[1..]),
         "provider" => parse_provider(&words[1..]),
@@ -209,6 +216,10 @@ pub fn execute(
     output: &mut dyn Write,
 ) -> Result<i32> {
     match request {
+        Request::Help(text) => {
+            emit!(output, "{text}")?;
+            Ok(0)
+        }
         Request::Interactive => interactive(ctx, probe, activate, input, output),
         Request::ShowLead => {
             print_lead_table(ctx, output)?;
@@ -262,8 +273,11 @@ pub fn execute(
 // ---------------------------------------------------------------------------
 
 fn parse_lead(words: &[String]) -> Result<Request> {
+    if words == ["--help"] || words == ["-h"] {
+        return Ok(Request::Help(LEAD_HELP));
+    }
     let mut level: Option<String> = None;
-    let mut scope = Scope::User;
+    let mut scope = Scope::Auto;
     let mut model: Option<String> = None;
     let mut variant: Option<String> = None;
     let mut yes = false;
@@ -285,7 +299,7 @@ fn parse_lead(words: &[String]) -> Result<Request> {
                     .get(index + 1)
                     .ok_or_else(|| usage("--scope needs a value"))?;
                 scope = Scope::parse(value)
-                    .ok_or_else(|| usage("--scope must be 'user' or 'project'"))?;
+                    .ok_or_else(|| usage("--scope must be 'auto', 'user' or 'project'"))?;
                 index += 2;
             }
             "--model" => {
@@ -305,7 +319,7 @@ fn parse_lead(words: &[String]) -> Result<Request> {
             _ => {
                 if let Some(value) = word.strip_prefix("--scope=") {
                     scope = Scope::parse(value)
-                        .ok_or_else(|| usage("--scope must be 'user' or 'project'"))?;
+                        .ok_or_else(|| usage("--scope must be 'auto', 'user' or 'project'"))?;
                     index += 1;
                 } else if let Some(value) = word.strip_prefix("--model=") {
                     model = Some(value.to_string());
@@ -344,14 +358,18 @@ fn parse_lead(words: &[String]) -> Result<Request> {
 
 fn parse_provider(words: &[String]) -> Result<Request> {
     let Some(action) = words.first() else {
-        return Err(usage(
-            "usage: ocg config provider add-openai-compatible <name> --base-url URL --api-key-env VAR --model ID [--model ID...]",
-        ));
+        return Ok(Request::Help(PROVIDER_HELP));
     };
+    if action == "--help" || action == "-h" {
+        return Ok(Request::Help(PROVIDER_HELP));
+    }
     if action != "add-openai-compatible" {
         return Err(usage(format!(
             "unknown provider action: '{action}' (only 'add-openai-compatible' exists)"
         )));
+    }
+    if words.len() == 2 && (words[1] == "--help" || words[1] == "-h") {
+        return Ok(Request::Help(PROVIDER_ADD_HELP));
     }
     let mut name: Option<String> = None;
     let mut scope = Scope::User;
@@ -371,8 +389,7 @@ fn parse_provider(words: &[String]) -> Result<Request> {
                 let value = words
                     .get(index + 1)
                     .ok_or_else(|| usage("--scope needs a value"))?;
-                scope = Scope::parse(value)
-                    .ok_or_else(|| usage("--scope must be 'user' or 'project'"))?;
+                scope = provider_scope(value)?;
                 index += 2;
             }
             "--base-url" => {
@@ -404,8 +421,7 @@ fn parse_provider(words: &[String]) -> Result<Request> {
             }
             _ => {
                 if let Some(value) = word.strip_prefix("--scope=") {
-                    scope = Scope::parse(value)
-                        .ok_or_else(|| usage("--scope must be 'user' or 'project'"))?;
+                    scope = provider_scope(value)?;
                     index += 1;
                 } else if let Some(value) = word.strip_prefix("--base-url=") {
                     base_url = Some(value.to_string());
@@ -427,22 +443,50 @@ fn parse_provider(words: &[String]) -> Result<Request> {
             }
         }
     }
-    let name = name.ok_or_else(|| usage("add-openai-compatible needs a provider name"))?;
-    let base_url = base_url.ok_or_else(|| usage("add-openai-compatible needs --base-url"))?;
-    let api_key_env =
-        api_key_env.ok_or_else(|| usage("add-openai-compatible needs --api-key-env"))?;
+    let mut missing = Vec::new();
+    if name.is_none() {
+        missing.push("missing: provider name <name>".to_string());
+    }
+    if base_url.is_none() {
+        missing.push("missing: --base-url URL".to_string());
+    }
+    if api_key_env.is_none() {
+        missing.push("missing: --api-key-env VAR".to_string());
+    }
     if models.is_empty() {
-        return Err(usage("add-openai-compatible needs at least one --model"));
+        missing.push("missing: --model ID (at least one)".to_string());
+    }
+    if !yes {
+        missing.push("missing confirmation: --yes".to_string());
+    }
+    if !missing.is_empty() {
+        return Err(usage(format!(
+            "invalid provider configuration:\n  {}",
+            missing.join("\n  ")
+        )));
     }
     Ok(Request::ProviderAdd {
-        name,
+        name: name.expect("validated"),
         scope,
-        base_url,
-        api_key_env,
+        base_url: base_url.expect("validated"),
+        api_key_env: api_key_env.expect("validated"),
         models,
         yes,
     })
 }
+
+fn provider_scope(raw: &str) -> Result<Scope> {
+    match raw {
+        "user" => Ok(Scope::User),
+        "project" => Ok(Scope::Project),
+        _ => Err(usage("provider --scope must be 'user' or 'project'")),
+    }
+}
+
+const CONFIG_HELP: &str = "ocg config\n\n  With no subcommand, start the interactive configuration wizard.\n\nCommands:\n  lead [low|mid|high]  show or change the effective Lead\n  provider             manage providers\n\nInteractive alternative: ocg config";
+const LEAD_HELP: &str = "ocg config lead <level> --model PROVIDER/MODEL [--variant VARIANT] [--scope auto|user|project] --yes\n\nOmitted --scope means effective/auto ownership: the layer currently owning the effective level is changed.\n--scope user or --scope project deliberately targets that layer; a shadowed lower layer is never reported as effective.\nChanging --model clears an inherited variant unless --variant is supplied.\nUse --no-activate to skip runtime activation/read-back.";
+const PROVIDER_HELP: &str = "ocg config provider\n\n  add-openai-compatible  register an OpenAI-compatible provider\n\nUse `ocg config provider add-openai-compatible --help` for the complete contract.";
+const PROVIDER_ADD_HELP: &str = "ocg config provider add-openai-compatible <name> \\\n  --base-url URL \\\n  --api-key-env VAR \\\n  --model ID [--model ID ...] \\\n  [--scope user|project] \\\n  --yes\n\n--model is repeatable. The API-key environment-variable NAME is stored; the secret is never accepted or persisted.\nWithout --scope, providers default to user scope. `--yes` confirms the write.\nInteractive alternative: ocg config.";
 
 // ---------------------------------------------------------------------------
 // Lead changes
@@ -489,6 +533,31 @@ fn apply_lead(
             "unknown throttle level: '{level}' (available: {available})"
         )));
     }
+    let auto = scope == Scope::Auto;
+    let scope = if auto {
+        effective_owner(ctx, level)
+    } else {
+        scope
+    };
+    if scope == Scope::User && layer_sets_lead(&ctx.project_path, level) {
+        emit!(
+            output,
+            "ocg config: NOT EFFECTIVE: project configuration {} owns throttle '{level}'",
+            ctx.project_path.display()
+        )?;
+        emit!(
+            output,
+            "  requested: {}",
+            model_arg.unwrap_or("current model (variant change)")
+        )?;
+        emit!(
+            output,
+            "  effective: {}",
+            model::lead_contract(&ctx.current.data, level)?.full_model_id()
+        )?;
+        emit!(output, "  use --scope project or omit --scope to update the effective Lead; user config is unchanged")?;
+        return Ok(1);
+    }
     let path = layer_path(ctx, scope);
     guard_writable(&path, scope)?;
     let mut layer = read_layer(&path)?;
@@ -512,6 +581,24 @@ fn apply_lead(
     }
 
     let candidate = candidate_effective(ctx, scope, &layer)?;
+    let requested = created
+        .as_ref()
+        .map(|model| format!("{}/{}", model.provider, model.id))
+        .unwrap_or_else(|| {
+            model::lead_contract(&ctx.current.data, level)
+                .map(|lead| lead.full_model_id())
+                .unwrap_or_default()
+        });
+    let candidate_lead = model::lead_contract(&candidate.data, level)?;
+    if candidate_lead.full_model_id() != requested {
+        emit!(
+            output,
+            "ocg config: NOT EFFECTIVE: requested {requested}, candidate effective {}",
+            candidate_lead.full_model_id()
+        )?;
+        emit!(output, "  config unchanged: {}", path.display())?;
+        return Ok(1);
+    }
     let errors = validate::validate(&candidate);
     if !errors.is_empty() {
         emit!(
@@ -550,8 +637,9 @@ fn apply_lead(
     // activation was already computed without mutating state and can only
     // *report* a mismatch, never leave a half-written file behind.
     report_lead(
-        ctx,
         scope,
+        auto,
+        &requested,
         level,
         &path,
         &candidate,
@@ -895,8 +983,17 @@ fn validate_model_id(id: &str) -> Result<()> {
 
 fn layer_path(ctx: &Context, scope: Scope) -> PathBuf {
     match scope {
+        Scope::Auto => unreachable!("auto scope must be resolved before selecting a layer"),
         Scope::User => ctx.user_path.clone(),
         Scope::Project => ctx.project_path.clone(),
+    }
+}
+
+fn effective_owner(ctx: &Context, level: &str) -> Scope {
+    if layer_sets_lead(&ctx.project_path, level) {
+        Scope::Project
+    } else {
+        Scope::User
     }
 }
 
@@ -958,6 +1055,7 @@ fn write_layer(path: &Path, layer: &Value) -> Result<()> {
 /// Build the configuration that the write *would* produce.
 fn candidate_effective(ctx: &Context, scope: Scope, layer: &Value) -> Result<Effective> {
     let (user_overlay, project_overlay) = match scope {
+        Scope::Auto => unreachable!("auto scope must be resolved before candidate building"),
         Scope::User => (Some(layer.clone()), read_optional_layer(&ctx.project_path)?),
         Scope::Project => (read_optional_layer(&ctx.user_path)?, Some(layer.clone())),
     };
@@ -1012,8 +1110,9 @@ fn probe_runtime(
 
 #[allow(clippy::too_many_arguments)]
 fn report_lead(
-    ctx: &Context,
     scope: Scope,
+    auto: bool,
+    requested: &str,
     level: &str,
     path: &Path,
     candidate: &Effective,
@@ -1024,8 +1123,19 @@ fn report_lead(
 ) -> Result<()> {
     let contract = model::lead_contract(&candidate.data, level)?;
     emit!(output, "ocg: Lead for throttle '{level}' updated")?;
-    emit!(output, "  scope:    {}", scope.as_str())?;
-    emit!(output, "  model:    {}", contract.full_model_id())?;
+    emit!(output, "  requested: {requested}")?;
+    emit!(output, "  written:   {}", contract.full_model_id())?;
+    emit!(
+        output,
+        "  scope:    {}{}",
+        scope.as_str(),
+        if auto {
+            " (auto-selected effective owner)"
+        } else {
+            ""
+        }
+    )?;
+    emit!(output, "  effective config: {}", contract.full_model_id())?;
     emit!(
         output,
         "  variant:  {}",
@@ -1083,15 +1193,6 @@ fn report_lead(
         }
         Activation::Failed(reason) => emit!(output, "  effective: NOT VERIFIED — {reason}")?,
         Activation::NotAvailable(reason) => emit!(output, "  effective: not observed — {reason}")?,
-    }
-    // A higher-precedence layer wins silently otherwise: say so explicitly.
-    if scope == Scope::User && layer_sets_lead(&ctx.project_path, level) {
-        emit!(
-            output,
-            "  note:     the project config {} also sets throttle '{level}'; the project value wins (effective: {})",
-            ctx.project_path.display(),
-            contract.full_model_id()
-        )?;
     }
     Ok(())
 }
@@ -1171,7 +1272,7 @@ fn print_lead_table(ctx: &Context, output: &mut dyn Write) -> Result<()> {
     emit!(output, "")?;
     emit!(
         output,
-        "  change:  ocg config lead <level> --model provider/model [--variant V] [--scope user|project] --yes [--no-activate]"
+        "  change:  ocg config lead <level> --model provider/model [--variant V] [--scope auto|user|project] --yes [--no-activate]"
     )?;
     emit!(output, "  provider: ocg config provider add-openai-compatible <name> --base-url URL --api-key-env VAR --model ID --yes")?;
     Ok(())
@@ -1233,6 +1334,14 @@ fn interactive_lead(
         return Ok(None);
     }
     let current = model::lead_contract(&ctx.current.data, &level)?;
+    let owner = effective_owner(ctx, &level);
+    emit!(
+        output,
+        "effective: {} (source: {}, file: {})",
+        current.full_model_id(),
+        owner.as_str(),
+        layer_path(ctx, owner).display()
+    )?;
     let model = ask(
         input,
         output,
@@ -1253,9 +1362,14 @@ fn interactive_lead(
         emit!(output, "nothing to change")?;
         return Ok(None);
     }
-    let scope = ask(input, output, "scope [user|project] (default user): ")?;
-    let scope = match scope.as_deref().unwrap_or("user") {
-        "" | "user" => Scope::User,
+    let scope = ask(
+        input,
+        output,
+        &format!("scope [auto|user|project] (default {}): ", owner.as_str()),
+    )?;
+    let scope = match scope.as_deref().unwrap_or("") {
+        "" | "auto" => Scope::Auto,
+        "user" => Scope::User,
         "project" => Scope::Project,
         other => {
             emit!(output, "unknown scope: {other}")?;

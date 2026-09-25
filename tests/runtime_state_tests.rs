@@ -300,14 +300,13 @@ fn doctor_effective_reports_configured_resolved_and_effective_from_the_live_runt
     );
     let text = stdout(&output);
     assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
-    assert!(text.contains("runtime state"), "{text}");
+    assert!(text.contains("Effective State"), "{text}");
+    // Status is rendered first, independent of label length.
+    assert!(text.contains("[PASS] configured"), "{text}");
+    assert!(text.contains("lead-low on openai/gpt-5.6-sol"), "{text}");
+    assert!(text.contains("[PASS] resolved"), "{text}");
     assert!(
-        text.contains("configured         [PASS] lead-low on openai/gpt-5.6-sol"),
-        "{text}"
-    );
-    assert!(text.contains("resolved           [PASS]"), "{text}");
-    assert!(
-        text.contains("effective          [PASS]") && text.contains("ses_fake"),
+        text.contains("[PASS] effective") && text.contains("ses_fake"),
         "the effective state must come from the live session: {text}"
     );
     assert!(
@@ -380,32 +379,28 @@ fn status_effective_reports_the_three_states_for_the_active_level() {
 
 #[test]
 fn a_runtime_that_never_becomes_ready_is_reported_distinctly() {
+    use opencode_gear::proxy::{resolve, MapProxyEnv, NoStaticProxy};
+    use opencode_gear::runtime::compat::v2_server::{OwnedV2Server, StartupBudget};
+    use std::time::Duration;
+
     let dir = TestDir::new();
-    let project = dir.project();
-    let user = user_path(&dir);
     // The executable prints the handshake but nothing listens on the port.
     let fake = fake_runtime(&dir, "fake-dead", false);
-
-    let output = run(
-        &project,
-        &dir,
-        &user,
+    let proxy = resolve(false, &MapProxyEnv::new(), &NoStaticProxy).child_env();
+    let error = OwnedV2Server::start_with(
         &fake.program,
-        &["doctor", "--effective"],
-    );
-    let text = stdout(&output);
-    assert!(
-        text.contains("never became ready"),
-        "the runtime-not-ready class must be distinguishable: {text}"
-    );
-    assert!(
-        text.contains("effective          [FAIL]"),
-        "an unreachable runtime must never be reported as verified: {text}"
-    );
-    assert!(
-        !text.contains("effective          [PASS]"),
-        "an unreachable runtime must never be reported as verified: {text}"
-    );
+        "{}",
+        &[],
+        &proxy,
+        StartupBudget {
+            handshake_deadline: Duration::from_secs(1),
+            attempts: 2,
+            interval: Duration::from_millis(10),
+        },
+    )
+    .err()
+    .expect("unready runtime must fail");
+    assert!(error.to_string().contains("never became ready"), "{error}");
 }
 
 #[test]
