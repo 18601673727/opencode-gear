@@ -284,7 +284,7 @@ OpenCode V2 adapter (V2SessionClient + OwnedV2Server)
 
 `RuntimeAdapter` is the small, stateful per-invocation lifecycle seam. It
 owns the operations the current controller and bridge actually consume:
-resolve/create/inspect a runtime execution, apply and verify a runtime profile,
+resolve/create/inspect a runtime execution, read its immediate parent, apply and verify a runtime profile,
 observe normalized context, and stage/resume a continuation. Its execution ID is
 an opaque replaceable binding; it is never a Mission ID. The durable Mission
 continues to use the existing `session_id` field on disk for backward
@@ -299,6 +299,21 @@ converts event payloads into the neutral observation request rather than
 interpreting V2 session responses. V1 remains the existing request-scoped
 compatibility path: it has no V2 lifecycle capabilities and does not emulate
 session creation or continuation.
+
+The runtime-neutral `RuntimeExecutionLineage` resolves an execution's immediate
+parent, root, and depth by walking verified parent links, with a 32-edge bound.
+Missing executions or ancestors, cycles, malformed identities, and runtime
+failures cannot establish ownership. OpenCode V2 reads each link from
+`GET /api/session/{id}` (`parentID`); Mission only sees the resolved root and
+compares it to its durable **current** execution binding. A rebind or terminal
+Mission removes the old root's ownership without changing worker session
+records. This is a read-only authority lookup, not a dispatch gate.
+
+On the installed OpenCode 2.0.15, a disposable real `subagent` invocation
+showed the child session's `parentID` through both the plugin session API and
+a separate `opencode api --standalone` process during its first `model.request`
+hook, before the fake provider received that worker's first POST. The hook's
+`sessionID` was sufficient to start the lookup; its `agent` field was not used.
 
 Capabilities are explicit. A caller can distinguish execution creation, profile
 selection, context observation, continuation staging/resume, and persistent
@@ -937,10 +952,12 @@ execution, and context/health observation, are local or transport-only and do
 not by themselves establish provider work.
 
 Interactive root and worker model turns are dispatched by OpenCode itself, not
-by an OCG process, and OCG has no proven pre-provider abort at that seam. That
-path is therefore reported explicitly as not gated rather than claimed to be
-covered; the enforceable boundary is the OCG-owned execution path plus the
-engine-level configuration OCG exports.
+by an OCG process. OpenCode 2.0.15 exposes a synchronous pre-provider
+`session.hook("model.request")` (throwing from it resulted in zero provider
+POSTs), and worker ownership can now be resolved there through runtime lineage.
+No interactive admission, provider transport, or spend gate is wired in this
+phase. That path remains explicitly not gated; the enforceable boundary is the
+existing OCG-owned execution path plus the engine-level configuration OCG exports.
 
 ### Inspection
 

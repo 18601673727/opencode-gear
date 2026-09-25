@@ -45,7 +45,10 @@ use crate::orchestration::budget::{
 };
 use crate::orchestration::handoff::{HandoffFinding, HandoffVerification, Role, Transition};
 use crate::orchestration::state::{Attempts, OrchestrationPhase, SessionState};
-use crate::runtime::lifecycle::RuntimeExecutionId;
+use crate::runtime::lifecycle::{
+    resolve_execution_lineage, RuntimeAdapter, RuntimeError, RuntimeErrorKind, RuntimeExecutionId,
+    RuntimeExecutionLineage,
+};
 use crate::verification::result::VerificationReport;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -2080,6 +2083,68 @@ pub fn find_by_session(root: &Path, session_id: &str) -> Result<Option<Mission>>
     find_by_session_projection(root, session_id)
 }
 
+/// Resolve a runtime execution through verified ancestry to the Mission's
+/// current root binding. The Mission store contains no runtime-specific parent
+/// fields. A missing or terminal owner is not an authorization to dispatch.
+pub fn owner_for_execution(
+    root: &Path,
+    adapter: &dyn RuntimeAdapter,
+    execution_id: &RuntimeExecutionId,
+) -> std::result::Result<(RuntimeExecutionLineage, Option<Mission>), RuntimeError> {
+    let lineage = resolve_execution_lineage(adapter, execution_id)?;
+    let mission = unique_active_owner(root, lineage.root_id.as_str()).map_err(|_| {
+        RuntimeError::new(
+            RuntimeErrorKind::ObservationFailed,
+            "Mission ownership is unavailable",
+        )
+    })?;
+    Ok((lineage, mission))
+}
+
+fn unique_active_owner(root: &Path, execution_id: &str) -> Result<Option<Mission>> {
+    let missions =
+        if let Some(snapshot) = crate::orchestration::replay::read_authoritative_snapshot(root)? {
+            snapshot.missions.into_values().collect::<Vec<_>>()
+        } else {
+            let dir = missions_dir(root);
+            match fs::read_dir(dir) {
+                Ok(entries) => {
+                    let mut missions = Vec::new();
+                    for entry in entries {
+                        let path = entry
+                            .map_err(|error| GearError::io("cannot read Mission entry", error))?
+                            .path();
+                        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                            continue;
+                        }
+                        let name = path
+                            .file_stem()
+                            .and_then(|value| value.to_str())
+                            .ok_or_else(|| GearError::config("invalid Mission entry name"))?;
+                        if !name.ends_with(".corrupt") {
+                            if let Some(mission) = load_projection(root, name)? {
+                                missions.push(mission);
+                            }
+                        }
+                    }
+                    missions
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => return Err(GearError::io("cannot read Mission directory", error)),
+            }
+        };
+    let mut owners = missions.into_iter().filter(|mission| {
+        !mission.is_terminal() && mission.session_id.as_deref() == Some(execution_id)
+    });
+    let owner = owners.next();
+    if owners.next().is_some() {
+        return Err(GearError::config(
+            "multiple active Missions claim the same execution",
+        ));
+    }
+    Ok(owner)
+}
+
 fn find_by_session_projection(root: &Path, session_id: &str) -> Result<Option<Mission>> {
     let dir = missions_dir(root);
     let Ok(entries) = fs::read_dir(dir) else {
@@ -2232,12 +2297,98 @@ fn quarantine(path: &Path, mission_id: &str, reason: &str) -> GearError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::lifecycle::{RuntimeCapabilities, RuntimeIdentity, RuntimeResult};
     use serde_json::json;
 
     const TASK_ID: &str = "task-0123456789abcdef";
 
     fn admitted() -> Mission {
         Mission::admit(TASK_ID, "update the parser", "session-1", 7)
+    }
+
+    struct ParentAdapter;
+
+    impl RuntimeAdapter for ParentAdapter {
+        fn identity(&self) -> RuntimeIdentity {
+            RuntimeIdentity::new("test", "test", "test")
+        }
+
+        fn capabilities(&self) -> RuntimeCapabilities {
+            RuntimeCapabilities {
+                execution_lineage: true,
+                ..RuntimeCapabilities::NONE
+            }
+        }
+
+        fn execution_parent(
+            &self,
+            id: &RuntimeExecutionId,
+        ) -> RuntimeResult<Option<RuntimeExecutionId>> {
+            match id.as_str() {
+                "nested" => Ok(Some("worker".into())),
+                "worker" => Ok(Some("session-1".into())),
+                "session-1" | "session-2" => Ok(None),
+                _ => Err(RuntimeError::new(
+                    RuntimeErrorKind::ExecutionMissing,
+                    "execution not found",
+                )),
+            }
+        }
+    }
+
+    #[test]
+    fn current_mission_owner_is_resolved_from_runtime_root_across_reopen_and_rebind() {
+        let dir = tempfile::tempdir().unwrap();
+        let mission = admitted();
+        save(dir.path(), &mission).unwrap();
+        for (id, depth) in [("session-1", 0), ("worker", 1), ("nested", 2)] {
+            let (lineage, owner) =
+                owner_for_execution(dir.path(), &ParentAdapter, &id.into()).unwrap();
+            assert_eq!(lineage.root_id.as_str(), "session-1");
+            assert_eq!(lineage.depth, depth);
+            assert_eq!(owner.unwrap().mission_id, TASK_ID);
+        }
+
+        let mut loaded = load(dir.path(), TASK_ID).unwrap().unwrap();
+        assert!(loaded.bind_runtime_execution(&"session-2".into(), 12));
+        save(dir.path(), &loaded).unwrap();
+        assert!(
+            owner_for_execution(dir.path(), &ParentAdapter, &"worker".into())
+                .unwrap()
+                .1
+                .is_none()
+        );
+        assert_eq!(
+            owner_for_execution(dir.path(), &ParentAdapter, &"session-2".into())
+                .unwrap()
+                .1
+                .unwrap()
+                .mission_id,
+            TASK_ID
+        );
+        loaded
+            .cancel("session-2", Some("stopped".into()), 13)
+            .unwrap();
+        save(dir.path(), &loaded).unwrap();
+        assert!(
+            owner_for_execution(dir.path(), &ParentAdapter, &"session-2".into())
+                .unwrap()
+                .1
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ambiguous_current_root_cannot_claim_a_mission() {
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), &admitted()).unwrap();
+        save(
+            dir.path(),
+            &Mission::admit("task-abcdef0123456789", "another task", "session-1", 8),
+        )
+        .unwrap();
+        let error = owner_for_execution(dir.path(), &ParentAdapter, &"worker".into()).unwrap_err();
+        assert_eq!(error.kind(), RuntimeErrorKind::ObservationFailed);
     }
 
     #[test]

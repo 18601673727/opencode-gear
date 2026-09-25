@@ -30,10 +30,10 @@ pub mod self_update;
 
 pub use compat::{detect, detect_from_host, Major, RuntimeAdapter, RuntimeVersion, SessionClient};
 pub use lifecycle::{
-    RuntimeAdapter as RuntimeLifecycleAdapter, RuntimeCapabilities, RuntimeContextEvent,
-    RuntimeContextObservation, RuntimeContinuation, RuntimeError, RuntimeErrorKind,
-    RuntimeExecution, RuntimeExecutionId, RuntimeIdentity, RuntimeProfile, RuntimeProvenance,
-    RuntimeRecoveryKey,
+    resolve_execution_lineage, RuntimeAdapter as RuntimeLifecycleAdapter, RuntimeCapabilities,
+    RuntimeContextEvent, RuntimeContextObservation, RuntimeContinuation, RuntimeError,
+    RuntimeErrorKind, RuntimeExecution, RuntimeExecutionId, RuntimeExecutionLineage,
+    RuntimeIdentity, RuntimeProfile, RuntimeProvenance, RuntimeRecoveryKey,
 };
 pub use policy::{Channel, Fallback, RuntimePolicy};
 pub use resolve::{RuntimeManager, RuntimeReport, RuntimeSelection, RuntimeSource, UpgradeOutcome};

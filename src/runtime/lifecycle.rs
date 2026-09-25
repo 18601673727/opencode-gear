@@ -8,6 +8,7 @@
 use crate::telemetry::task::redact;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fmt;
 
 /// An opaque execution identity owned by a runtime adapter.
@@ -44,6 +45,75 @@ impl From<String> for RuntimeExecutionId {
 impl From<&str> for RuntimeExecutionId {
     fn from(value: &str) -> Self {
         Self::new(value)
+    }
+}
+
+/// Maximum number of parent edges accepted from a runtime. A longer chain
+/// cannot be used as evidence of Mission ownership.
+pub const MAX_EXECUTION_LINEAGE_DEPTH: usize = 32;
+
+/// Verified, runtime-neutral ancestry for a single execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeExecutionLineage {
+    pub execution_id: RuntimeExecutionId,
+    pub parent_id: Option<RuntimeExecutionId>,
+    pub root_id: RuntimeExecutionId,
+    pub depth: usize,
+}
+
+/// Walk the runtime's durable immediate-parent relation. Each visited object,
+/// including the root, must exist; no result is cached across dispatches.
+pub fn resolve_execution_lineage(
+    adapter: &dyn RuntimeAdapter,
+    execution_id: &RuntimeExecutionId,
+) -> RuntimeResult<RuntimeExecutionLineage> {
+    if execution_id.as_str().is_empty() {
+        return Err(RuntimeError::new(
+            RuntimeErrorKind::InvalidResponse,
+            "empty execution identity",
+        ));
+    }
+    let mut current = execution_id.clone();
+    let mut visited = HashSet::new();
+    let mut parent_id = None;
+    let mut depth = 0;
+    loop {
+        if !visited.insert(current.clone()) {
+            return Err(RuntimeError::new(
+                RuntimeErrorKind::InvalidResponse,
+                "execution lineage cycle",
+            ));
+        }
+        let parent = adapter.execution_parent(&current)?;
+        if depth == 0 {
+            parent_id = parent.clone();
+        }
+        match parent {
+            None => {
+                return Ok(RuntimeExecutionLineage {
+                    execution_id: execution_id.clone(),
+                    parent_id,
+                    root_id: current,
+                    depth,
+                })
+            }
+            Some(next) if next.as_str().is_empty() => {
+                return Err(RuntimeError::new(
+                    RuntimeErrorKind::InvalidResponse,
+                    "empty execution lineage parent",
+                ))
+            }
+            Some(_) if depth == MAX_EXECUTION_LINEAGE_DEPTH => {
+                return Err(RuntimeError::new(
+                    RuntimeErrorKind::InvalidResponse,
+                    "execution lineage exceeds depth limit",
+                ))
+            }
+            Some(next) => {
+                depth += 1;
+                current = next;
+            }
+        }
     }
 }
 
@@ -149,6 +219,7 @@ pub struct RuntimeCapabilities {
     /// [`RuntimeCapability::RecoverExecution`], which names the operation.
     pub recover_execution: bool,
     pub inspect_execution: bool,
+    pub execution_lineage: bool,
     pub select_profile: bool,
     pub observe_context: bool,
     pub stage_continuation: bool,
@@ -161,6 +232,7 @@ impl RuntimeCapabilities {
         create_execution: false,
         recover_execution: false,
         inspect_execution: false,
+        execution_lineage: false,
         select_profile: false,
         observe_context: false,
         stage_continuation: false,
@@ -172,6 +244,7 @@ impl RuntimeCapabilities {
         create_execution: true,
         recover_execution: true,
         inspect_execution: true,
+        execution_lineage: true,
         select_profile: true,
         observe_context: true,
         stage_continuation: true,
@@ -185,6 +258,7 @@ pub enum RuntimeCapability {
     CreateExecution,
     RecoverExecution,
     InspectExecution,
+    ExecutionLineage,
     SelectProfile,
     ObserveContext,
     StageContinuation,
@@ -198,6 +272,7 @@ impl RuntimeCapability {
             Self::CreateExecution => "create_execution",
             Self::RecoverExecution => "recover_execution",
             Self::InspectExecution => "inspect_execution",
+            Self::ExecutionLineage => "execution_lineage",
             Self::SelectProfile => "select_profile",
             Self::ObserveContext => "observe_context",
             Self::StageContinuation => "stage_continuation",
@@ -451,6 +526,18 @@ pub trait RuntimeAdapter {
     fn identity(&self) -> RuntimeIdentity;
     fn capabilities(&self) -> RuntimeCapabilities;
 
+    /// Read one authoritative parent link, including confirmation that the
+    /// requested execution exists. `None` means a verified root, not an
+    /// unavailable or missing execution.
+    fn execution_parent(
+        &self,
+        _execution_id: &RuntimeExecutionId,
+    ) -> RuntimeResult<Option<RuntimeExecutionId>> {
+        Err(RuntimeError::unsupported(
+            RuntimeCapability::ExecutionLineage,
+        ))
+    }
+
     fn resolve_execution(&mut self) -> RuntimeResult<RuntimeExecutionId> {
         Err(RuntimeError::unsupported(
             RuntimeCapability::ResolveExecution,
@@ -526,8 +613,117 @@ pub trait RuntimeAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     struct EmptyAdapter;
+
+    struct LineageAdapter(HashMap<String, Option<String>>);
+
+    impl RuntimeAdapter for LineageAdapter {
+        fn identity(&self) -> RuntimeIdentity {
+            RuntimeIdentity::new("lineage", "test", "unit")
+        }
+
+        fn capabilities(&self) -> RuntimeCapabilities {
+            RuntimeCapabilities {
+                execution_lineage: true,
+                ..RuntimeCapabilities::NONE
+            }
+        }
+
+        fn execution_parent(
+            &self,
+            id: &RuntimeExecutionId,
+        ) -> RuntimeResult<Option<RuntimeExecutionId>> {
+            self.0
+                .get(id.as_str())
+                .map(|parent| parent.as_deref().map(RuntimeExecutionId::new))
+                .ok_or_else(|| {
+                    RuntimeError::new(
+                        RuntimeErrorKind::ExecutionMissing,
+                        "missing execution or parent",
+                    )
+                })
+        }
+    }
+
+    fn lineage_adapter(edges: &[(&str, Option<&str>)]) -> LineageAdapter {
+        LineageAdapter(
+            edges
+                .iter()
+                .map(|(id, parent)| (id.to_string(), parent.map(str::to_string)))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn root_direct_child_and_nested_lineage() {
+        let adapter = lineage_adapter(&[
+            ("root", None),
+            ("child", Some("root")),
+            ("nested", Some("child")),
+        ]);
+        for (id, parent, depth) in [
+            ("root", None, 0),
+            ("child", Some("root"), 1),
+            ("nested", Some("child"), 2),
+        ] {
+            let lineage = resolve_execution_lineage(&adapter, &id.into()).unwrap();
+            assert_eq!(lineage.execution_id.as_str(), id);
+            assert_eq!(
+                lineage.parent_id.as_ref().map(RuntimeExecutionId::as_str),
+                parent
+            );
+            assert_eq!(lineage.root_id.as_str(), "root");
+            assert_eq!(lineage.depth, depth);
+        }
+    }
+
+    #[test]
+    fn lineage_rejects_missing_execution_parent_cycles_and_excess_depth() {
+        let adapter = lineage_adapter(&[("child", Some("absent"))]);
+        assert_eq!(
+            resolve_execution_lineage(&adapter, &"child".into())
+                .unwrap_err()
+                .kind(),
+            RuntimeErrorKind::ExecutionMissing
+        );
+        assert_eq!(
+            resolve_execution_lineage(&adapter, &"absent".into())
+                .unwrap_err()
+                .kind(),
+            RuntimeErrorKind::ExecutionMissing
+        );
+        let adapter = lineage_adapter(&[("a", Some("b")), ("b", Some("a"))]);
+        assert_eq!(
+            resolve_execution_lineage(&adapter, &"a".into())
+                .unwrap_err()
+                .kind(),
+            RuntimeErrorKind::InvalidResponse
+        );
+        let edges: Vec<_> = (0..=MAX_EXECUTION_LINEAGE_DEPTH + 1)
+            .map(|index| {
+                (
+                    format!("node-{index}"),
+                    (index <= MAX_EXECUTION_LINEAGE_DEPTH).then(|| format!("node-{}", index + 1)),
+                )
+            })
+            .collect();
+        let adapter = LineageAdapter(edges.into_iter().collect());
+        assert_eq!(
+            resolve_execution_lineage(&adapter, &"node-0".into())
+                .unwrap_err()
+                .kind(),
+            RuntimeErrorKind::InvalidResponse
+        );
+        let adapter = lineage_adapter(&[("child", Some(""))]);
+        assert_eq!(
+            resolve_execution_lineage(&adapter, &"child".into())
+                .unwrap_err()
+                .kind(),
+            RuntimeErrorKind::InvalidResponse
+        );
+    }
 
     impl RuntimeAdapter for EmptyAdapter {
         fn identity(&self) -> RuntimeIdentity {
@@ -569,6 +765,12 @@ mod tests {
         let mut adapter = EmptyAdapter;
         let error = adapter.create_execution().unwrap_err();
         assert_eq!(error.kind(), RuntimeErrorKind::Unsupported);
+        assert_eq!(
+            resolve_execution_lineage(&adapter, &"root".into())
+                .unwrap_err()
+                .kind(),
+            RuntimeErrorKind::Unsupported
+        );
     }
 
     #[test]

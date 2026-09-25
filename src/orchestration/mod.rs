@@ -64,9 +64,9 @@ pub use handoff::{
     Transition,
 };
 pub use mission::{
-    Mission, MissionEvent, MissionEventKind, MissionPolicyReceipt, MissionReconcileReceipt,
-    MissionReconcileState, MissionReconcileStatus, MissionRolloverState, MissionRolloverStatus,
-    MissionStatus, MissionSummary, NextAction, MISSION_SCHEMA_VERSION,
+    owner_for_execution, Mission, MissionEvent, MissionEventKind, MissionPolicyReceipt,
+    MissionReconcileReceipt, MissionReconcileState, MissionReconcileStatus, MissionRolloverState,
+    MissionRolloverStatus, MissionStatus, MissionSummary, NextAction, MISSION_SCHEMA_VERSION,
 };
 pub use policy::{
     approval_dir, approval_id, approval_path, ensure_pending, evaluate as evaluate_policy,

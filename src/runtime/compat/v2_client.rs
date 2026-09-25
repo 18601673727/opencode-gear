@@ -16,7 +16,7 @@
 //! GET  /api/session?directory=&limit=1       (newest root sessions first)   -> {data:[{id},...], cursor}
 //! POST /api/session/{id}/agent               {agent}                        -> 204
 //! POST /api/session/{id}/model               {model:{id, providerID[, variant]}} -> 204
-//! GET  /api/session/{id}                     -> {data:{id, agent, model:{id, providerID[, variant]}, ...}}
+//! GET  /api/session/{id}                     -> {data:{id[, parentID], agent, model:{id, providerID[, variant]}, ...}}
 //! GET  /api/session/{id}/context             -> {data:[message records]}
 //! GET  /api/model?directory=...               -> {data:[{providerID,id,limit:{context,input,output}}]}
 //! POST /api/session/{id}/synthetic            {id,text,description,metadata,resume} -> {data:{id}}
@@ -741,6 +741,8 @@ fn runtime_error(error: GearError, default_kind: RuntimeErrorKind) -> RuntimeErr
         || lower.contains("different session")
     {
         RuntimeErrorKind::InvalidResponse
+    } else if default_kind == RuntimeErrorKind::ExecutionMissing {
+        RuntimeErrorKind::ObservationFailed
     } else {
         default_kind
     };
@@ -864,6 +866,32 @@ impl RuntimeAdapter for V2SessionClient {
 
     fn capabilities(&self) -> RuntimeCapabilities {
         RuntimeCapabilities::OPENCODE_V2
+    }
+
+    fn execution_parent(
+        &self,
+        execution_id: &RuntimeExecutionId,
+    ) -> RuntimeResult<Option<RuntimeExecutionId>> {
+        let info = self
+            .session_info(execution_id.as_str())
+            .map_err(|error| runtime_error(error, RuntimeErrorKind::ExecutionMissing))?;
+        if info.get("id").and_then(Value::as_str) != Some(execution_id.as_str()) {
+            return Err(RuntimeError::new(
+                RuntimeErrorKind::InvalidResponse,
+                "runtime lineage lookup returned a different execution identity",
+            ));
+        }
+        // V2 omits parentID for a root; a child has a nonempty string.
+        match info.get("parentID") {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(parent)) if !parent.is_empty() => {
+                Ok(Some(RuntimeExecutionId::new(parent.clone())))
+            }
+            _ => Err(RuntimeError::new(
+                RuntimeErrorKind::InvalidResponse,
+                "runtime lineage response has an invalid parent identity",
+            )),
+        }
     }
 
     fn resolve_execution(&mut self) -> RuntimeResult<RuntimeExecutionId> {
@@ -1170,6 +1198,7 @@ fn encode_component(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::runtime::compat::{select_session_lead, LeadSelection};
+    use crate::runtime::lifecycle::resolve_execution_lineage;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
@@ -1456,6 +1485,85 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind(), RuntimeErrorKind::ExecutionMissing);
+    }
+
+    #[test]
+    fn lineage_reads_authoritative_v2_parent_links_without_agent_or_model() {
+        let fake = FakeTransport::with(vec![
+            ok(json!({"data": {"id": "nested", "parentID": "child", "agent": "untrusted"}})),
+            ok(json!({"data": {"id": "child", "parentID": SESSION}})),
+            ok(json!({"data": {"id": SESSION, "parentID": null}})),
+        ]);
+        let lineage = resolve_execution_lineage(&client(&fake), &"nested".into()).unwrap();
+        assert_eq!(lineage.parent_id.unwrap().as_str(), "child");
+        assert_eq!(lineage.root_id.as_str(), SESSION);
+        assert_eq!(lineage.depth, 2);
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| request.method == "GET"));
+        assert_eq!(requests[0].url, format!("{BASE}/api/session/nested"));
+    }
+
+    #[test]
+    fn lineage_rejects_missing_mismatched_and_invalid_v2_records() {
+        for response in [status(404, "{}"), status(410, "{}")] {
+            let fake = FakeTransport::with(vec![response]);
+            assert_eq!(
+                resolve_execution_lineage(&client(&fake), &SESSION.into())
+                    .unwrap_err()
+                    .kind(),
+                RuntimeErrorKind::ExecutionMissing
+            );
+        }
+        let fake = FakeTransport::with(vec![
+            ok(json!({"data": {"id": "child", "parentID": "absent"}})),
+            status(404, "{}"),
+        ]);
+        assert_eq!(
+            resolve_execution_lineage(&client(&fake), &"child".into())
+                .unwrap_err()
+                .kind(),
+            RuntimeErrorKind::ExecutionMissing
+        );
+        for data in [
+            json!({"id": "other"}),
+            json!({"parentID": null}),
+            json!({"id": SESSION, "parentID": ""}),
+            json!({"id": SESSION, "parentID": 23}),
+        ] {
+            let fake = FakeTransport::with(vec![ok(json!({"data": data}))]);
+            assert_eq!(
+                resolve_execution_lineage(&client(&fake), &SESSION.into())
+                    .unwrap_err()
+                    .kind(),
+                RuntimeErrorKind::InvalidResponse
+            );
+        }
+    }
+
+    #[test]
+    fn lineage_never_interprets_runtime_failures_as_missing_parents() {
+        let fake = FakeTransport::with(vec![status(500, "{}")]);
+        assert_eq!(
+            resolve_execution_lineage(&client(&fake), &SESSION.into())
+                .unwrap_err()
+                .kind(),
+            RuntimeErrorKind::Unavailable
+        );
+        let fake = FakeTransport::with(vec![Err(GearError::config("connection refused"))]);
+        assert_eq!(
+            resolve_execution_lineage(&client(&fake), &SESSION.into())
+                .unwrap_err()
+                .kind(),
+            RuntimeErrorKind::Transport
+        );
+        let fake = FakeTransport::with(vec![status(400, "{}")]);
+        assert_eq!(
+            resolve_execution_lineage(&client(&fake), &SESSION.into())
+                .unwrap_err()
+                .kind(),
+            RuntimeErrorKind::ObservationFailed
+        );
     }
 
     #[test]
