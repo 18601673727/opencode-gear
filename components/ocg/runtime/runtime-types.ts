@@ -7,6 +7,7 @@ import type {
   SendMessageInput,
 } from "../types";
 import type { RuntimeObservability } from "./observability";
+import type { ResourceLedger } from "../resource-ledger/types";
 import type { BootstrapState, OnboardingStageId } from "../bootstrap/types";
 
 export type ScenarioId =
@@ -23,6 +24,7 @@ export type ScenarioId =
   | "runtime-failed"
   | "permission-required"
   | "observability-live"
+  | "resource-ledger"
   | "local-ready"
   | "local-first-run"
   | "remote-unauthenticated"
@@ -46,6 +48,7 @@ export type RuntimeSnapshot = {
   messagesBySession: Record<string, ChatMessage[]>;
   missionsBySession: Record<string, Mission | null>;
   observabilityBySession: Record<string, RuntimeObservability | null>;
+  resourceLedger: ResourceLedger | null;
   bootstrap: BootstrapState;
 };
 

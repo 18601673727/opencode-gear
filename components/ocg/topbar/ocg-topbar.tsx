@@ -6,6 +6,7 @@ import {
   MoreHorizontal,
   PanelLeft,
   PanelRight,
+  Table2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -16,10 +17,15 @@ type OcgTopbarProps = {
   session: ChatSession;
   sidebarCollapsed: boolean;
   missionOpen: boolean;
+  /** When false, the mission panel toggles are hidden (for example on the ledger view). Defaults to true. */
+  missionControls?: boolean;
+  /** Highlights the ledger action while the ledger workspace is the active view. */
+  ledgerActive?: boolean;
   onToggleSidebar: () => void;
   onToggleMission: () => void;
   onOpenMobileSidebar: () => void;
   onOpenMobileMission: () => void;
+  onOpenLedger?: () => void;
   runtimeStatus: RuntimeStatus;
 };
 
@@ -34,10 +40,13 @@ export function OcgTopbar({
   session,
   sidebarCollapsed,
   missionOpen,
+  missionControls = true,
+  ledgerActive = false,
   onToggleSidebar,
   onToggleMission,
   onOpenMobileSidebar,
   onOpenMobileMission,
+  onOpenLedger,
   runtimeStatus,
 }: OcgTopbarProps) {
   return (
@@ -109,33 +118,50 @@ export function OcgTopbar({
         <MoreHorizontal className="size-4" />
       </Button>
 
-      {/* Mobile mission toggle */}
-      <Button
-        variant="ghost"
-        size="icon-xs"
-        className="lg:hidden"
-        onClick={onOpenMobileMission}
-        aria-label="Open mission panel"
-        title="Open mission panel"
-      >
-        <PanelRight className="size-4" />
-      </Button>
-      {/* Desktop mission toggle */}
-      <Button
-        variant={!missionOpen ? "secondary" : "ghost"}
-        size="icon-xs"
-        className="hidden lg:inline-flex"
-        onClick={onToggleMission}
-        aria-label={missionOpen ? "Collapse mission panel" : "Expand mission panel"}
-        aria-expanded={missionOpen}
-        title={missionOpen ? "Collapse mission panel" : "Expand mission panel"}
-      >
-        {missionOpen ? (
-          <ChevronsRight className="size-4" />
-        ) : (
-          <ChevronsLeft className="size-4" />
-        )}
-      </Button>
+      {onOpenLedger && (
+        <Button
+          variant={ledgerActive ? "secondary" : "ghost"}
+          size="icon-xs"
+          onClick={onOpenLedger}
+          aria-label={ledgerActive ? "Open chat workspace" : "Open resource ledger"}
+          aria-current={ledgerActive ? "page" : undefined}
+          title={ledgerActive ? "Open chat workspace" : "Open resource ledger"}
+        >
+          <Table2 className="size-4" />
+        </Button>
+      )}
+
+      {missionControls && (
+        <>
+          {/* Mobile mission toggle */}
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            className="lg:hidden"
+            onClick={onOpenMobileMission}
+            aria-label="Open mission panel"
+            title="Open mission panel"
+          >
+            <PanelRight className="size-4" />
+          </Button>
+          {/* Desktop mission toggle */}
+          <Button
+            variant={!missionOpen ? "secondary" : "ghost"}
+            size="icon-xs"
+            className="hidden lg:inline-flex"
+            onClick={onToggleMission}
+            aria-label={missionOpen ? "Collapse mission panel" : "Expand mission panel"}
+            aria-expanded={missionOpen}
+            title={missionOpen ? "Collapse mission panel" : "Expand mission panel"}
+          >
+            {missionOpen ? (
+              <ChevronsRight className="size-4" />
+            ) : (
+              <ChevronsLeft className="size-4" />
+            )}
+          </Button>
+        </>
+      )}
     </header>
   );
 }

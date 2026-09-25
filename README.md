@@ -22,10 +22,10 @@ The UI currently runs against a local OCG-owned mock runtime. Inspect a fixture 
 `?scenario=`; unknown values fall back to `normal-chat`:
 
 ```text
- normal-chat · long-stream · tool-heavy · worker-parallel
- build-failed · retry-success · mission-complete · budget-exhausted
+normal-chat · long-stream · tool-heavy · worker-parallel
+build-failed · retry-success · mission-complete · budget-exhausted
 runtime-disconnected · runtime-connecting · runtime-failed · permission-required
-observability-live
+observability-live · resource-ledger
 ```
 
 Entry/setup fixtures:
@@ -47,6 +47,16 @@ workspace. Cloudflare Access is represented as a mock handoff button, and no
 credential is entered or stored.
 
 For example: `http://localhost:3000/?scenario=worker-parallel`.
+
+## Resource ledger
+
+The `resource-ledger` scenario adds a cross-mission usage and cost ledger on top
+of the workspace. Open it directly at `/resource-ledger`, which defaults to the
+ledger scenario, or via the ledger action in the topbar. A scenario can still be
+selected explicitly with `?scenario=`, for example
+`http://localhost:3000/resource-ledger?scenario=resource-ledger`. Other
+scenarios have no ledger fixture and the surface shows an explicit empty state
+instead of inventing data.
 
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 

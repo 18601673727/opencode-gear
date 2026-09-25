@@ -1,25 +1,30 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { ChatView } from "../chat/chat-view";
 import { MissionView } from "../mission/mission-view";
 import { OcgSidebar } from "../sidebar/ocg-sidebar";
 import { OcgTopbar } from "../topbar/ocg-topbar";
+import { ResourceLedgerSurface } from "../resource-ledger/resource-ledger-surface";
 import { OcgRuntimeProvider, useOcgRuntime } from "../runtime/runtime-context";
 import type { ScenarioId } from "../runtime/runtime-types";
 import type { InspectorMode } from "../observability/inspector-state";
 
-export function AppShell({ scenario }: { scenario: ScenarioId }) {
+export type WorkspaceView = "chat" | "ledger";
+
+export function AppShell({ scenario, view = "chat" }: { scenario: ScenarioId; view?: WorkspaceView }) {
   return (
     <OcgRuntimeProvider scenario={scenario}>
-      <RuntimeWorkspace />
+      <RuntimeWorkspace view={view} />
     </OcgRuntimeProvider>
   );
 }
 
-export function RuntimeWorkspace() {
+export function RuntimeWorkspace({ view = "chat" }: { view?: WorkspaceView }) {
   const { snapshot, createSession, sendMessage } = useOcgRuntime();
+  const router = useRouter();
   const [activeSessionId, setActiveSessionId] = useState("design-pwa-shell");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -40,6 +45,7 @@ export function RuntimeWorkspace() {
   const activeSession = snapshot.sessions.find((session) => session.id === activeSessionId) ?? snapshot.sessions[0];
   const activeSessionKey = activeSession?.id;
   const activeWorkType = activeSession?.workType;
+  const isLedger = view === "ledger";
 
   const handleNewChat = useCallback(async () => {
     if (!activeWorkType) return;
@@ -58,6 +64,12 @@ export function RuntimeWorkspace() {
     (content: string) => activeSessionKey ? sendMessage(activeSessionKey, { content }) : undefined,
     [activeSessionKey, sendMessage],
   );
+
+  const handleOpenLedger = useCallback(() => {
+    setMobileNavOpen(false);
+    setMobileMissionOpen(false);
+    router.push(isLedger ? "/" : "/resource-ledger");
+  }, [isLedger, router]);
 
   if (!activeSession) return null;
 
@@ -125,59 +137,70 @@ export function RuntimeWorkspace() {
           session={activeSession}
           sidebarCollapsed={sidebarCollapsed}
           missionOpen={missionOpen}
+          missionControls={!isLedger}
+          ledgerActive={isLedger}
           onToggleSidebar={() => setSidebarCollapsed((value) => !value)}
-           onToggleMission={() => setMissionMode((value) => value === "collapsed" ? "docked" : "collapsed")}
+          onToggleMission={() => setMissionMode((value) => value === "collapsed" ? "docked" : "collapsed")}
           onOpenMobileSidebar={() => setMobileNavOpen(true)}
           onOpenMobileMission={() => setMobileMissionOpen(true)}
+          onOpenLedger={handleOpenLedger}
           runtimeStatus={snapshot.status}
         />
-        <main aria-label="OCG workspace" className="flex min-h-0 flex-1">
-          <div className="flex min-w-0 flex-1 flex-col">
-            <ChatView
-              key={activeSession.id}
-              session={activeSession}
-              messages={messages}
-              runtimeStatus={snapshot.status}
-              mission={mission}
-              onSendMessage={handleSendMessage}
-            />
-          </div>
+        {isLedger ? (
+          <main aria-label="Resource ledger" className="flex min-h-0 flex-1 overflow-hidden">
+            <ResourceLedgerSurface ledger={snapshot.resourceLedger} />
+          </main>
+        ) : (
+          <main aria-label="OCG workspace" className="flex min-h-0 flex-1">
+            <div className="flex min-w-0 flex-1 flex-col">
+              <ChatView
+                key={activeSession.id}
+                session={activeSession}
+                messages={messages}
+                runtimeStatus={snapshot.status}
+                mission={mission}
+                onSendMessage={handleSendMessage}
+              />
+            </div>
 
+            <aside
+              aria-label="Mission panel"
+              className={cn(
+                "hidden shrink-0 overflow-hidden border-border bg-background transition-[width,opacity] duration-200 ease-out lg:block",
+                 missionMode === "expanded" ? "w-[min(640px,42vw)] border-l opacity-100" : missionMode === "docked" ? "w-[min(360px,28vw)] border-l opacity-100" : "w-0 border-l-0 opacity-0",
+              )}
+            >
+              <div className={cn("h-full", missionMode === "expanded" ? "w-[min(640px,42vw)]" : "w-[min(360px,28vw)]")}>
+                {mission && missionOpen && <MissionView mission={mission} observability={observability} mode={missionMode} onModeChange={setMissionMode} onClose={() => setMissionMode("collapsed")} />}
+              </div>
+            </aside>
+          </main>
+        )}
+      </div>
+
+      {!isLedger && (
+        <div
+          className={cn("fixed inset-0 z-50 lg:hidden", !mobileMissionOpen && "pointer-events-none")}
+          aria-hidden={!mobileMissionOpen}
+        >
+          <div
+            onClick={() => setMobileMissionOpen(false)}
+            className={cn(
+              "absolute inset-0 bg-black/40 transition-opacity duration-200",
+              mobileMissionOpen ? "opacity-100" : "opacity-0",
+            )}
+          />
           <aside
             aria-label="Mission panel"
             className={cn(
-              "hidden shrink-0 overflow-hidden border-border bg-background transition-[width,opacity] duration-200 ease-out lg:block",
-               missionMode === "expanded" ? "w-[min(640px,42vw)] border-l opacity-100" : missionMode === "docked" ? "w-[min(360px,28vw)] border-l opacity-100" : "w-0 border-l-0 opacity-0",
-            )}
-          >
-            <div className={cn("h-full", missionMode === "expanded" ? "w-[min(640px,42vw)]" : "w-[min(360px,28vw)]")}>
-              {mission && missionOpen && <MissionView mission={mission} observability={observability} mode={missionMode} onModeChange={setMissionMode} onClose={() => setMissionMode("collapsed")} />}
-            </div>
+               "absolute inset-y-0 right-0 w-full max-w-none border-l border-border bg-background transition-transform duration-200 ease-out sm:w-[640px] sm:max-w-[85vw]",
+               mobileMissionOpen ? "translate-x-0" : "translate-x-full",
+             )}
+            >
+            {mobileMissionOpen && mission && <MissionView mission={mission} observability={observability} mode="expanded" onClose={() => setMobileMissionOpen(false)} />}
           </aside>
-        </main>
-      </div>
-
-      <div
-        className={cn("fixed inset-0 z-50 lg:hidden", !mobileMissionOpen && "pointer-events-none")}
-        aria-hidden={!mobileMissionOpen}
-      >
-        <div
-          onClick={() => setMobileMissionOpen(false)}
-          className={cn(
-            "absolute inset-0 bg-black/40 transition-opacity duration-200",
-            mobileMissionOpen ? "opacity-100" : "opacity-0",
-          )}
-        />
-        <aside
-          aria-label="Mission panel"
-          className={cn(
-             "absolute inset-y-0 right-0 w-full max-w-none border-l border-border bg-background transition-transform duration-200 ease-out sm:w-[640px] sm:max-w-[85vw]",
-             mobileMissionOpen ? "translate-x-0" : "translate-x-full",
-           )}
-          >
-          {mobileMissionOpen && mission && <MissionView mission={mission} observability={observability} mode="expanded" onClose={() => setMobileMissionOpen(false)} />}
-        </aside>
-      </div>
+        </div>
+      )}
     </div>
   );
 }

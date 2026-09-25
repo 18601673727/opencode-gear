@@ -53,6 +53,7 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
       messagesBySession: clone(fixture.messagesBySession),
       missionsBySession: clone(fixture.missionsBySession),
       observabilityBySession: clone(fixture.observabilityBySession),
+      resourceLedger: clone(fixture.resourceLedger),
       bootstrap: clone(fixture.bootstrap),
     };
   }

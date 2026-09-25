@@ -14,7 +14,9 @@ import type {
 } from "./observability";
 import { usage } from "./observability";
 import { createBootstrapFixture } from "../bootstrap/fixtures";
+import { createResourceLedgerFixture } from "../resource-ledger/fixtures";
 import type { BootstrapState } from "../bootstrap/types";
+import type { ResourceLedger } from "../resource-ledger/types";
 
 export const DEFAULT_SCENARIO: ScenarioId = "normal-chat";
 export const SCENARIO_IDS: readonly ScenarioId[] = [
@@ -31,6 +33,7 @@ export const SCENARIO_IDS: readonly ScenarioId[] = [
   "runtime-failed",
   "permission-required",
   "observability-live",
+  "resource-ledger",
   "local-ready",
   "local-first-run",
   "remote-unauthenticated",
@@ -343,6 +346,7 @@ export type ScenarioFixture = {
   messagesBySession: Record<string, ChatMessage[]>;
   missionsBySession: Record<string, Mission | null>;
   observabilityBySession: Record<string, RuntimeObservability | null>;
+  resourceLedger: ResourceLedger | null;
   bootstrap: BootstrapState;
   observabilityUpdates?: { afterMs: number; sessionId: string; observability: RuntimeObservability; mission?: Mission }[];
   streamChunks?: string[];
@@ -360,6 +364,7 @@ export function createScenarioFixture(id: ScenarioId): ScenarioFixture {
     ),
     missionsBySession: Object.fromEntries(sessions.map((session) => [session.id, mission("running")])),
     observabilityBySession: Object.fromEntries(sessions.map((session) => [session.id, createDefaultObservability(session.id)])),
+    resourceLedger: createResourceLedgerFixture(id),
     streamChunks: [
       "Mock runtime received your message. ",
       "This response is streamed locally, ",
