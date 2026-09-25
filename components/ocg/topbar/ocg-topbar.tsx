@@ -8,6 +8,7 @@ import {
   PanelRight,
   SlidersHorizontal,
   Table2,
+  Workflow,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -24,12 +25,14 @@ type OcgTopbarProps = {
   ledgerActive?: boolean;
   /** Highlights the Control Center action while it is the active view. */
   controlCenterActive?: boolean;
+  missionControlActive?: boolean;
   onToggleSidebar: () => void;
   onToggleMission: () => void;
   onOpenMobileSidebar: () => void;
   onOpenMobileMission: () => void;
   onOpenLedger?: () => void;
   onOpenControlCenter?: () => void;
+  onOpenMissionControl?: () => void;
   runtimeStatus: RuntimeStatus;
 };
 
@@ -47,12 +50,14 @@ export function OcgTopbar({
   missionControls = true,
   ledgerActive = false,
   controlCenterActive = false,
+  missionControlActive = false,
   onToggleSidebar,
   onToggleMission,
   onOpenMobileSidebar,
   onOpenMobileMission,
   onOpenLedger,
   onOpenControlCenter,
+  onOpenMissionControl,
   runtimeStatus,
 }: OcgTopbarProps) {
   return (
@@ -147,6 +152,19 @@ export function OcgTopbar({
           title={controlCenterActive ? "Close Control Center" : "Open Control Center"}
         >
           <SlidersHorizontal className="size-4" />
+        </Button>
+      )}
+
+      {onOpenMissionControl && (
+        <Button
+          variant={missionControlActive ? "secondary" : "ghost"}
+          size="icon-xs"
+          onClick={onOpenMissionControl}
+          aria-label={missionControlActive ? "Close Mission Control" : "Open Mission Control"}
+          aria-current={missionControlActive ? "page" : undefined}
+          title={missionControlActive ? "Close Mission Control" : "Open Mission Control"}
+        >
+          <Workflow className="size-4" />
         </Button>
       )}
 

@@ -53,6 +53,7 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
       messagesBySession: clone(fixture.messagesBySession),
       missionsBySession: clone(fixture.missionsBySession),
       observabilityBySession: clone(fixture.observabilityBySession),
+      executionBySession: clone(fixture.executionBySession),
       resourceLedger: clone(fixture.resourceLedger),
       bootstrap: clone(fixture.bootstrap),
     };
@@ -168,6 +169,7 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
       messagesBySession: { ...this.snapshot.messagesBySession, [id]: [] },
       missionsBySession: { ...this.snapshot.missionsBySession, [id]: null },
       observabilityBySession: { ...this.snapshot.observabilityBySession, [id]: null },
+      executionBySession: { ...this.snapshot.executionBySession, [id]: null },
     };
     this.emit({ type: "conversation.session-created", session: clone(session) });
     return clone(session);

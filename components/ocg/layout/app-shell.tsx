@@ -9,12 +9,13 @@ import { OcgSidebar } from "../sidebar/ocg-sidebar";
 import { OcgTopbar } from "../topbar/ocg-topbar";
 import { ResourceLedgerSurface } from "../resource-ledger/resource-ledger-surface";
 import { ControlCenterSurface } from "../control-center/control-center-surface";
+import { MissionControlSurface } from "../mission-control/mission-control-surface";
 import type { ControlCenterView } from "../control-center/domain";
 import { OcgRuntimeProvider, useOcgRuntime } from "../runtime/runtime-context";
 import type { ScenarioId } from "../runtime/runtime-types";
 import type { InspectorMode } from "../observability/inspector-state";
 
-export type WorkspaceView = "chat" | "ledger" | "control-center";
+export type WorkspaceView = "chat" | "ledger" | "control-center" | "mission-control";
 
 export function AppShell({
   scenario,
@@ -63,6 +64,7 @@ export function RuntimeWorkspace({
   const activeWorkType = activeSession?.workType;
   const isLedger = view === "ledger";
   const isControlCenter = view === "control-center";
+  const isMissionControl = view === "mission-control";
 
   const handleNewChat = useCallback(async () => {
     if (!activeWorkType) return;
@@ -102,6 +104,12 @@ export function RuntimeWorkspace({
     router.push(view === "control-center" ? "/" : "/?scenario=profiles-models");
   }, [router, view]);
 
+  const handleOpenMissionControl = useCallback(() => {
+    setMobileNavOpen(false);
+    setMobileMissionOpen(false);
+    router.push(isMissionControl ? "/" : "/?scenario=mission-control");
+  }, [isMissionControl, router]);
+
   const handleSelectProfile = useCallback((profileId: string) => {
     void setActiveProfile(profileId);
   }, [setActiveProfile]);
@@ -126,6 +134,7 @@ export function RuntimeWorkspace({
       onOpenChat={handleOpenChat}
       onOpenLedger={handleOpenLedger}
       onOpenControlCenter={handleOpenControlCenter}
+      onOpenMissionControl={handleOpenMissionControl}
     />
   );
 
@@ -171,6 +180,7 @@ export function RuntimeWorkspace({
             onOpenChat={handleOpenChat}
             onOpenLedger={handleOpenLedger}
             onOpenControlCenter={handleOpenControlCenter}
+            onOpenMissionControl={handleOpenMissionControl}
           />
         </aside>
       </div>
@@ -180,15 +190,17 @@ export function RuntimeWorkspace({
           session={activeSession}
           sidebarCollapsed={sidebarCollapsed}
           missionOpen={missionOpen}
-          missionControls={!isLedger && !isControlCenter}
+          missionControls={!isLedger && !isControlCenter && !isMissionControl}
           ledgerActive={isLedger}
           controlCenterActive={isControlCenter}
+          missionControlActive={isMissionControl}
           onToggleSidebar={() => setSidebarCollapsed((value) => !value)}
           onToggleMission={() => setMissionMode((value) => value === "collapsed" ? "docked" : "collapsed")}
           onOpenMobileSidebar={() => setMobileNavOpen(true)}
           onOpenMobileMission={() => setMobileMissionOpen(true)}
           onOpenLedger={handleOpenLedger}
           onOpenControlCenter={handleOpenControlCenter}
+          onOpenMissionControl={handleOpenMissionControl}
           runtimeStatus={snapshot.status}
         />
         {isLedger ? (
@@ -204,6 +216,17 @@ export function RuntimeWorkspace({
               initialView={controlCenterView}
               onSelectProfile={handleSelectProfile}
             />
+          </main>
+        ) : isMissionControl ? (
+          <main aria-label="Mission Control" className="flex min-h-0 flex-1 overflow-hidden">
+            {snapshot.executionBySession[activeSession.id] ? (
+              <MissionControlSurface
+                execution={snapshot.executionBySession[activeSession.id]!}
+                onOpenInspector={() => router.push("/")}
+              />
+            ) : (
+              <div className="flex flex-1 items-center justify-center p-6 text-[12px] text-muted-foreground">No Mission execution is available.</div>
+            )}
           </main>
         ) : (
           <main aria-label="OCG workspace" className="flex min-h-0 flex-1">
@@ -226,14 +249,14 @@ export function RuntimeWorkspace({
               )}
             >
               <div className={cn("h-full", missionMode === "expanded" ? "w-[min(640px,42vw)]" : "w-[min(360px,28vw)]")}>
-                {mission && missionOpen && <MissionView mission={mission} observability={observability} mode={missionMode} onModeChange={setMissionMode} onClose={() => setMissionMode("collapsed")} />}
+                {mission && missionOpen && <MissionView mission={mission} observability={observability} mode={missionMode} onModeChange={setMissionMode} onClose={() => setMissionMode("collapsed")} onOpenMissionControl={handleOpenMissionControl} />}
               </div>
             </aside>
           </main>
         )}
       </div>
 
-      {!isLedger && !isControlCenter && (
+      {!isLedger && !isControlCenter && !isMissionControl && (
         <div
           className={cn("fixed inset-0 z-50 lg:hidden", !mobileMissionOpen && "pointer-events-none")}
           aria-hidden={!mobileMissionOpen}
@@ -252,7 +275,7 @@ export function RuntimeWorkspace({
                mobileMissionOpen ? "translate-x-0" : "translate-x-full",
              )}
             >
-            {mobileMissionOpen && mission && <MissionView mission={mission} observability={observability} mode="expanded" onClose={() => setMobileMissionOpen(false)} />}
+            {mobileMissionOpen && mission && <MissionView mission={mission} observability={observability} mode="expanded" onClose={() => setMobileMissionOpen(false)} onOpenMissionControl={handleOpenMissionControl} />}
           </aside>
         </div>
       )}

@@ -9,6 +9,7 @@ import type {
 import type { RuntimeObservability } from "./observability";
 import type { ResourceLedger } from "../resource-ledger/types";
 import type { BootstrapState, OnboardingStageId } from "../bootstrap/types";
+import type { MissionExecution } from "../execution/domain";
 
 export type ScenarioId =
   | "normal-chat"
@@ -40,7 +41,8 @@ export type ScenarioId =
   | "onboarding-connection-failure"
   | "onboarding-discovery"
   | "onboarding-ready"
-  | "profiles-models";
+  | "profiles-models"
+  | "mission-control";
 
 export type RuntimeSnapshot = {
   scenario: ScenarioId;
@@ -49,6 +51,7 @@ export type RuntimeSnapshot = {
   messagesBySession: Record<string, ChatMessage[]>;
   missionsBySession: Record<string, Mission | null>;
   observabilityBySession: Record<string, RuntimeObservability | null>;
+  executionBySession: Record<string, MissionExecution | null>;
   resourceLedger: ResourceLedger | null;
   bootstrap: BootstrapState;
 };

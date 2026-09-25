@@ -1,6 +1,6 @@
 "use client";
 
-import { CircleDot, Maximize2, Minimize2, X } from "lucide-react";
+import { CircleDot, ExternalLink, Maximize2, Minimize2, X } from "lucide-react";
 import { useState } from "react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -15,6 +15,7 @@ type MissionViewProps = {
   mode?: InspectorMode;
   onModeChange?: (mode: InspectorMode) => void;
   onClose: () => void;
+  onOpenMissionControl?: () => void;
 };
 
 const TAB_LABELS: Record<InspectorTab, string> = {
@@ -44,7 +45,7 @@ function MissionContext({ mission, compact = false }: { mission: Mission; compac
   );
 }
 
-export function MissionView({ mission, observability, mode = "docked", onModeChange, onClose }: MissionViewProps) {
+export function MissionView({ mission, observability, mode = "docked", onModeChange, onClose, onOpenMissionControl }: MissionViewProps) {
   const [tab, setTab] = useState<InspectorTab>("overview");
   const hasObservability = Boolean(observability);
   const nextMode = toggleInspectorMode(mode);
@@ -53,6 +54,7 @@ export function MissionView({ mission, observability, mode = "docked", onModeCha
       <header className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2.5">
         <CircleDot className="size-4 text-muted-foreground" aria-hidden="true" />
         <h2 className="flex-1 text-[13px] font-semibold tracking-tight">Mission Inspector</h2>
+        {onOpenMissionControl && <Button variant="ghost" size="icon-xs" onClick={onOpenMissionControl} aria-label="Open Mission Control" title="Open Mission Control"><ExternalLink className="size-3.5" /></Button>}
         {onModeChange && <Button variant="ghost" size="icon-xs" className="hidden lg:inline-flex" onClick={() => onModeChange(nextMode)} aria-label={mode === "expanded" ? "Dock mission inspector" : "Expand mission inspector"} title={mode === "expanded" ? "Dock mission inspector" : "Expand mission inspector"}>{mode === "expanded" ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}</Button>}
         <Button variant="ghost" size="icon-xs" onClick={onClose} aria-label="Collapse mission inspector" title="Collapse mission inspector"><X className="size-4" /></Button>
       </header>

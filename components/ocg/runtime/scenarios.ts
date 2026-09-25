@@ -17,6 +17,8 @@ import { createBootstrapFixture } from "../bootstrap/fixtures";
 import { createResourceLedgerFixture } from "../resource-ledger/fixtures";
 import type { BootstrapState } from "../bootstrap/types";
 import type { ResourceLedger } from "../resource-ledger/types";
+import type { MissionExecution } from "../execution/domain";
+import { createMissionControlExecution } from "../execution/fixtures";
 
 export const DEFAULT_SCENARIO: ScenarioId = "normal-chat";
 export const SCENARIO_IDS: readonly ScenarioId[] = [
@@ -50,6 +52,7 @@ export const SCENARIO_IDS: readonly ScenarioId[] = [
   "onboarding-discovery",
   "onboarding-ready",
   "profiles-models",
+  "mission-control",
 ];
 
 export function resolveScenario(value: string | undefined | null): ScenarioId {
@@ -347,6 +350,7 @@ export type ScenarioFixture = {
   messagesBySession: Record<string, ChatMessage[]>;
   missionsBySession: Record<string, Mission | null>;
   observabilityBySession: Record<string, RuntimeObservability | null>;
+  executionBySession: Record<string, MissionExecution | null>;
   resourceLedger: ResourceLedger | null;
   bootstrap: BootstrapState;
   observabilityUpdates?: { afterMs: number; sessionId: string; observability: RuntimeObservability; mission?: Mission }[];
@@ -365,6 +369,7 @@ export function createScenarioFixture(id: ScenarioId): ScenarioFixture {
     ),
     missionsBySession: Object.fromEntries(sessions.map((session) => [session.id, mission("running")])),
     observabilityBySession: Object.fromEntries(sessions.map((session) => [session.id, createDefaultObservability(session.id)])),
+    executionBySession: Object.fromEntries(sessions.map((session) => [session.id, null])),
     resourceLedger: createResourceLedgerFixture(id),
     streamChunks: [
       "Mock runtime received your message. ",
@@ -375,6 +380,32 @@ export function createScenarioFixture(id: ScenarioId): ScenarioFixture {
   };
 
   switch (id) {
+    case "mission-control": {
+      const execution = createMissionControlExecution();
+      fixture.executionBySession[baseSession.id] = execution;
+      fixture.missionsBySession[baseSession.id] = mission("running", {
+        title: execution.title,
+        goal: "Dogfood the frontend execution inspector while preserving existing OCG surfaces.",
+        completed: execution.summary.completed,
+        total: execution.summary.total,
+        current: "Verify is checking the integration gate",
+        tasks: execution.tasks.map((item) => ({
+          id: item.id,
+          title: item.title,
+          status: item.status === "completed" ? "completed" : item.status === "failed" || item.status === "blocked" ? "failed" : item.status === "running" || item.status === "retrying" || item.status === "verifying" ? "active" : "pending",
+        })),
+        workers: execution.workers.map((worker) => ({
+          id: worker.id,
+          name: worker.label,
+          status: worker.status === "active" ? "active" : worker.status === "blocked" ? "waiting" : worker.status === "completed" ? "completed" : worker.status === "waiting" ? "waiting" : "queued",
+          task: worker.currentTaskId,
+        })),
+        elapsed: "55m",
+        commitment: { workers: execution.workers.length, mode: "capped" },
+        budget: { spent: execution.budget?.spent ?? 0, limit: execution.budget?.limit ?? 0, currency: "USD", status: "within-limit" },
+      });
+      break;
+    }
     case "long-stream":
       fixture.messagesBySession[baseSession.id] = [
         message("stream-u1", "user", "Show me the runtime state as it arrives."),

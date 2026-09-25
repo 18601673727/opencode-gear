@@ -13,6 +13,7 @@ import {
   Settings,
   SlidersHorizontal,
   Table2,
+  Workflow,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -35,12 +36,13 @@ const GROUP_ICON: Record<WorkType, typeof Search> = {
   devops: Server,
 };
 
-export type WorkspaceTarget = "chat" | "ledger" | "control-center";
+export type WorkspaceTarget = "chat" | "ledger" | "control-center" | "mission-control";
 
 const WORKSPACE_NAV: { target: WorkspaceTarget; label: string; icon: typeof Search }[] = [
   { target: "chat", label: "Chat", icon: MessageSquare },
   { target: "control-center", label: "Control Center", icon: SlidersHorizontal },
   { target: "ledger", label: "Resource Ledger", icon: Table2 },
+  { target: "mission-control", label: "Mission Control", icon: Workflow },
 ];
 
 type OcgSidebarProps = {
@@ -56,6 +58,7 @@ type OcgSidebarProps = {
   onOpenChat?: () => void;
   onOpenLedger?: () => void;
   onOpenControlCenter?: () => void;
+  onOpenMissionControl?: () => void;
 };
 
 const RUNTIME_LABEL: Record<RuntimeStatus["state"], string> = {
@@ -111,13 +114,15 @@ export function OcgSidebar({
   onOpenChat,
   onOpenLedger,
   onOpenControlCenter,
+  onOpenMissionControl,
 }: OcgSidebarProps) {
   const navHandlers: Record<WorkspaceTarget, (() => void) | undefined> = {
     chat: onOpenChat,
     ledger: onOpenLedger,
     "control-center": onOpenControlCenter,
+    "mission-control": onOpenMissionControl,
   };
-  const hasNav = Boolean(onOpenChat || onOpenLedger || onOpenControlCenter);
+  const hasNav = Boolean(onOpenChat || onOpenLedger || onOpenControlCenter || onOpenMissionControl);
 
   if (collapsed) {
     return (

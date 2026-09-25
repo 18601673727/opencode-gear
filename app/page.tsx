@@ -14,7 +14,7 @@ export default async function Home({
 
   // `profiles-models` opens the Control Center by default; `view` pins a tab.
   const view: WorkspaceView =
-    scenario === "profiles-models" ? "control-center" : scenario === "resource-ledger" ? "ledger" : "chat";
+    scenario === "profiles-models" ? "control-center" : scenario === "resource-ledger" ? "ledger" : scenario === "mission-control" ? "mission-control" : "chat";
   const controlCenterView = resolveControlCenterView(
     typeof params.view === "string" ? params.view : undefined,
   );

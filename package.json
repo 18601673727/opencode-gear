@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --import tsx --test components/ocg/runtime/*.test.ts components/ocg/bootstrap/*.test.ts components/ocg/resource-ledger/*.test.ts components/ocg/control-center/*.test.ts"
+    "test": "node --import tsx --test components/ocg/runtime/*.test.ts components/ocg/bootstrap/*.test.ts components/ocg/resource-ledger/*.test.ts components/ocg/control-center/*.test.ts components/ocg/execution/*.test.ts"
   },
   "dependencies": {
     "@assistant-ui/react": "^0.15.21",
