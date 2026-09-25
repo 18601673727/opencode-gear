@@ -17,7 +17,7 @@ export default async function Home({
   const requestedView = typeof params.view === "string" ? params.view : undefined;
   const view: WorkspaceView = requestedView === "settings" || requestedView === "logs"
     ? requestedView
-    : scenario === "profiles-models" ? "control-center" : scenario === "resource-ledger" ? "ledger" : scenario === "mission-control" ? "mission-control" : scenario === "logs-live" ? "logs" : "chat";
+    : scenario === "home-overview" || scenario === "home-calm" ? "home" : scenario === "profiles-models" ? "control-center" : scenario === "resource-ledger" ? "ledger" : scenario === "mission-control" ? "mission-control" : scenario === "logs-live" ? "logs" : "chat";
   const controlCenterView = resolveControlCenterView(
     typeof params.view === "string" ? params.view : undefined,
   );

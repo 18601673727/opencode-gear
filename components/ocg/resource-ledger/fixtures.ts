@@ -785,12 +785,12 @@ const ENTRIES: ResourceLedgerEntry[] = [
 ];
 
 /**
- * Returns the rich ledger only for the dedicated scenario. Other scenarios
- * carry `null` so the inspector shows an explicit empty state instead of
- * pretending every workspace has a ledger.
+ * Returns the rich ledger for the dedicated scenario and the home scenarios.
+ * Other scenarios carry `null` so the inspector shows an explicit
+ * empty state instead of pretending every workspace has a ledger.
  */
 export function createResourceLedgerFixture(scenario: ScenarioId): ResourceLedger | null {
-  if (scenario !== "resource-ledger") return null;
+  if (scenario !== "resource-ledger" && scenario !== "home-overview" && scenario !== "home-calm") return null;
   return {
     generatedAt: new Date(BASE_MS + 150 * 60_000).toISOString(),
     entries: ENTRIES.map((entry) => ({

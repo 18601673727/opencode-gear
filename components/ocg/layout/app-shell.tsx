@@ -16,8 +16,9 @@ import type { ControlCenterView } from "../control-center/domain";
 import { OcgRuntimeProvider, useOcgRuntime } from "../runtime/runtime-context";
 import type { ScenarioId } from "../runtime/runtime-types";
 import type { InspectorMode } from "../observability/inspector-state";
+import { HomeSurface } from "../home/home-surface";
 
-export type WorkspaceView = "chat" | "ledger" | "control-center" | "mission-control" | "logs" | "settings";
+export type WorkspaceView = "chat" | "home" | "ledger" | "control-center" | "mission-control" | "logs" | "settings";
 
 export function AppShell({
   scenario,
@@ -69,6 +70,7 @@ export function RuntimeWorkspace({
   const isMissionControl = view === "mission-control";
   const isLogs = view === "logs";
   const isSettings = view === "settings";
+  const isHome = view === "home";
 
   const handleNewChat = useCallback(async () => {
     if (!activeWorkType) return;
@@ -80,11 +82,9 @@ export function RuntimeWorkspace({
   const selectSession = useCallback((id: string) => {
     setActiveSessionId(id);
     setMobileNavOpen(false);
-    // Session selection is a chat action; leave other workspace views.
     if (view !== "chat") router.push("/");
   }, [router, view]);
 
-  // The provider owns runtime data. This callback only adapts the presentational ChatView contract.
   const handleSendMessage = useCallback(
     (content: string) => activeSessionKey ? sendMessage(activeSessionKey, { content }) : undefined,
     [activeSessionKey, sendMessage],
@@ -94,6 +94,12 @@ export function RuntimeWorkspace({
     setMobileNavOpen(false);
     setMobileMissionOpen(false);
     if (view !== "chat") router.push("/");
+  }, [router, view]);
+
+  const handleOpenHome = useCallback(() => {
+    setMobileNavOpen(false);
+    setMobileMissionOpen(false);
+    if (view !== "home") router.push("/?scenario=home-overview");
   }, [router, view]);
 
   const handleOpenLedger = useCallback(() => {
@@ -148,6 +154,7 @@ export function RuntimeWorkspace({
       runtimeStatus={snapshot.status}
       activeWorkspace={view}
       onOpenChat={handleOpenChat}
+      onOpenHome={handleOpenHome}
       onOpenLedger={handleOpenLedger}
       onOpenControlCenter={handleOpenControlCenter}
       onOpenMissionControl={handleOpenMissionControl}
@@ -196,6 +203,7 @@ export function RuntimeWorkspace({
             runtimeStatus={snapshot.status}
             activeWorkspace={view}
             onOpenChat={handleOpenChat}
+            onOpenHome={handleOpenHome}
             onOpenLedger={handleOpenLedger}
             onOpenControlCenter={handleOpenControlCenter}
             onOpenMissionControl={handleOpenMissionControl}
@@ -210,16 +218,19 @@ export function RuntimeWorkspace({
           session={activeSession}
           sidebarCollapsed={sidebarCollapsed}
           missionOpen={missionOpen}
-          missionControls={!isLedger && !isControlCenter && !isMissionControl && !isLogs && !isSettings}
+          missionControls={!isLedger && !isControlCenter && !isMissionControl && !isLogs && !isSettings && !isHome}
           ledgerActive={isLedger}
           controlCenterActive={isControlCenter}
           missionControlActive={isMissionControl}
           logsActive={isLogs}
           settingsActive={isSettings}
+          homeActive={isHome}
           onToggleSidebar={() => setSidebarCollapsed((value) => !value)}
           onToggleMission={() => setMissionMode((value) => value === "collapsed" ? "docked" : "collapsed")}
           onOpenMobileSidebar={() => setMobileNavOpen(true)}
           onOpenMobileMission={() => setMobileMissionOpen(true)}
+          onOpenChat={handleOpenChat}
+          onOpenHome={handleOpenHome}
           onOpenLedger={handleOpenLedger}
           onOpenControlCenter={handleOpenControlCenter}
           onOpenMissionControl={handleOpenMissionControl}
@@ -260,6 +271,18 @@ export function RuntimeWorkspace({
           <main aria-label="Settings" className="flex min-h-0 flex-1 overflow-hidden">
             <SettingsSurface snapshot={snapshot} />
           </main>
+        ) : isHome ? (
+          <main aria-label="Workspace home" className="flex min-h-0 flex-1 overflow-hidden">
+            <HomeSurface
+              snapshot={snapshot}
+              onOpenChat={handleOpenChat}
+              onOpenMissionControl={handleOpenMissionControl}
+              onOpenControlCenter={handleOpenControlCenter}
+              onOpenLedger={handleOpenLedger}
+              onOpenLogs={handleOpenLogs}
+              onOpenSettings={handleOpenSettings}
+            />
+          </main>
         ) : (
           <main aria-label="OCG workspace" className="flex min-h-0 flex-1">
             <div className="flex min-w-0 flex-1 flex-col">
@@ -288,7 +311,7 @@ export function RuntimeWorkspace({
         )}
       </div>
 
-      {!isLedger && !isControlCenter && !isMissionControl && !isLogs && !isSettings && (
+      {!isLedger && !isControlCenter && !isMissionControl && !isLogs && !isSettings && !isHome && (
         <div
           className={cn("fixed inset-0 z-50 lg:hidden", !mobileMissionOpen && "pointer-events-none")}
           aria-hidden={!mobileMissionOpen}

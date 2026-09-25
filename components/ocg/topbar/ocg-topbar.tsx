@@ -3,6 +3,7 @@
 import {
   ChevronsLeft,
   ChevronsRight,
+  Home,
   MoreHorizontal,
   PanelLeft,
   PanelRight,
@@ -30,10 +31,13 @@ type OcgTopbarProps = {
   missionControlActive?: boolean;
   logsActive?: boolean;
   settingsActive?: boolean;
+  homeActive?: boolean;
   onToggleSidebar: () => void;
   onToggleMission: () => void;
   onOpenMobileSidebar: () => void;
   onOpenMobileMission: () => void;
+  onOpenChat?: () => void;
+  onOpenHome?: () => void;
   onOpenLedger?: () => void;
   onOpenControlCenter?: () => void;
   onOpenMissionControl?: () => void;
@@ -59,10 +63,13 @@ export function OcgTopbar({
   missionControlActive = false,
   logsActive = false,
   settingsActive = false,
+  homeActive = false,
   onToggleSidebar,
   onToggleMission,
   onOpenMobileSidebar,
   onOpenMobileMission,
+  onOpenChat,
+  onOpenHome,
   onOpenLedger,
   onOpenControlCenter,
   onOpenMissionControl,
@@ -129,6 +136,19 @@ export function OcgTopbar({
         <span aria-hidden="true">·</span>
         <span>{runtimeStatus.state}</span>
       </div>
+
+      {onOpenHome && (
+        <Button
+          variant={homeActive ? "secondary" : "ghost"}
+          size="icon-xs"
+          onClick={onOpenHome}
+          aria-label={homeActive ? "Close Home" : "Open Home"}
+          aria-current={homeActive ? "page" : undefined}
+          title="Open Home"
+        >
+          <Home className="size-4" />
+        </Button>
+      )}
 
       <Button
         variant="ghost"

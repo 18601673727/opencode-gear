@@ -54,6 +54,8 @@ export const SCENARIO_IDS: readonly ScenarioId[] = [
   "profiles-models",
   "mission-control",
   "logs-live",
+  "home-overview",
+  "home-calm",
 ];
 
 export function resolveScenario(value: string | undefined | null): ScenarioId {
@@ -523,6 +525,84 @@ export function createScenarioFixture(id: ScenarioId): ScenarioFixture {
       ];
       fixture.missionsBySession[baseSession.id] = mission("paused", { current: "Waiting for operator approval" });
       break;
+    case "home-overview": {
+      // Deterministic busy workspace for the Home overview surface.
+      // Uses profiles-models bootstrap for full resource data.
+      fixture.bootstrap = createBootstrapFixture("profiles-models");
+      fixture.missionsBySession[baseSession.id] = mission("running", {
+        title: "Consolidate frontend architecture",
+        goal: "Dogfood the frontend execution inspector while preserving existing OCG surfaces.",
+        completed: 8,
+        total: 13,
+        current: "Wave 4/6",
+        tasks: [
+          { id: "t1", title: "Recon", status: "completed" },
+          { id: "t2", title: "Inventory", status: "completed" },
+          { id: "t3", title: "Foundation", status: "completed" },
+          { id: "t4", title: "Design system", status: "completed" },
+          { id: "t5", title: "Runtime boundary", status: "completed" },
+          { id: "t6", title: "Mission inspector", status: "completed" },
+          { id: "t7", title: "Onboarding", status: "completed" },
+          { id: "t8", title: "Resource ledger", status: "failed" },
+          { id: "t9", title: "Responsive", status: "active" },
+          { id: "t10", title: "Integration gate", status: "active" },
+          { id: "t11", title: "Verification follow-up", status: "pending" },
+          { id: "t12", title: "Conflict debug", status: "failed" },
+          { id: "t13", title: "Release gate", status: "pending" },
+        ],
+        workers: [
+          { id: "lead", name: "Lead", status: "active", task: "Coordinate" },
+          { id: "explore", name: "Explore", status: "completed", task: "Recon" },
+          { id: "explore-deep", name: "Explore Deep", status: "completed", task: "Inventory" },
+          { id: "build", name: "Build", status: "active", task: "Resource ledger" },
+          { id: "verify", name: "Verify", status: "active", task: "Integration" },
+          { id: "debug", name: "Debug", status: "waiting", task: "Conflict" },
+        ],
+        elapsed: "55m",
+        commitment: { workers: 6, mode: "capped" },
+        budget: { spent: 4.2, limit: 25, currency: "USD", status: "within-limit" },
+      });
+      // Add a paused mission
+      fixture.missionsBySession["research-space-bunny"] = {
+        title: "Space Bunny architecture study",
+        goal: "Research workspace.",
+        status: "paused",
+        completed: 2,
+        total: 5,
+        current: "Blocked on dependency",
+        tasks: [{ id: "t1", title: "One", status: "completed" }, { id: "t2", title: "Two", status: "failed" }],
+        workers: [{ id: "explore", name: "Explore", status: "waiting" }],
+        elapsed: "42m",
+        commitment: { workers: 1, mode: "capped" },
+        budget: { spent: 8.0, limit: 25, currency: "USD", status: "within-limit" },
+        warnings: [],
+      };
+      // Add a recently completed mission
+      fixture.missionsBySession["research-rust-graph"] = {
+        title: "Rust graph storage options",
+        goal: "Research workspace.",
+        status: "completed",
+        completed: 5,
+        total: 5,
+        current: "Complete",
+        tasks: [],
+        workers: [{ id: "explore-deep", name: "Explore Deep", status: "completed" }],
+        elapsed: "3h",
+        commitment: { workers: 1, mode: "capped" },
+        budget: { spent: 3.5, limit: 10, currency: "USD", status: "within-limit" },
+        warnings: [],
+      };
+      fixture.executionBySession[baseSession.id] = createMissionControlExecution();
+      break;
+    }
+    case "home-calm": {
+      // Calm workspace with no active missions and no attention items.
+      fixture.bootstrap = createBootstrapFixture("local-ready");
+      fixture.missionsBySession = {};
+      fixture.executionBySession = {};
+      fixture.resourceLedger = createResourceLedgerFixture("home-calm");
+      break;
+    }
   }
 
   return fixture;

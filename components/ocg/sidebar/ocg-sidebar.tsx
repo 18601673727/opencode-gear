@@ -4,6 +4,7 @@ import {
   ChevronsLeft,
   Code2,
   FlaskConical,
+  Home,
   LifeBuoy,
   MessageSquare,
   PenTool,
@@ -37,9 +38,10 @@ const GROUP_ICON: Record<WorkType, typeof Search> = {
   devops: Server,
 };
 
-export type WorkspaceTarget = "chat" | "ledger" | "control-center" | "mission-control" | "logs" | "settings";
+export type WorkspaceTarget = "home" | "chat" | "ledger" | "control-center" | "mission-control" | "logs" | "settings";
 
 const WORKSPACE_NAV: { target: WorkspaceTarget; label: string; icon: typeof Search }[] = [
+  { target: "home", label: "Home", icon: Home },
   { target: "chat", label: "Chat", icon: MessageSquare },
   { target: "control-center", label: "Control Center", icon: SlidersHorizontal },
   { target: "ledger", label: "Resource Ledger", icon: Table2 },
@@ -58,6 +60,7 @@ type OcgSidebarProps = {
   /** Active top-level workspace, used to highlight the navigation group. */
   activeWorkspace?: WorkspaceTarget;
   onOpenChat?: () => void;
+  onOpenHome?: () => void;
   onOpenLedger?: () => void;
   onOpenControlCenter?: () => void;
   onOpenMissionControl?: () => void;
@@ -116,6 +119,7 @@ export function OcgSidebar({
   runtimeStatus,
   activeWorkspace = "chat",
   onOpenChat,
+  onOpenHome,
   onOpenLedger,
   onOpenControlCenter,
   onOpenMissionControl,
@@ -123,6 +127,7 @@ export function OcgSidebar({
   onOpenSettings,
 }: OcgSidebarProps) {
   const navHandlers: Record<WorkspaceTarget, (() => void) | undefined> = {
+    home: onOpenHome,
     chat: onOpenChat,
     ledger: onOpenLedger,
     "control-center": onOpenControlCenter,
@@ -130,7 +135,7 @@ export function OcgSidebar({
     logs: onOpenLogs,
     settings: onOpenSettings,
   };
-  const hasNav = Boolean(onOpenChat || onOpenLedger || onOpenControlCenter || onOpenMissionControl || onOpenLogs);
+  const hasNav = Boolean(onOpenChat || onOpenHome || onOpenLedger || onOpenControlCenter || onOpenMissionControl || onOpenLogs);
 
   if (collapsed) {
     return (
