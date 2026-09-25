@@ -209,6 +209,8 @@ pub enum Command {
     Reject(Vec<OsString>),
     /// Run the loopback-only HTTP/SSE control server.
     Serve(Vec<OsString>),
+    /// Run the project-scoped STDIO MCP adapter.
+    Mcp(Vec<OsString>),
     /// Hidden/internal: the generated plugin's bridge. Never advertised.
     Bridge(Vec<OsString>),
     Version,
@@ -408,6 +410,7 @@ where
                     | Some("approve")
                     | Some("reject")
                     | Some("serve")
+                    | Some("mcp")
             ) {
                 rest.push(args[index].clone());
                 index += 1;
@@ -473,6 +476,7 @@ where
         Some("approve") => Command::Approve(rest),
         Some("reject") => Command::Reject(rest),
         Some("serve") => Command::Serve(rest),
+        Some("mcp") => Command::Mcp(rest),
         Some("__bridge") => Command::Bridge(rest),
         Some("version") => Command::Version,
         Some("doctor") => Command::Doctor,
@@ -544,6 +548,7 @@ Commands:
                         reject a pending admission request
   serve [--addr 127.0.0.1:PORT]
                         run the loopback-only HTTP/SSE control server
+  mcp                   run the local project-scoped STDIO MCP server
   version               report Gear, platform and the resolved OpenCode runtime
   doctor                diagnose layering, Lead contracts, OpenCode, proxy and runtime (read-only)
   upgrade               self-update Gear, then maintain the active OpenCode
@@ -707,7 +712,12 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
         env.throttle.as_deref(),
     );
 
-    if cli.dry_run && !matches!(cli.command, Command::Reconcile(_) | Command::Serve(_)) {
+    if cli.dry_run
+        && !matches!(
+            cli.command,
+            Command::Reconcile(_) | Command::Serve(_) | Command::Mcp(_)
+        )
+    {
         // Runtime-facing output: a dry-run must print the same contract a real
         // launch would use, so the runtime family is resolved exactly like
         // launch/doctor/models resolve it.
@@ -923,6 +933,16 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
         Command::Serve(args) => {
             boundary.require(&invocation_dir).map_err(Failure::Gear)?;
             serve_command(&project_root, args, cli.pretty)
+        }
+        Command::Mcp(args) => {
+            boundary.require(&invocation_dir).map_err(Failure::Gear)?;
+            if !args.is_empty() {
+                return Err(usage_failure(
+                    "ocg mcp accepts no arguments (STDIO is the only transport)",
+                ));
+            }
+            crate::mcp::serve_stdio(&project_root).map_err(Failure::Gear)?;
+            Ok(0)
         }
         Command::Bridge(args) => {
             boundary.require(&invocation_dir).map_err(Failure::Gear)?;

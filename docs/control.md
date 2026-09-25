@@ -253,7 +253,8 @@ conflict`, never a silent overwrite.
 ## Non-goals
 
 - No remote exposure: loopback only, and no auth/CORS/TLS layer.
-- No frontend, no WebSocket, no MCP.
+- No frontend or WebSocket. MCP is a separate STDIO adapter over the same
+  `ControlService`; it is not implemented in this HTTP server.
 - No reconciliation route; `ocg reconcile` stays an explicit CLI action.
 
 ## Tests

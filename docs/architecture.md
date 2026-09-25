@@ -994,6 +994,17 @@ typed JSON envelope with a stable code and status, bounded and redacted. There
 is no authentication, CORS, frontend, WebSocket or reconciliation route. See
 [control.md](control.md) for the routes, schemas, SSE semantics and limits.
 
+## Local MCP adapter
+
+Phase 2B-3 adds `ocg mcp`, a project-scoped STDIO adapter over the same
+`ControlService`. It introduces no state or network listener. Compact reads,
+bounded replay, approval resolution and explicit hard-budget changes call the
+existing application boundary in-process; model input can never select another
+root. SnapshotService remains authoritative, mutations retain domain CAS/policy/
+budget semantics, and protocol stdout contains only JSON-RPC. There are no
+reconcile, shell, filesystem, placement, runtime or provider-dispatch tools.
+See [mcp.md](mcp.md) for registration, schemas and the exact tool surface.
+
 ## Verification, distillation and checkpoints
 
 Verification is the explicit, configured half of the quality loop. It is a

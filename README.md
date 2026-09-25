@@ -909,6 +909,13 @@ post-commit cursor so a stream can resume without a gap. See
 [docs/control.md](docs/control.md) for the routes, schemas, SSE semantics and
 limits.
 
+`ocg mcp` runs a protocol-clean local STDIO MCP child over that same
+`ControlService`. It exposes compact authoritative reads, bounded replay,
+generation-bound approval resolution and explicit hard-budget changes only—no
+shell, filesystem, reconcile, placement, runtime or provider control. See
+[docs/mcp.md](docs/mcp.md) for the exact tools and current OpenCode V2
+registration shape.
+
 Inside the TUI, `Tab` / `Shift+Tab` cycle the three Lead agents. The cycle
 order depends on the active `default_agent`; the default configuration starts
 at `lead-low`. If you do not want the keybind, remove `keybinds` from
@@ -1517,6 +1524,7 @@ walkthrough.
 | [docs/verification.md](docs/verification.md) | Verification, log distillation, test selection, capabilities/firewall, checkpoints, stable ordering |
 | [docs/replay.md](docs/replay.md) | The durable replay authority: cursor/atomicity, epochs, retention, fail-closed bootstrap |
 | [docs/control.md](docs/control.md) | The loopback-only HTTP/1.1 + SSE control plane: routes, schemas, error envelope, limits |
+| [docs/mcp.md](docs/mcp.md) | The project-scoped STDIO MCP adapter: registration, bounded tools, authority and safety |
 | [docs/telemetry.md](docs/telemetry.md) | Telemetry schema, privacy model, token provenance, orchestration accounting, `ocg stats`, doctor checks, deferred boundaries |
 | [docs/token-efficiency.md](docs/token-efficiency.md) | Recorded deterministic context, log-distillation and orchestration hand-off measurements |
 | [docs/migration.md](docs/migration.md) | Step-by-step migration from a whole-bundle Gear/profile setup |

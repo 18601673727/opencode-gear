@@ -50,8 +50,10 @@ pub use context_governor::{
     ModelMetadata, TelemetryProvenance, TokenUsage,
 };
 pub use control::{
-    ApiIssue, ApprovalsView, BudgetView, ControlError, ControlService, ReplaySlice, ResourcesView,
-    SnapshotView, CONTROL_API_SCHEMA_VERSION, MAX_ERROR_MESSAGE_BYTES,
+    ApiIssue, ApprovalsView, AuthoritativeApprovalsView, AuthoritativeResourcesView, BudgetView,
+    ControlError, ControlService, MissionListItem, MissionView, MissionsView, ReplaySlice,
+    ResourcesView, SnapshotView, StateSummaryView, CONTROL_API_SCHEMA_VERSION,
+    MAX_ERROR_MESSAGE_BYTES,
 };
 pub use controller::{
     BuildDecision, BuildOutcome, ContextGovernanceResult, Controller, ExploreDigest,

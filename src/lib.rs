@@ -19,6 +19,7 @@ pub mod defaults;
 pub mod error;
 pub mod http;
 pub mod json;
+pub mod mcp;
 pub mod model;
 pub mod observability;
 pub mod orchestration;

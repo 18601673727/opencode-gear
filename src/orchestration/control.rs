@@ -28,6 +28,7 @@ use crate::orchestration::replay::{
 use crate::resources::{self, ResourceRecord};
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Upper bound on an error message returned to a client. Anything longer is
@@ -239,6 +240,67 @@ pub struct BudgetView {
     pub budget: MissionBudgetReceipt,
 }
 
+/// Compact, authoritative orientation data for model-facing adapters.
+#[derive(Debug, Clone, Serialize)]
+pub struct StateSummaryView {
+    pub cursor: Cursor,
+    pub mission_count: usize,
+    pub mission_statuses: BTreeMap<String, usize>,
+    pub pending_approval_count: usize,
+    pub resource_count: usize,
+    pub resource_health: BTreeMap<String, usize>,
+    pub budget_blocked_mission_count: usize,
+}
+
+/// A deliberately compact Mission projection for bounded listings.
+#[derive(Debug, Clone, Serialize)]
+pub struct MissionListItem {
+    pub mission_id: String,
+    pub revision: u64,
+    pub generation: u32,
+    pub status: String,
+    pub phase: String,
+    pub runtime_execution_id: Option<String>,
+    pub reconcile_status: String,
+    pub budget: MissionBudgetReceipt,
+    pub updated_at: i64,
+}
+
+/// A bounded Mission listing paired with the exact authority cursor.
+#[derive(Debug, Clone, Serialize)]
+pub struct MissionsView {
+    pub cursor: Cursor,
+    pub total: usize,
+    pub truncated: bool,
+    pub missions: Vec<MissionListItem>,
+}
+
+/// One authoritative Mission paired with the exact authority cursor.
+#[derive(Debug, Clone, Serialize)]
+pub struct MissionView {
+    pub cursor: Cursor,
+    pub mission: Mission,
+}
+
+/// Authority-backed approval state paired with its freshness cursor.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthoritativeApprovalsView {
+    pub cursor: Cursor,
+    pub total: usize,
+    pub truncated: bool,
+    pub approvals: Vec<ApprovalRecord>,
+}
+
+/// Authority-backed durable resource observations. Configured facts are not
+/// invented here and Unknown remains explicit in each observation.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthoritativeResourcesView {
+    pub cursor: Cursor,
+    pub total: usize,
+    pub truncated: bool,
+    pub resources: Vec<crate::resources::ResourceObservation>,
+}
+
 /// A thin handle to the durable orchestration authority.
 ///
 /// The underlying [`SnapshotService`] is cheap and stateless, so a long-lived
@@ -307,6 +369,137 @@ impl ControlService {
     /// The current authoritative head cursor.
     pub fn head(&self) -> std::result::Result<Cursor, ControlError> {
         self.service.head().map_err(ControlError::storage)
+    }
+
+    /// Return a cheap aggregate without exposing the full snapshot.
+    pub fn state_summary(&self) -> std::result::Result<StateSummaryView, ControlError> {
+        let view = self.snapshot()?;
+        let mut mission_statuses = BTreeMap::new();
+        let mut budget_blocked_mission_count = 0;
+        for mission in view.snapshot.missions.values() {
+            *mission_statuses
+                .entry(mission.status.as_str().to_string())
+                .or_insert(0) += 1;
+            if matches!(
+                mission.budget.status,
+                crate::orchestration::budget::BudgetStatus::Exhausted
+                    | crate::orchestration::budget::BudgetStatus::Breached
+            ) {
+                budget_blocked_mission_count += 1;
+            }
+        }
+        let mut resource_health = BTreeMap::new();
+        for resource in view.snapshot.resources.values() {
+            *resource_health
+                .entry(resource.health.state.as_str().to_string())
+                .or_insert(0) += 1;
+        }
+        Ok(StateSummaryView {
+            cursor: view.cursor,
+            mission_count: view.snapshot.missions.len(),
+            mission_statuses,
+            pending_approval_count: view
+                .snapshot
+                .approvals
+                .values()
+                .filter(|approval| approval.status.is_pending())
+                .count(),
+            resource_count: view.snapshot.resources.len(),
+            resource_health,
+            budget_blocked_mission_count,
+        })
+    }
+
+    /// List Missions from one authoritative snapshot, newest first.
+    pub fn missions(&self, limit: usize) -> std::result::Result<MissionsView, ControlError> {
+        let view = self.snapshot()?;
+        let total = view.snapshot.missions.len();
+        let mut missions: Vec<&Mission> = view.snapshot.missions.values().collect();
+        missions.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.mission_id.cmp(&b.mission_id))
+        });
+        let missions = missions
+            .into_iter()
+            .take(limit)
+            .map(|mission| MissionListItem {
+                mission_id: mission.mission_id.clone(),
+                revision: mission.revision,
+                generation: mission.generation,
+                status: mission.status.as_str().to_string(),
+                phase: mission.phase.as_str().to_string(),
+                runtime_execution_id: mission.session_id.clone(),
+                reconcile_status: mission.reconcile.status.as_str().to_string(),
+                budget: mission.budget.receipt(),
+                updated_at: mission.updated_at,
+            })
+            .collect();
+        Ok(MissionsView {
+            cursor: view.cursor,
+            total,
+            truncated: total > limit,
+            missions,
+        })
+    }
+
+    /// Get one Mission from the authoritative snapshot, never its projection.
+    pub fn mission(&self, mission_id: &str) -> std::result::Result<MissionView, ControlError> {
+        if !crate::orchestration::checkpoint::is_safe_id(mission_id) {
+            return Err(ControlError::invalid("mission_id is not a safe identifier"));
+        }
+        let view = self.snapshot()?;
+        let mission = view
+            .snapshot
+            .missions
+            .get(mission_id)
+            .cloned()
+            .ok_or_else(|| ControlError::not_found(format!("unknown Mission '{mission_id}'")))?;
+        Ok(MissionView {
+            cursor: view.cursor,
+            mission,
+        })
+    }
+
+    /// List approvals from the same validated snapshot as the returned cursor.
+    pub fn authoritative_approvals(
+        &self,
+        limit: usize,
+    ) -> std::result::Result<AuthoritativeApprovalsView, ControlError> {
+        let view = self.snapshot()?;
+        let mut approvals: Vec<ApprovalRecord> =
+            view.snapshot.approvals.values().cloned().collect();
+        let total = approvals.len();
+        approvals.sort_by(|a, b| {
+            b.requested_at
+                .cmp(&a.requested_at)
+                .then_with(|| a.approval_id.cmp(&b.approval_id))
+        });
+        approvals.truncate(limit);
+        Ok(AuthoritativeApprovalsView {
+            cursor: view.cursor,
+            total,
+            truncated: total > limit,
+            approvals,
+        })
+    }
+
+    /// List durable resource observations from the authoritative snapshot.
+    pub fn authoritative_resources(
+        &self,
+        limit: usize,
+    ) -> std::result::Result<AuthoritativeResourcesView, ControlError> {
+        let view = self.snapshot()?;
+        let mut resources: Vec<_> = view.snapshot.resources.values().cloned().collect();
+        let total = resources.len();
+        resources.sort_by(|a, b| a.resource_id.as_str().cmp(b.resource_id.as_str()));
+        resources.truncate(limit);
+        Ok(AuthoritativeResourcesView {
+            cursor: view.cursor,
+            total,
+            truncated: total > limit,
+            resources,
+        })
     }
 
     /// List every readable approval. Corruption is surfaced, never hidden.
