@@ -59,7 +59,15 @@ export type MissionStatus =
   | "failed"
   | "budget-exhausted";
 
-export type WorkerStatus = "idle" | "active" | "completed" | "failed";
+export type WorkerStatus =
+  | "queued"
+  | "starting"
+  | "active"
+  | "waiting"
+  | "idle"
+  | "completed"
+  | "failed"
+  | "cancelled";
 
 export type Worker = {
   id: string;

@@ -8,6 +8,7 @@ import { OcgSidebar } from "../sidebar/ocg-sidebar";
 import { OcgTopbar } from "../topbar/ocg-topbar";
 import { OcgRuntimeProvider, useOcgRuntime } from "../runtime/runtime-context";
 import type { ScenarioId } from "../runtime/runtime-types";
+import type { InspectorMode } from "../observability/inspector-state";
 
 export function AppShell({ scenario }: { scenario: ScenarioId }) {
   return (
@@ -22,7 +23,7 @@ function RuntimeWorkspace() {
   const [activeSessionId, setActiveSessionId] = useState("design-pwa-shell");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  const [missionOpen, setMissionOpen] = useState(true);
+  const [missionMode, setMissionMode] = useState<InspectorMode>("docked");
   const [mobileMissionOpen, setMobileMissionOpen] = useState(false);
 
   useEffect(() => {
@@ -63,6 +64,7 @@ function RuntimeWorkspace() {
   const messages = snapshot.messagesBySession[activeSession.id] ?? [];
   const mission = snapshot.missionsBySession[activeSession.id];
   const observability = snapshot.observabilityBySession[activeSession.id];
+  const missionOpen = missionMode !== "collapsed";
 
   const sidebar = (
     <OcgSidebar
@@ -124,7 +126,7 @@ function RuntimeWorkspace() {
           sidebarCollapsed={sidebarCollapsed}
           missionOpen={missionOpen}
           onToggleSidebar={() => setSidebarCollapsed((value) => !value)}
-          onToggleMission={() => setMissionOpen((value) => !value)}
+           onToggleMission={() => setMissionMode((value) => value === "collapsed" ? "docked" : "collapsed")}
           onOpenMobileSidebar={() => setMobileNavOpen(true)}
           onOpenMobileMission={() => setMobileMissionOpen(true)}
           runtimeStatus={snapshot.status}
@@ -145,11 +147,11 @@ function RuntimeWorkspace() {
             aria-label="Mission panel"
             className={cn(
               "hidden shrink-0 overflow-hidden border-border bg-background transition-[width,opacity] duration-200 ease-out lg:block",
-              missionOpen ? "w-[320px] border-l opacity-100" : "w-0 border-l-0 opacity-0",
+               missionMode === "expanded" ? "w-[min(640px,42vw)] border-l opacity-100" : missionMode === "docked" ? "w-[min(360px,28vw)] border-l opacity-100" : "w-0 border-l-0 opacity-0",
             )}
           >
-            <div className="h-full w-[320px]">
-              {mission && <MissionView mission={mission} observability={observability} onClose={() => setMissionOpen(false)} />}
+            <div className={cn("h-full", missionMode === "expanded" ? "w-[min(640px,42vw)]" : "w-[min(360px,28vw)]")}>
+              {mission && missionOpen && <MissionView mission={mission} observability={observability} mode={missionMode} onModeChange={setMissionMode} onClose={() => setMissionMode("collapsed")} />}
             </div>
           </aside>
         </main>
@@ -169,11 +171,11 @@ function RuntimeWorkspace() {
         <aside
           aria-label="Mission panel"
           className={cn(
-            "absolute inset-y-0 right-0 w-[320px] max-w-[85vw] border-l border-border bg-background transition-transform duration-200 ease-out",
-            mobileMissionOpen ? "translate-x-0" : "translate-x-full",
-          )}
-        >
-          {mission && <MissionView mission={mission} observability={observability} onClose={() => setMobileMissionOpen(false)} />}
+             "absolute inset-y-0 right-0 w-full max-w-none border-l border-border bg-background transition-transform duration-200 ease-out sm:w-[640px] sm:max-w-[85vw]",
+             mobileMissionOpen ? "translate-x-0" : "translate-x-full",
+           )}
+          >
+          {mobileMissionOpen && mission && <MissionView mission={mission} observability={observability} mode="expanded" onClose={() => setMobileMissionOpen(false)} />}
         </aside>
       </div>
     </div>

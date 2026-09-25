@@ -41,6 +41,7 @@ export type WorkerRuntimeStats = {
 export type ProviderStats = {
   provider: string;
   invocationCount: number;
+  retryCount: number;
   activeWorkers: number;
   workerCount: number;
   tokenUsage: TokenUsage;
@@ -55,6 +56,7 @@ export type ModelStats = {
   provider: string;
   model: string;
   invocationCount: number;
+  retryCount: number;
   activeWorkers: number;
   workerCount: number;
   tokenUsage: TokenUsage;
@@ -69,6 +71,7 @@ export type MissionRuntimeStats = {
   missionId: string;
   tokenUsage: TokenUsage;
   costMicros?: UsageValue;
+  estimatedFinalSpend?: UsageValue;
   elapsedMs?: number;
   invocationCount: number;
   retryCount: number;
@@ -81,11 +84,45 @@ export type UsageTimelinePoint = {
   cumulativeUsage: TokenUsage;
 };
 
+export type RuntimeActivityKind =
+  | "invocation-started"
+  | "worker-started"
+  | "worker-completed"
+  | "retry-scheduled"
+  | "invocation-failed"
+  | "usage-finalized"
+  | "worker-waiting"
+  | "mission-transition";
+
+export type RuntimeActivityItem = {
+  id: string;
+  timestamp: string;
+  elapsedMs: number;
+  kind: RuntimeActivityKind;
+  workerId?: string;
+  workerLabel?: string;
+  role?: "lead" | "worker";
+  summary: string;
+  provider?: string;
+  model?: string;
+  status?: WorkerStatus;
+};
+
+export type BudgetUsageProjection = {
+  spent: number;
+  limit: number;
+  remaining: number;
+  percent: number;
+  burnRatePerMinute?: number;
+  estimatedFinalSpend?: UsageValue;
+};
+
 /** Normalized observability state. It intentionally contains no transport or backend DTOs. */
 export type RuntimeObservability = {
   mission: MissionRuntimeStats;
   workers: WorkerRuntimeStats[];
   timeline: UsageTimelinePoint[];
+  activities: RuntimeActivityItem[];
 };
 
 const USAGE_KEYS: (keyof TokenUsage)[] = [
@@ -136,6 +173,7 @@ export function aggregateProviderStats(workers: WorkerRuntimeStats[]): ProviderS
   return [...groups.entries()].map(([provider, members]) => ({
     provider,
     invocationCount: members.reduce((total, worker) => total + worker.invocationCount, 0),
+    retryCount: members.reduce((total, worker) => total + worker.retryCount, 0),
     activeWorkers: members.filter((worker) => worker.status === "active").length,
     workerCount: members.length,
     tokenUsage: sumTokenUsage(members.map((worker) => worker.tokenUsage)),
@@ -157,6 +195,7 @@ export function aggregateModelStats(workers: WorkerRuntimeStats[]): ModelStats[]
     provider: members[0].provider,
     model: members[0].model,
     invocationCount: members.reduce((total, worker) => total + worker.invocationCount, 0),
+    retryCount: members.reduce((total, worker) => total + worker.retryCount, 0),
     activeWorkers: members.filter((worker) => worker.status === "active").length,
     workerCount: members.length,
     tokenUsage: sumTokenUsage(members.map((worker) => worker.tokenUsage)),
@@ -170,4 +209,48 @@ export function aggregateModelStats(workers: WorkerRuntimeStats[]): ModelStats[]
 
 export function boundTimeline(points: UsageTimelinePoint[], limit = 60): UsageTimelinePoint[] {
   return points.slice(Math.max(0, points.length - limit));
+}
+
+export function boundActivities(items: RuntimeActivityItem[], limit = 80): RuntimeActivityItem[] {
+  return items.slice(Math.max(0, items.length - limit));
+}
+
+export type ChartableTimelinePoint = {
+  timestamp: string;
+  elapsedMs: number;
+  total: number | null;
+  estimatedTotal: number | null;
+  reportedTotal: number | null;
+  provenance?: UsageProvenance;
+};
+
+/** Converts normalized points into explicit numeric/null chart values without interpolating missing usage. */
+export function toChartableTimeline(points: UsageTimelinePoint[]): ChartableTimelinePoint[] {
+  return boundTimeline(points).map((point) => {
+    const total = point.cumulativeUsage.total;
+    return {
+      timestamp: point.timestamp,
+      elapsedMs: point.elapsedMs,
+      total: total?.value ?? null,
+      estimatedTotal: total?.provenance === "estimated" ? total.value : null,
+      reportedTotal: total?.provenance === "reported" ? total.value : null,
+      provenance: total?.provenance,
+    };
+  });
+}
+
+export function deriveBudgetUsage(
+  budget: { spent: number; limit: number },
+  elapsedMs?: number,
+  estimatedFinalSpend?: UsageValue,
+): BudgetUsageProjection {
+  const remaining = Math.max(0, budget.limit - budget.spent);
+  return {
+    spent: budget.spent,
+    limit: budget.limit,
+    remaining,
+    percent: budget.limit > 0 ? Math.min(100, (budget.spent / budget.limit) * 100) : 0,
+    burnRatePerMinute: elapsedMs && elapsedMs > 0 ? budget.spent / (elapsedMs / 60_000) : undefined,
+    estimatedFinalSpend,
+  };
 }

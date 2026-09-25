@@ -7,6 +7,7 @@ import type {
 } from "../types";
 import type { ScenarioId } from "./runtime-types";
 import type {
+  RuntimeActivityItem,
   RuntimeObservability,
   UsageTimelinePoint,
   WorkerRuntimeStats,
@@ -151,6 +152,32 @@ function timeline(...points: UsageTimelinePoint[]): UsageTimelinePoint[] {
   return points;
 }
 
+function activity(
+  id: string,
+  elapsedMs: number,
+  kind: RuntimeActivityItem["kind"],
+  summary: string,
+  worker?: Pick<WorkerRuntimeStats, "workerId" | "label" | "role" | "provider" | "model" | "status">,
+): RuntimeActivityItem {
+  return {
+    id,
+    timestamp: `00:${String(Math.floor(elapsedMs / 1000)).padStart(2, "0")}`,
+    elapsedMs,
+    kind,
+    summary,
+    ...(worker
+      ? {
+          workerId: worker.workerId,
+          workerLabel: worker.label,
+          role: worker.role,
+          provider: worker.provider,
+          model: worker.model,
+          status: worker.status,
+        }
+      : {}),
+  };
+}
+
 function createDefaultObservability(missionId: string): RuntimeObservability {
   const workers = [
     runtimeWorker("lead", "Lead-Mid", "Command Code", "Muse Spark 1.3 Contributor", {
@@ -188,8 +215,13 @@ function createDefaultObservability(missionId: string): RuntimeObservability {
       invocationCount: 3,
       retryCount: 0,
       activeWorkerCount: 1,
+      estimatedFinalSpend: usage(11, "estimated"),
     },
     workers,
+    activities: [
+      activity("default-lead-started", 0, "worker-started", "Lead runtime connected", workers[0]),
+      activity("default-worker-completed", 86000, "worker-completed", "Local worker completed", workers[1]),
+    ],
     timeline: timeline(
       { timestamp: "00:00", elapsedMs: 0, cumulativeUsage: { input: usage(0), output: usage(0), total: usage(0) } },
       { timestamp: "21:00", elapsedMs: 1260000, cumulativeUsage: { input: usage(7600), output: usage(2600), total: usage(10200, "estimated") } },
@@ -208,6 +240,7 @@ function createLiveObservability(missionId: string): RuntimeObservability {
       invocationCount: 4,
       retryCount: 0,
       activeWorkerCount: 3,
+      estimatedFinalSpend: usage(10.4, "estimated"),
     },
     workers: [
       runtimeWorker("lead", "Lead-Mid", "Command Code", "Muse Spark 1.3 Contributor", {
@@ -225,10 +258,10 @@ function createLiveObservability(missionId: string): RuntimeObservability {
         tokenUsage: { input: usage(1300), output: usage(400), total: usage(1700, "estimated") },
         costMicros: usage(9000, "estimated"), latencyMs: 730, tokensPerSecond: 31,
       }),
-      runtimeWorker("build", "Build", "Command Code", "DeepSeek V4.1 Flash", { status: "idle" }),
-      runtimeWorker("verify", "Verify", "OpenCode Zen", "Muse Spark 1.3 Contributor Free", { status: "idle" }),
-      runtimeWorker("debug", "Debug", "OpenCode Go", "Space Bunny Free", { status: "idle" }),
-      runtimeWorker("docs", "Docs", "Command Code", "Muse Spark 1.3 Contributor", { status: "idle" }),
+      runtimeWorker("build", "Build", "Command Code", "DeepSeek V4.1 Flash", { status: "queued" }),
+      runtimeWorker("verify", "Verify", "OpenCode Zen", "Muse Spark 1.3 Contributor Free", { status: "waiting" }),
+      runtimeWorker("debug", "Debug", "OpenCode Go", "Space Bunny Free", { status: "queued" }),
+      runtimeWorker("docs", "Docs", "Command Code", "Muse Spark 1.3 Contributor", { status: "queued" }),
     ],
     timeline: timeline(
       { timestamp: "00:00", elapsedMs: 0, cumulativeUsage: { total: usage(0) } },
@@ -236,6 +269,12 @@ function createLiveObservability(missionId: string): RuntimeObservability {
       { timestamp: "00:12", elapsedMs: 12000, cumulativeUsage: { input: usage(5600), output: usage(1400), total: usage(7000, "estimated") } },
       { timestamp: "00:18", elapsedMs: 18000, cumulativeUsage: { input: usage(6400), output: usage(1800), total: usage(8200, "estimated") } },
     ),
+    activities: [
+      activity("live-lead-started", 0, "worker-started", "Lead started coordinating the Mission", { workerId: "lead", label: "Lead-Mid", role: "lead", provider: "Command Code", model: "Muse Spark 1.3 Contributor", status: "active" }),
+      activity("live-explore-started", 4000, "worker-started", "Explore started runtime mapping", { workerId: "explore", label: "Explore", role: "worker", provider: "OpenCode Go", model: "Space Bunny Free", status: "active" }),
+      activity("live-deep-started", 9000, "worker-started", "Explore Deep started architecture review", { workerId: "explore-deep", label: "Explore Deep", role: "worker", provider: "OpenCode Go", model: "Space Bunny Free", status: "active" }),
+      activity("live-usage-estimated", 18000, "invocation-started", "Streaming usage is estimated"),
+    ],
   };
 }
 
@@ -250,11 +289,12 @@ function updateLiveObservability(base: RuntimeObservability, step: 1 | 2 | 3): R
       costMicros: usage(15000), latencyMs: 640, tokensPerSecond: 32,
     });
     if (build) Object.assign(build, {
-      status: "active", startedAt: "00:24", elapsedMs: 9000, invocationCount: 1,
+      status: "starting", startedAt: "00:24", elapsedMs: 9000, invocationCount: 1,
       tokenUsage: { input: usage(1500), output: usage(300), total: usage(1800, "estimated") },
       costMicros: usage(7000, "estimated"), latencyMs: 480, ttftMs: 120,
     });
     next.mission = { ...next.mission, tokenUsage: { input: usage(8300), output: usage(2300), total: usage(10600, "estimated") }, costMicros: usage(68000, "estimated"), elapsedMs: 25000, invocationCount: 5, activeWorkerCount: 3 };
+    next.activities = [...next.activities, activity("live-explore-completed", 25000, "worker-completed", "Explore completed runtime mapping", next.workers.find((worker) => worker.workerId === "explore")), activity("live-build-started", 25000, "worker-started", "Build started implementation", next.workers.find((worker) => worker.workerId === "build")), activity("live-verify-waiting", 25000, "worker-waiting", "Verify is waiting for the build", next.workers.find((worker) => worker.workerId === "verify"))];
     next.timeline = [...next.timeline, { timestamp: "00:25", elapsedMs: 25000, cumulativeUsage: { input: usage(8300), output: usage(2300), total: usage(10600, "estimated") } }];
   }
   if (step === 2) {
@@ -265,13 +305,15 @@ function updateLiveObservability(base: RuntimeObservability, step: 1 | 2 | 3): R
     if (build) Object.assign(build, { status: "active", elapsedMs: 18000, invocationCount: 2, retryCount: 1, tokenUsage: { input: usage(2100), output: usage(600), total: usage(2700, "estimated") }, costMicros: usage(11000, "estimated"), latencyMs: 540 });
     if (verify) Object.assign(verify, { status: "active", startedAt: "00:33", elapsedMs: 5000, invocationCount: 1, tokenUsage: { input: usage(900), output: usage(120), total: usage(1020, "estimated") }, latencyMs: 390 });
     next.mission = { ...next.mission, tokenUsage: { input: usage(10800), output: usage(3200), total: usage(14000, "estimated") }, costMicros: usage(88000, "estimated"), elapsedMs: 36000, invocationCount: 7, retryCount: 1, activeWorkerCount: 3 };
+    next.activities = [...next.activities, activity("live-build-failed", 32000, "invocation-failed", "Build invocation failed transiently", build), activity("live-build-retry", 33000, "retry-scheduled", "Build retry scheduled after transient failure", build), activity("live-verify-started", 36000, "worker-started", "Verify started the post-build check", verify)];
     next.timeline = [...next.timeline, { timestamp: "00:36", elapsedMs: 36000, cumulativeUsage: { input: usage(10800), output: usage(3200), total: usage(14000, "estimated") } }];
   }
   if (step === 3) {
     next.workers = next.workers.map((worker) => worker.workerId === "docs"
       ? { ...worker, status: "completed", elapsedMs: 6000, invocationCount: 1, successCount: 1, tokenUsage: { input: usage(700), output: usage(220), total: usage(920) } }
       : { ...worker, status: worker.status === "idle" ? "completed" : "completed", finishedAt: "00:44", successCount: worker.successCount ?? 1, tokenUsage: Object.fromEntries(Object.entries(worker.tokenUsage).map(([key, value]) => [key, value && { ...value, provenance: "reported" }])) as WorkerRuntimeStats["tokenUsage"] });
-    next.mission = { ...next.mission, tokenUsage: { input: usage(12400, "reported"), output: usage(3900, "reported"), total: usage(16300, "reported") }, costMicros: usage(104000, "reported"), elapsedMs: 44000, invocationCount: 9, retryCount: 1, activeWorkerCount: 0 };
+    next.mission = { ...next.mission, tokenUsage: { input: usage(12400, "reported"), output: usage(3900, "reported"), total: usage(16300, "reported") }, costMicros: usage(104000, "reported"), estimatedFinalSpend: usage(10.4, "reported"), elapsedMs: 44000, invocationCount: 9, retryCount: 1, activeWorkerCount: 0 };
+    next.activities = [...next.activities, activity("live-usage-finalized", 44000, "usage-finalized", "Provider-reported usage finalized"), activity("live-mission-complete", 44000, "mission-transition", "Mission completed")];
     next.timeline = [...next.timeline, { timestamp: "00:44", elapsedMs: 44000, cumulativeUsage: { input: usage(12400, "reported"), output: usage(3900, "reported"), total: usage(16300, "reported") } }];
   }
   return next;
@@ -356,9 +398,9 @@ export function createScenarioFixture(id: ScenarioId): ScenarioFixture {
       const step2 = updateLiveObservability(step1, 2);
       const step3 = updateLiveObservability(step2, 3);
       fixture.observabilityUpdates = [
-        { afterMs: 650, sessionId: baseSession.id, observability: step1, mission: mission("running", { completed: 4, current: "Build is assembling the selected change", workers: [{ id: "lead", name: "Lead-Mid", status: "active", task: "Coordinate Mission" }, { id: "explore", name: "Explore", status: "completed", task: "Map runtime boundaries" }, { id: "build", name: "Build", status: "active", task: "Implement foundation" }] }) },
-        { afterMs: 1300, sessionId: baseSession.id, observability: step2, mission: mission("running", { completed: 5, current: "Verify is checking the build after one retry", workers: [{ id: "lead", name: "Lead-Mid", status: "active", task: "Coordinate Mission" }, { id: "build", name: "Build", status: "active", task: "Implement foundation" }, { id: "verify", name: "Verify", status: "active", task: "Review the result" }] }) },
-        { afterMs: 1950, sessionId: baseSession.id, observability: step3, mission: mission("completed", { completed: 7, current: "Mission complete", tasks: fixture.missionsBySession[baseSession.id]!.tasks.map((task) => ({ ...task, status: "completed" })), workers: [{ id: "lead", name: "Lead-Mid", status: "completed", task: "Mission complete" }] }) },
+        { afterMs: 650, sessionId: baseSession.id, observability: step1, mission: mission("running", { completed: 4, current: "Build is assembling the selected change", budget: { spent: 6.8, limit: 25, currency: "USD", status: "within-limit" }, workers: [{ id: "lead", name: "Lead-Mid", status: "active", task: "Coordinate Mission" }, { id: "explore", name: "Explore", status: "completed", task: "Map runtime boundaries" }, { id: "build", name: "Build", status: "active", task: "Implement foundation" }] }) },
+        { afterMs: 1300, sessionId: baseSession.id, observability: step2, mission: mission("running", { completed: 5, current: "Verify is checking the build after one retry", budget: { spent: 8.8, limit: 25, currency: "USD", status: "within-limit" }, workers: [{ id: "lead", name: "Lead-Mid", status: "active", task: "Coordinate Mission" }, { id: "build", name: "Build", status: "active", task: "Implement foundation" }, { id: "verify", name: "Verify", status: "active", task: "Review the result" }] }) },
+        { afterMs: 1950, sessionId: baseSession.id, observability: step3, mission: mission("completed", { completed: 7, current: "Mission complete", budget: { spent: 10.4, limit: 25, currency: "USD", status: "within-limit" }, tasks: fixture.missionsBySession[baseSession.id]!.tasks.map((task) => ({ ...task, status: "completed" })), workers: [{ id: "lead", name: "Lead-Mid", status: "completed", task: "Mission complete" }] }) },
       ];
       break;
     }

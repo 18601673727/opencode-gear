@@ -8,7 +8,7 @@ import type {
   WorkType,
 } from "../types";
 import { createScenarioFixture } from "./scenarios";
-import { boundTimeline } from "./observability";
+import { boundActivities, boundTimeline } from "./observability";
 import type {
   CreateSessionInput,
   OcgRuntimeClient,
@@ -218,7 +218,11 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
         ...this.snapshot,
         observabilityBySession: {
           ...this.snapshot.observabilityBySession,
-          [event.sessionId]: { ...event.observability, timeline: boundTimeline(event.observability.timeline) },
+          [event.sessionId]: {
+            ...event.observability,
+            timeline: boundTimeline(event.observability.timeline),
+            activities: boundActivities(event.observability.activities),
+          },
         },
       };
     }
@@ -240,7 +244,11 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
         this.emit({
           type: "observability.updated",
           sessionId: update.sessionId,
-          observability: clone({ ...update.observability, timeline: boundTimeline(update.observability.timeline) }),
+          observability: clone({
+            ...update.observability,
+            timeline: boundTimeline(update.observability.timeline),
+            activities: boundActivities(update.observability.activities),
+          }),
         });
         if (update.mission) this.emit({ type: "mission.updated", sessionId: update.sessionId, mission: clone(update.mission) });
       }, update.afterMs);

@@ -1,187 +1,76 @@
 "use client";
 
-import {
-  Check,
-  Circle,
-  CircleDot,
-  Clock,
-  Cpu,
-  AlertCircle,
-  Loader2,
-  Wallet,
-  X,
-} from "lucide-react";
+import { CircleDot, Maximize2, Minimize2, X } from "lucide-react";
+import { useState } from "react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { ActivityPulse } from "../activity-pulse";
 import type { Mission } from "../types";
 import type { RuntimeObservability } from "../runtime/observability";
 import { ObservabilityPanel } from "../observability/observability-panel";
+import { INSPECTOR_TABS, toggleInspectorMode, type InspectorMode, type InspectorTab } from "../observability/inspector-state";
 
 type MissionViewProps = {
   mission: Mission;
   observability?: RuntimeObservability | null;
+  mode?: InspectorMode;
+  onModeChange?: (mode: InspectorMode) => void;
   onClose: () => void;
 };
 
-function TaskIcon({ status }: { status: Mission["tasks"][number]["status"] }) {
-  if (status === "completed")
-    return <Check className="size-3.5 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />;
-  if (status === "active")
-    return <Loader2 className="size-3.5 animate-spin text-foreground" aria-hidden="true" />;
-  if (status === "failed") return <AlertCircle className="size-3.5 text-red-500" aria-hidden="true" />;
-  return <Circle className="size-3.5 text-muted-foreground/60" aria-hidden="true" />;
+const TAB_LABELS: Record<InspectorTab, string> = {
+  overview: "Overview",
+  runtime: "Runtime",
+  usage: "Usage",
+};
+
+function MissionContext({ mission, compact = false }: { mission: Mission; compact?: boolean }) {
+  const pct = mission.total > 0 ? Math.round((mission.completed / mission.total) * 100) : 0;
+  return (
+    <div className={cn(compact ? "rounded-md border border-border bg-muted/20 px-2.5 py-2" : "", "min-w-0")}>
+      <p className={cn("truncate font-semibold tracking-tight", compact ? "text-[12px]" : "text-[14px]")} title={mission.title}>{mission.title}</p>
+      <div className="mt-1.5 flex items-center gap-1.5">
+        <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2 py-0.5 text-[11px] font-medium capitalize">
+          <span className={cn("size-1.5 rounded-full", mission.status === "running" && "animate-pulse bg-amber-500", mission.status === "completed" && "bg-emerald-500", (mission.status === "failed" || mission.status === "budget-exhausted") && "bg-red-500", mission.status === "paused" && "bg-muted-foreground", mission.status === "planning" && "bg-sky-500")} aria-hidden="true" />
+          {mission.status.replace("-", " ")}
+        </span>
+        <span className="text-[11px] text-muted-foreground">{mission.completed} / {mission.total} tasks</span>
+        <span className="ml-auto text-[11px] tabular-nums text-muted-foreground">{pct}%</span>
+      </div>
+      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted" role="progressbar" aria-label="Mission progress" aria-valuemin={0} aria-valuemax={mission.total} aria-valuenow={mission.completed}>
+        <div className="h-full rounded-full bg-foreground transition-[width] duration-300" style={{ width: `${pct}%` }} />
+      </div>
+      {!compact && <p className="mt-1 text-[11px] text-muted-foreground">{pct}% complete · local fixture</p>}
+    </div>
+  );
 }
 
-export function MissionView({ mission, observability, onClose }: MissionViewProps) {
-  const pct = Math.round((mission.completed / mission.total) * 100);
+export function MissionView({ mission, observability, mode = "docked", onModeChange, onClose }: MissionViewProps) {
+  const [tab, setTab] = useState<InspectorTab>("overview");
+  const hasObservability = Boolean(observability);
+  const nextMode = toggleInspectorMode(mode);
   return (
-    <div className="flex h-full w-full flex-col">
-      <div className="flex items-center gap-2 border-b border-border px-3 py-2.5">
+    <div className="flex h-full w-full min-w-0 flex-col">
+      <header className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2.5">
         <CircleDot className="size-4 text-muted-foreground" aria-hidden="true" />
-        <h2 className="flex-1 text-[13px] font-semibold tracking-tight">Mission</h2>
-        <Button
-          variant="ghost"
-          size="icon-xs"
-          onClick={onClose}
-          aria-label="Collapse mission panel"
-          title="Collapse mission panel"
-        >
-          <X className="size-4" />
-        </Button>
-      </div>
+        <h2 className="flex-1 text-[13px] font-semibold tracking-tight">Mission Inspector</h2>
+        {onModeChange && <Button variant="ghost" size="icon-xs" className="hidden lg:inline-flex" onClick={() => onModeChange(nextMode)} aria-label={mode === "expanded" ? "Dock mission inspector" : "Expand mission inspector"} title={mode === "expanded" ? "Dock mission inspector" : "Expand mission inspector"}>{mode === "expanded" ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}</Button>}
+        <Button variant="ghost" size="icon-xs" onClick={onClose} aria-label="Collapse mission inspector" title="Collapse mission inspector"><X className="size-4" /></Button>
+      </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
-        <p className="text-[14px] font-semibold tracking-tight">{mission.title}</p>
-        <div className="mt-1.5 flex items-center gap-1.5">
-          <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2 py-0.5 text-[11px] font-medium">
-            <span
-              className={cn(
-                "size-1.5 rounded-full",
-                mission.status === "running" && "animate-pulse bg-amber-500",
-                mission.status === "completed" && "bg-emerald-500",
-                mission.status === "failed" && "bg-red-500",
-                mission.status === "budget-exhausted" && "bg-red-500",
-                mission.status === "paused" && "bg-muted-foreground",
-                mission.status === "planning" && "bg-sky-500",
-              )}
-              aria-hidden="true"
-            />
-            {mission.status}
-          </span>
-          <span className="text-[11px] text-muted-foreground">
-            {mission.completed} / {mission.total} tasks
-          </span>
-        </div>
-
-        <div
-          className="mt-2.5"
-          role="progressbar"
-          aria-valuenow={mission.completed}
-          aria-valuemin={0}
-          aria-valuemax={mission.total}
-          aria-label="Mission progress"
-        >
-          <div className="h-1.5 overflow-hidden rounded-full bg-muted">
-            <div
-              className="h-full rounded-full bg-foreground transition-[width] duration-300 ease-out"
-              style={{ width: `${pct}%` }}
-            />
-          </div>
-          <p className="mt-1 text-[11px] text-muted-foreground">{pct}% complete · local fixture</p>
-        </div>
-
-        <p className="mt-3 text-[12px] leading-5 text-muted-foreground">{mission.goal}</p>
-
-        <div className="mt-3 rounded-md border border-border bg-muted/30 px-2.5 py-2">
-          <p className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">
-            Current
-          </p>
-          <p className="mt-0.5 text-[13px] font-medium">{mission.current}</p>
-        </div>
-
-        <h3 className="mt-4 mb-1 text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">
-          Tasks
-        </h3>
-        <ul className="flex flex-col">
-          {mission.tasks.map((task) => (
-            <li
-              key={task.id}
-              className={cn(
-                "flex items-center gap-2 rounded-md px-2 py-1.5 text-[13px]",
-                task.status === "active" && "bg-muted font-medium",
-                 task.status === "completed" && "text-muted-foreground",
-                 task.status === "pending" && "text-muted-foreground",
-                 task.status === "failed" && "text-red-600 dark:text-red-400",
-              )}
-            >
-              <TaskIcon status={task.status} />
-              <span
-                className={cn(
-                  "flex-1 truncate",
-                   task.status === "completed" && "line-through decoration-muted-foreground/50",
-                )}
-              >
-                {task.title}
-              </span>
-              {task.status === "active" && (
-                <span className="rounded border border-border bg-background px-1 text-[10px] text-muted-foreground">
-                  now
-                </span>
-              )}
-            </li>
-          ))}
-        </ul>
-
-        <h3 className="mt-4 mb-1.5 text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">
-          Resources
-        </h3>
-        <dl className="flex flex-col gap-1.5 text-[12px]">
-          <div className="flex items-center gap-2 rounded-md border border-border px-2.5 py-2">
-            <Cpu className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
-            <dt className="text-muted-foreground">Commitment</dt>
-            <dd className="ml-auto font-medium">
-              {mission.commitment.workers} workers · {mission.commitment.mode}
-            </dd>
-          </div>
-          <div className="flex items-center gap-2 rounded-md border border-border px-2.5 py-2">
-            <Wallet className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
-            <dt className="text-muted-foreground">Budget</dt>
-            <dd className={cn("ml-auto font-medium", mission.budget.status === "exhausted" && "text-red-600 dark:text-red-400")}>
-              ${mission.budget.spent} / ${mission.budget.limit}
-            </dd>
-          </div>
-          {mission.workers.map((worker) => (
-            <div key={worker.id} className="flex items-center gap-2 rounded-md border border-border px-2.5 py-2">
-              <ActivityPulse className="size-5 shrink-0" label={`${worker.name} activity`} />
-              <dt className="text-muted-foreground">Worker</dt>
-              <dd className="ml-auto text-right font-medium">
-                {worker.name}
-                <span className="block text-[11px] font-normal text-muted-foreground">
-                  {worker.status}{worker.task ? ` · ${worker.task}` : ""}
-                </span>
-              </dd>
-            </div>
-          ))}
-          <div className="flex items-center gap-2 rounded-md border border-border px-2.5 py-2">
-            <Clock className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
-            <dt className="text-muted-foreground">Elapsed</dt>
-            <dd className="ml-auto font-medium">{mission.elapsed}</dd>
-          </div>
-        </dl>
-
-        {observability && <ObservabilityPanel observability={observability} />}
-
-        {mission.warnings.length > 0 && (
-          <div className="mt-3 flex flex-col gap-1 rounded-md border border-amber-500/30 bg-amber-500/5 px-2.5 py-2 text-[11px] text-muted-foreground">
-            {mission.warnings.map((warning) => <p key={warning}>{warning}</p>)}
-          </div>
+        {!hasObservability ? (
+          <div className="flex flex-col gap-3"><MissionContext mission={mission} /><p className="rounded-md border border-dashed border-border px-2.5 py-3 text-[11px] text-muted-foreground">Runtime observability is not available for this Mission yet.</p></div>
+        ) : (
+          <>
+            {tab === "overview" ? <MissionContext mission={mission} /> : <MissionContext mission={mission} compact />}
+            <nav className="sticky top-0 z-10 -mx-3 mt-3 border-y border-border bg-background/95 px-3 py-1.5 backdrop-blur" aria-label="Mission inspector surfaces" role="tablist">
+              <div className="grid grid-cols-3 gap-1 rounded-md bg-muted/50 p-0.5">
+                {INSPECTOR_TABS.map((item) => <button key={item} type="button" role="tab" aria-selected={tab === item} aria-controls={`mission-inspector-${item}`} onClick={() => setTab(item)} className={cn("rounded px-2 py-1.5 text-[11px] font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring", tab === item ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground")}>{TAB_LABELS[item]}</button>)}
+              </div>
+            </nav>
+            <div id={`mission-inspector-${tab}`} role="tabpanel" aria-label={TAB_LABELS[tab]} className="mt-3"><ObservabilityPanel mission={mission} observability={observability!} tab={tab} /></div>
+          </>
         )}
-
-        <p className="mt-3 rounded-md bg-muted/40 px-2.5 py-2 text-[11px] leading-5 text-muted-foreground">
-          Illustrative surface only — durable Mission state, persistence, and
-          orchestration land in a later phase.
-        </p>
       </div>
     </div>
   );

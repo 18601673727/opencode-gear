@@ -3,12 +3,16 @@ import { test } from "node:test";
 import {
   aggregateModelStats,
   aggregateProviderStats,
+  boundActivities,
   boundTimeline,
+  deriveBudgetUsage,
   sumTokenUsage,
   sumUsageValues,
+  toChartableTimeline,
   type WorkerRuntimeStats,
 } from "./observability";
 import { createScenarioFixture } from "./scenarios";
+import { isInspectorTab, restoreWorkerSelection, toggleInspectorMode } from "../observability/inspector-state";
 
 function worker(overrides: Partial<WorkerRuntimeStats> = {}): WorkerRuntimeStats {
   return {
@@ -68,6 +72,33 @@ test("timeline history is bounded to the newest points", () => {
   assert.equal(bounded[0].timestamp, "5");
 });
 
+test("timeline normalization preserves plotted values and provenance", () => {
+  const points = toChartableTimeline(createScenarioFixture("observability-live").observabilityBySession["design-pwa-shell"]!.timeline);
+  assert.ok(points.length >= 4);
+  assert.ok(points.some((point) => point.estimatedTotal !== null));
+  assert.ok(points.every((point) => point.total !== null));
+  assert.equal(points[1].provenance, "estimated");
+});
+
+test("budget projection exposes remaining, percentage, and burn rate", () => {
+  const budget = deriveBudgetUsage({ spent: 8, limit: 20 }, 120_000, { value: 12, provenance: "estimated" });
+  assert.equal(budget.remaining, 12);
+  assert.equal(budget.percent, 40);
+  assert.equal(budget.burnRatePerMinute, 4);
+  assert.deepEqual(budget.estimatedFinalSpend, { value: 12, provenance: "estimated" });
+});
+
+test("activity feed is bounded and worker selection survives compatible updates", () => {
+  const activities = Array.from({ length: 85 }, (_, index) => ({ id: String(index), timestamp: String(index), elapsedMs: index, kind: "worker-started" as const, summary: "started" }));
+  assert.equal(boundActivities(activities).length, 80);
+  assert.equal(restoreWorkerSelection("build", ["lead", "build"]), "build");
+  assert.equal(restoreWorkerSelection("build", ["lead"]), null);
+  assert.equal(isInspectorTab("usage"), true);
+  assert.equal(isInspectorTab("charts"), false);
+  assert.equal(toggleInspectorMode("docked"), "expanded");
+  assert.equal(toggleInspectorMode("expanded"), "docked");
+});
+
 test("observability live fixture is deterministic and includes staged updates", () => {
   const first = createScenarioFixture("observability-live");
   const second = createScenarioFixture("observability-live");
@@ -75,4 +106,5 @@ test("observability live fixture is deterministic and includes staged updates", 
   assert.deepEqual(first.observabilityUpdates, second.observabilityUpdates);
   assert.equal(first.observabilityUpdates?.length, 3);
   assert.equal(first.observabilityBySession["design-pwa-shell"]?.workers.some((item) => item.role === "lead"), true);
+  assert.deepEqual(first.observabilityBySession["design-pwa-shell"]?.workers.map((item) => item.label), ["Lead-Mid", "Explore", "Explore Deep", "Build", "Verify", "Debug", "Docs"]);
 });
