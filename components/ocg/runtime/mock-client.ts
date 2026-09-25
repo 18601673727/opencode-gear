@@ -8,6 +8,7 @@ import type {
   WorkType,
 } from "../types";
 import { createScenarioFixture } from "./scenarios";
+import { boundTimeline } from "./observability";
 import type {
   CreateSessionInput,
   OcgRuntimeClient,
@@ -32,6 +33,7 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
   private readonly timers = new Map<string, Timer[]>();
   private nextId = 0;
   private snapshot: RuntimeSnapshot;
+  private liveScenarioStarted = false;
 
   constructor(scenario: ScenarioId) {
     const fixture = createScenarioFixture(scenario);
@@ -42,6 +44,7 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
       sessions: clone(fixture.sessions),
       messagesBySession: clone(fixture.messagesBySession),
       missionsBySession: clone(fixture.missionsBySession),
+      observabilityBySession: clone(fixture.observabilityBySession),
     };
   }
 
@@ -70,6 +73,11 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
     return clone(this.snapshot.missionsBySession[sessionId] ?? null);
   }
 
+  async getObservability(sessionId: string) {
+    const observability = this.snapshot.observabilityBySession[sessionId];
+    return observability ? clone(observability) : null;
+  }
+
   async createSession(input: CreateSessionInput): Promise<ChatSession> {
     const id = `mock-session-${Date.now()}-${this.nextId++}`;
     const session: ChatSession = {
@@ -83,6 +91,7 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
       sessions: [session, ...this.snapshot.sessions],
       messagesBySession: { ...this.snapshot.messagesBySession, [id]: [] },
       missionsBySession: { ...this.snapshot.missionsBySession, [id]: null },
+      observabilityBySession: { ...this.snapshot.observabilityBySession, [id]: null },
     };
     this.emit({ type: "conversation.session-created", session: clone(session) });
     return clone(session);
@@ -169,6 +178,7 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
 
   subscribe(listener: (event: OcgRuntimeEvent) => void): () => void {
     this.listeners.add(listener);
+    this.startLiveScenario();
     return () => this.listeners.delete(listener);
   }
 
@@ -203,7 +213,40 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
     if (event.type === "runtime.status-changed") {
       this.snapshot = { ...this.snapshot, status: event.status };
     }
+    if (event.type === "observability.updated") {
+      this.snapshot = {
+        ...this.snapshot,
+        observabilityBySession: {
+          ...this.snapshot.observabilityBySession,
+          [event.sessionId]: { ...event.observability, timeline: boundTimeline(event.observability.timeline) },
+        },
+      };
+    }
     for (const listener of this.listeners) listener(event);
+  }
+
+  private startLiveScenario(): void {
+    if (this.scenario !== "observability-live" || this.liveScenarioStarted) return;
+    this.liveScenarioStarted = true;
+    const fixture = createScenarioFixture(this.scenario);
+    fixture.observabilityUpdates?.forEach((update) => {
+      const timer = setTimeout(() => {
+        this.snapshot = {
+          ...this.snapshot,
+          missionsBySession: update.mission
+            ? { ...this.snapshot.missionsBySession, [update.sessionId]: clone(update.mission) }
+            : this.snapshot.missionsBySession,
+        };
+        this.emit({
+          type: "observability.updated",
+          sessionId: update.sessionId,
+          observability: clone({ ...update.observability, timeline: boundTimeline(update.observability.timeline) }),
+        });
+        if (update.mission) this.emit({ type: "mission.updated", sessionId: update.sessionId, mission: clone(update.mission) });
+      }, update.afterMs);
+      const timers = this.timers.get("__observability__") ?? [];
+      this.timers.set("__observability__", [...timers, timer]);
+    });
   }
 }
 

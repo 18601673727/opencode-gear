@@ -15,9 +15,12 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ActivityPulse } from "../activity-pulse";
 import type { Mission } from "../types";
+import type { RuntimeObservability } from "../runtime/observability";
+import { ObservabilityPanel } from "../observability/observability-panel";
 
 type MissionViewProps = {
   mission: Mission;
+  observability?: RuntimeObservability | null;
   onClose: () => void;
 };
 
@@ -30,7 +33,7 @@ function TaskIcon({ status }: { status: Mission["tasks"][number]["status"] }) {
   return <Circle className="size-3.5 text-muted-foreground/60" aria-hidden="true" />;
 }
 
-export function MissionView({ mission, onClose }: MissionViewProps) {
+export function MissionView({ mission, observability, onClose }: MissionViewProps) {
   const pct = Math.round((mission.completed / mission.total) * 100);
   return (
     <div className="flex h-full w-full flex-col">
@@ -166,6 +169,8 @@ export function MissionView({ mission, onClose }: MissionViewProps) {
             <dd className="ml-auto font-medium">{mission.elapsed}</dd>
           </div>
         </dl>
+
+        {observability && <ObservabilityPanel observability={observability} />}
 
         {mission.warnings.length > 0 && (
           <div className="mt-3 flex flex-col gap-1 rounded-md border border-amber-500/30 bg-amber-500/5 px-2.5 py-2 text-[11px] text-muted-foreground">

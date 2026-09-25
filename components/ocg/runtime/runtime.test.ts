@@ -60,3 +60,21 @@ test("disconnected runtime does not pretend to send a message", async () => {
   assert.deepEqual(await client.getMessages("design-pwa-shell"), before);
   assert.ok(events.includes("warning"));
 });
+
+test("live observability updates flow through the runtime snapshot", async () => {
+  const client = new MockOcgRuntimeClient("observability-live");
+  const events: string[] = [];
+  client.subscribe((event) => events.push(event.type));
+
+  await new Promise((resolve) => setTimeout(resolve, 2200));
+
+  const observability = await client.getObservability("design-pwa-shell");
+  const snapshotObservability = client.getSnapshot().observabilityBySession["design-pwa-shell"];
+  const mission = await client.getMission("design-pwa-shell");
+  assert.equal(mission?.status, "completed");
+  assert.equal(observability?.mission.tokenUsage.total?.provenance, "reported");
+  assert.equal(observability?.mission.activeWorkerCount, 0);
+  assert.equal(snapshotObservability?.mission.tokenUsage.total?.value, 16300);
+  assert.ok(events.filter((event) => event === "observability.updated").length >= 3);
+  assert.ok((observability?.timeline.length ?? 0) <= 60);
+});

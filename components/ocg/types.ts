@@ -115,6 +115,7 @@ export type OcgRuntimeEvent =
   | { type: "conversation.message-completed"; sessionId: string; message: ChatMessage }
   | { type: "activity.updated"; sessionId: string; messageId: string; activity: ToolActivity }
   | { type: "mission.updated"; sessionId: string; mission: Mission }
+  | { type: "observability.updated"; sessionId: string; observability: import("./runtime/observability").RuntimeObservability }
   | { type: "worker.updated"; sessionId: string; worker: Worker }
   | { type: "warning"; message: string }
   | { type: "error"; message: string }

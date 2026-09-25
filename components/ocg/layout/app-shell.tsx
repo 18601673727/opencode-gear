@@ -62,6 +62,7 @@ function RuntimeWorkspace() {
 
   const messages = snapshot.messagesBySession[activeSession.id] ?? [];
   const mission = snapshot.missionsBySession[activeSession.id];
+  const observability = snapshot.observabilityBySession[activeSession.id];
 
   const sidebar = (
     <OcgSidebar
@@ -148,7 +149,7 @@ function RuntimeWorkspace() {
             )}
           >
             <div className="h-full w-[320px]">
-              {mission && <MissionView mission={mission} onClose={() => setMissionOpen(false)} />}
+              {mission && <MissionView mission={mission} observability={observability} onClose={() => setMissionOpen(false)} />}
             </div>
           </aside>
         </main>
@@ -172,7 +173,7 @@ function RuntimeWorkspace() {
             mobileMissionOpen ? "translate-x-0" : "translate-x-full",
           )}
         >
-          {mission && <MissionView mission={mission} onClose={() => setMobileMissionOpen(false)} />}
+          {mission && <MissionView mission={mission} observability={observability} onClose={() => setMobileMissionOpen(false)} />}
         </aside>
       </div>
     </div>

@@ -6,6 +6,7 @@ import type {
   RuntimeStatus,
   SendMessageInput,
 } from "../types";
+import type { RuntimeObservability } from "./observability";
 
 export type ScenarioId =
   | "normal-chat"
@@ -19,7 +20,8 @@ export type ScenarioId =
   | "runtime-disconnected"
   | "runtime-connecting"
   | "runtime-failed"
-  | "permission-required";
+  | "permission-required"
+  | "observability-live";
 
 export type RuntimeSnapshot = {
   scenario: ScenarioId;
@@ -27,6 +29,7 @@ export type RuntimeSnapshot = {
   sessions: ChatSession[];
   messagesBySession: Record<string, ChatMessage[]>;
   missionsBySession: Record<string, Mission | null>;
+  observabilityBySession: Record<string, RuntimeObservability | null>;
 };
 
 export type CreateSessionInput = {
@@ -40,6 +43,7 @@ export interface OcgRuntimeClient {
   getSession(id: string): Promise<ChatSession | null>;
   getMessages(sessionId: string): Promise<ChatMessage[]>;
   getMission(sessionId: string): Promise<Mission | null>;
+  getObservability(sessionId: string): Promise<RuntimeObservability | null>;
   createSession(input: CreateSessionInput): Promise<ChatSession>;
   sendMessage(sessionId: string, input: SendMessageInput): Promise<void>;
   subscribe(listener: (event: OcgRuntimeEvent) => void): () => void;
