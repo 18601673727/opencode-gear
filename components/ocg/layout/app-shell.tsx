@@ -18,7 +18,7 @@ export function AppShell({ scenario }: { scenario: ScenarioId }) {
   );
 }
 
-function RuntimeWorkspace() {
+export function RuntimeWorkspace() {
   const { snapshot, createSession, sendMessage } = useOcgRuntime();
   const [activeSessionId, setActiveSessionId] = useState("design-pwa-shell");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);

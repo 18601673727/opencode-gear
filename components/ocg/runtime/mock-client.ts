@@ -9,6 +9,14 @@ import type {
 } from "../types";
 import { createScenarioFixture } from "./scenarios";
 import { boundActivities, boundTimeline } from "./observability";
+import {
+  advanceOnboarding,
+  resolveAccessHandoff,
+  resolveBootstrapRetry,
+  selectActiveOnboardingStage,
+  selectNextStage,
+} from "../bootstrap/selectors";
+import { ONBOARDING_STAGES, type BootstrapState, type OnboardingStageId } from "../bootstrap/types";
 import type {
   CreateSessionInput,
   OcgRuntimeClient,
@@ -45,6 +53,7 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
       messagesBySession: clone(fixture.messagesBySession),
       missionsBySession: clone(fixture.missionsBySession),
       observabilityBySession: clone(fixture.observabilityBySession),
+      bootstrap: clone(fixture.bootstrap),
     };
   }
 
@@ -76,6 +85,60 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
   async getObservability(sessionId: string) {
     const observability = this.snapshot.observabilityBySession[sessionId];
     return observability ? clone(observability) : null;
+  }
+
+  async getBootstrap(): Promise<BootstrapState> {
+    return clone(this.snapshot.bootstrap);
+  }
+
+  async requestAccessHandoff(): Promise<void> {
+    const access = resolveAccessHandoff(this.snapshot.bootstrap.access);
+    if (access === this.snapshot.bootstrap.access) return;
+    this.updateBootstrap({ ...this.snapshot.bootstrap, access });
+  }
+
+  async setOnboardingStage(stage: OnboardingStageId): Promise<void> {
+    const onboarding = this.snapshot.bootstrap.onboarding;
+    if (!onboarding) return;
+
+    const current = selectActiveOnboardingStage(this.snapshot.bootstrap);
+    const next = selectNextStage(current);
+    if (stage === next) {
+      const advanced = advanceOnboarding(this.snapshot.bootstrap);
+      if (advanced !== this.snapshot.bootstrap) this.updateBootstrap(advanced);
+      return;
+    }
+
+    // Back navigation may revisit a completed stage. Future stages are never
+    // directly selectable, even if a caller bypasses the presentational UI.
+    const currentIndex = ONBOARDING_STAGES.indexOf(current);
+    const requestedIndex = ONBOARDING_STAGES.indexOf(stage);
+    if (requestedIndex < 0 || requestedIndex > currentIndex || (requestedIndex < currentIndex && !onboarding.completedStages.includes(stage))) return;
+    this.updateBootstrap({
+      ...this.snapshot.bootstrap,
+      onboarding: { ...onboarding, stage, canResume: onboarding.canResume || onboarding.completedStages.length > 0, failure: undefined },
+    });
+  }
+
+  async completeOnboarding(): Promise<void> {
+    const onboarding = this.snapshot.bootstrap.onboarding;
+    if (!onboarding || selectActiveOnboardingStage(this.snapshot.bootstrap) !== "ready") return;
+    this.updateBootstrap({
+      ...this.snapshot.bootstrap,
+      ready: true,
+      onboarding: {
+        ...onboarding,
+        stage: "ready",
+        completedStages: onboarding.completedStages.includes("ready")
+          ? onboarding.completedStages
+          : [...onboarding.completedStages, "ready"],
+        failure: undefined,
+      },
+    });
+  }
+
+  async retryBootstrap(): Promise<void> {
+    this.updateBootstrap(resolveBootstrapRetry(this.snapshot.bootstrap));
   }
 
   async createSession(input: CreateSessionInput): Promise<ChatSession> {
@@ -209,9 +272,17 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
     this.updateMessages(sessionId, messages.map((item) => item.id === message.id ? message : item));
   }
 
+  private updateBootstrap(bootstrap: BootstrapState): void {
+    this.snapshot = { ...this.snapshot, bootstrap };
+    this.emit({ type: "bootstrap.updated", bootstrap: clone(bootstrap) });
+  }
+
   private emit(event: OcgRuntimeEvent): void {
     if (event.type === "runtime.status-changed") {
       this.snapshot = { ...this.snapshot, status: event.status };
+    }
+    if (event.type === "bootstrap.updated") {
+      this.snapshot = { ...this.snapshot, bootstrap: event.bootstrap };
     }
     if (event.type === "observability.updated") {
       this.snapshot = {

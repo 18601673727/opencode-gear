@@ -124,6 +124,7 @@ export type OcgRuntimeEvent =
   | { type: "activity.updated"; sessionId: string; messageId: string; activity: ToolActivity }
   | { type: "mission.updated"; sessionId: string; mission: Mission }
   | { type: "observability.updated"; sessionId: string; observability: import("./runtime/observability").RuntimeObservability }
+  | { type: "bootstrap.updated"; bootstrap: import("./bootstrap/types").BootstrapState }
   | { type: "worker.updated"; sessionId: string; worker: Worker }
   | { type: "warning"; message: string }
   | { type: "error"; message: string }

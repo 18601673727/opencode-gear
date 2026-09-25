@@ -13,6 +13,8 @@ import type {
   WorkerRuntimeStats,
 } from "./observability";
 import { usage } from "./observability";
+import { createBootstrapFixture } from "../bootstrap/fixtures";
+import type { BootstrapState } from "../bootstrap/types";
 
 export const DEFAULT_SCENARIO: ScenarioId = "normal-chat";
 export const SCENARIO_IDS: readonly ScenarioId[] = [
@@ -29,6 +31,21 @@ export const SCENARIO_IDS: readonly ScenarioId[] = [
   "runtime-failed",
   "permission-required",
   "observability-live",
+  "local-ready",
+  "local-first-run",
+  "remote-unauthenticated",
+  "remote-session-expired",
+  "remote-denied",
+  "remote-authenticated-ready",
+  "remote-authenticated-first-run",
+  "onboarding-resume",
+  "onboarding-migration",
+  "onboarding-recovery",
+  "onboarding-invalid-configuration",
+  "onboarding-auth-required",
+  "onboarding-connection-failure",
+  "onboarding-discovery",
+  "onboarding-ready",
 ];
 
 export function resolveScenario(value: string | undefined | null): ScenarioId {
@@ -326,6 +343,7 @@ export type ScenarioFixture = {
   messagesBySession: Record<string, ChatMessage[]>;
   missionsBySession: Record<string, Mission | null>;
   observabilityBySession: Record<string, RuntimeObservability | null>;
+  bootstrap: BootstrapState;
   observabilityUpdates?: { afterMs: number; sessionId: string; observability: RuntimeObservability; mission?: Mission }[];
   streamChunks?: string[];
   streamDelayMs?: number;
@@ -335,6 +353,7 @@ export function createScenarioFixture(id: ScenarioId): ScenarioFixture {
   const fixture: ScenarioFixture = {
     id,
     runtimeStatus: { state: "connected", detail: "local mock runtime" },
+    bootstrap: createBootstrapFixture(id),
     sessions,
     messagesBySession: Object.fromEntries(
       sessions.map((session) => [session.id, session.id === baseSession.id ? normalMessages() : genericMessages(session)]),

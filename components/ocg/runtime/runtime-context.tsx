@@ -6,6 +6,7 @@ import { MockOcgRuntimeClient } from "./mock-client";
 import type { CreateSessionInput, OcgRuntimeClient, ScenarioId } from "./runtime-types";
 import type { ChatSession, SendMessageInput } from "../types";
 import type { RuntimeSnapshot } from "./runtime-types";
+import type { OnboardingStageId } from "../bootstrap/types";
 
 type RuntimeContextValue = {
   client: OcgRuntimeClient;
@@ -13,6 +14,10 @@ type RuntimeContextValue = {
   createSession: (input: CreateSessionInput) => Promise<ChatSession>;
   sendMessage: (sessionId: string, input: SendMessageInput) => Promise<void>;
   cancel: (sessionId: string) => Promise<void>;
+  requestAccessHandoff: () => Promise<void>;
+  setOnboardingStage: (stage: OnboardingStageId) => Promise<void>;
+  completeOnboarding: () => Promise<void>;
+  retryBootstrap: () => Promise<void>;
 };
 
 const RuntimeContext = createContext<RuntimeContextValue | null>(null);
@@ -35,10 +40,32 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
   const cancel = useCallback(async (sessionId: string) => {
     await client.cancel?.(sessionId);
   }, [client]);
+  const requestAccessHandoff = useCallback(async () => {
+    await client.requestAccessHandoff?.();
+  }, [client]);
+  const setOnboardingStage = useCallback(async (stage: OnboardingStageId) => {
+    await client.setOnboardingStage?.(stage);
+  }, [client]);
+  const completeOnboarding = useCallback(async () => {
+    await client.completeOnboarding?.();
+  }, [client]);
+  const retryBootstrap = useCallback(async () => {
+    await client.retryBootstrap?.();
+  }, [client]);
 
   const value = useMemo(
-    () => ({ client, snapshot, createSession, sendMessage, cancel }),
-    [cancel, client, createSession, sendMessage, snapshot],
+    () => ({
+      client,
+      snapshot,
+      createSession,
+      sendMessage,
+      cancel,
+      requestAccessHandoff,
+      setOnboardingStage,
+      completeOnboarding,
+      retryBootstrap,
+    }),
+    [cancel, client, completeOnboarding, createSession, requestAccessHandoff, retryBootstrap, sendMessage, setOnboardingStage, snapshot],
   );
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;
 }

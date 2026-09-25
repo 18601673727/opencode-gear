@@ -22,10 +22,29 @@ The UI currently runs against a local OCG-owned mock runtime. Inspect a fixture 
 `?scenario=`; unknown values fall back to `normal-chat`:
 
 ```text
-normal-chat · long-stream · tool-heavy · worker-parallel
-build-failed · retry-success · mission-complete · budget-exhausted
+ normal-chat · long-stream · tool-heavy · worker-parallel
+ build-failed · retry-success · mission-complete · budget-exhausted
 runtime-disconnected · runtime-connecting · runtime-failed · permission-required
+observability-live
 ```
+
+Entry/setup fixtures:
+
+```text
+local-ready · local-first-run
+remote-unauthenticated · remote-session-expired · remote-denied
+remote-authenticated-ready · remote-authenticated-first-run
+onboarding-resume · onboarding-migration · onboarding-recovery
+onboarding-invalid-configuration · onboarding-auth-required
+onboarding-connection-failure · onboarding-discovery · onboarding-ready
+```
+
+The bootstrap scenarios drive the entry gate: local scenarios open the workspace
+directly, remote scenarios without access show the login surface, and pending
+setup opens the seven-stage onboarding wizard. `?scenario=` also works on
+`/login` and `/onboarding`; explicit local scenarios still resolve to the
+workspace. Cloudflare Access is represented as a mock handoff button, and no
+credential is entered or stored.
 
 For example: `http://localhost:3000/?scenario=worker-parallel`.
 

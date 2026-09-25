@@ -7,6 +7,7 @@ import type {
   SendMessageInput,
 } from "../types";
 import type { RuntimeObservability } from "./observability";
+import type { BootstrapState, OnboardingStageId } from "../bootstrap/types";
 
 export type ScenarioId =
   | "normal-chat"
@@ -21,7 +22,22 @@ export type ScenarioId =
   | "runtime-connecting"
   | "runtime-failed"
   | "permission-required"
-  | "observability-live";
+  | "observability-live"
+  | "local-ready"
+  | "local-first-run"
+  | "remote-unauthenticated"
+  | "remote-session-expired"
+  | "remote-denied"
+  | "remote-authenticated-ready"
+  | "remote-authenticated-first-run"
+  | "onboarding-resume"
+  | "onboarding-migration"
+  | "onboarding-recovery"
+  | "onboarding-invalid-configuration"
+  | "onboarding-auth-required"
+  | "onboarding-connection-failure"
+  | "onboarding-discovery"
+  | "onboarding-ready";
 
 export type RuntimeSnapshot = {
   scenario: ScenarioId;
@@ -30,6 +46,7 @@ export type RuntimeSnapshot = {
   messagesBySession: Record<string, ChatMessage[]>;
   missionsBySession: Record<string, Mission | null>;
   observabilityBySession: Record<string, RuntimeObservability | null>;
+  bootstrap: BootstrapState;
 };
 
 export type CreateSessionInput = {
@@ -44,9 +61,16 @@ export interface OcgRuntimeClient {
   getMessages(sessionId: string): Promise<ChatMessage[]>;
   getMission(sessionId: string): Promise<Mission | null>;
   getObservability(sessionId: string): Promise<RuntimeObservability | null>;
+  getBootstrap(): Promise<BootstrapState>;
   createSession(input: CreateSessionInput): Promise<ChatSession>;
   sendMessage(sessionId: string, input: SendMessageInput): Promise<void>;
   subscribe(listener: (event: OcgRuntimeEvent) => void): () => void;
   getSnapshot(): RuntimeSnapshot;
   cancel?(sessionId: string): Promise<void>;
+  /** Mock Cloudflare Access handoff. Never a real redirect or credential exchange. */
+  requestAccessHandoff?(): Promise<void>;
+  setOnboardingStage?(stage: OnboardingStageId): Promise<void>;
+  completeOnboarding?(): Promise<void>;
+  /** Mock recovery for an actionable bootstrap failure. */
+  retryBootstrap?(): Promise<void>;
 }
