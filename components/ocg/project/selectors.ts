@@ -66,10 +66,14 @@ export function selectProjectSnapshot(
     Object.fromEntries(Object.entries(record).filter(([key]) => allowed.has(key)));
 
   const missionIds = new Set(projectLedgerMissionIds(id));
-  const ledgerEntries = snapshot.resourceLedger?.entries.filter((entry) => missionIds.has(entry.missionId)) ?? [];
+  const ledgerEntries = snapshot.resourceLedger?.entries.filter((entry) =>
+    missionIds.has(entry.missionId) || (entry.sessionId !== null && allowed.has(entry.sessionId)),
+  ) ?? [];
   const resourceLedger = snapshot.resourceLedger && ledgerEntries.length > 0
     ? { ...snapshot.resourceLedger, entries: ledgerEntries }
     : null;
+  const attentionItems = snapshot.attentionItems?.filter((item) => item.projectId === id) ?? [];
+  const logs = snapshot.logs?.filter((entry) => entry.sessionId !== undefined && allowed.has(entry.sessionId)) ?? [];
 
   return {
     ...snapshot,
@@ -79,6 +83,8 @@ export function selectProjectSnapshot(
     observabilityBySession: keepBySession(snapshot.observabilityBySession),
     executionBySession: keepBySession(snapshot.executionBySession),
     resourceLedger,
+    ...(snapshot.attentionItems !== undefined ? { attentionItems } : {}),
+    ...(snapshot.logs !== undefined ? { logs } : {}),
   };
 }
 

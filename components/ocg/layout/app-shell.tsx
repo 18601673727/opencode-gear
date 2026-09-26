@@ -73,7 +73,7 @@ export function RuntimeWorkspace({
   view?: WorkspaceView;
   controlCenterView?: ControlCenterView;
 }) {
-  const { snapshot: runtimeSnapshot, createSession, sendMessage, setActiveProfile, cancel, launchMission } = useOcgRuntime();
+  const { snapshot: runtimeSnapshot, createSession, sendMessage, setActiveProfile, cancel, launchMission, sync } = useOcgRuntime();
   const {
     activeProjectId,
     activeProject,
@@ -129,8 +129,22 @@ export function RuntimeWorkspace({
   // items come from the scoped snapshot; fixture items are filtered by the
   // explicit projectId tag.
   const attentionQueue = useMemo(
-    () => selectProjectAttentionQueue(createAttentionQueue(snapshot.scenario), activeProjectId),
-    [snapshot.scenario, activeProjectId],
+    () => {
+      const fixtureQueue = selectProjectAttentionQueue(createAttentionQueue(snapshot.scenario), activeProjectId);
+      const runtimeItems = snapshot.attentionItems ?? [];
+      const runtimeIds = new Set(runtimeItems.map((item) => item.id));
+      return {
+        approvals: [
+          ...fixtureQueue.approvals.filter((item) => !runtimeIds.has(item.id)),
+          ...runtimeItems.filter(isUnresolved),
+        ],
+        history: [
+          ...fixtureQueue.history.filter((item) => !runtimeIds.has(item.id)),
+          ...runtimeItems.filter((item) => !isUnresolved(item)),
+        ],
+      };
+    },
+    [snapshot.attentionItems, snapshot.scenario, activeProjectId],
   );
 
   // Quiet unresolved-attention badge for product navigation. Derived from
@@ -537,6 +551,7 @@ export function RuntimeWorkspace({
           onOpenLogs={handleOpenLogs}
           onOpenSettings={handleOpenSettings}
           runtimeStatus={snapshot.status}
+          syncStatus={sync?.status ?? null}
         />
         {isLedger ? (
           <main aria-label="Resource ledger" className="flex min-h-0 flex-1 overflow-hidden">

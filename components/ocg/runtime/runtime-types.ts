@@ -12,6 +12,9 @@ import type { BootstrapState, OnboardingStageId } from "../bootstrap/types";
 import type { MissionExecution } from "../execution/domain";
 import type { ProjectId } from "../project/domain";
 import type { MissionLaunchCommand } from "../mission/draft-domain";
+import type { RuntimeSyncState } from "./reconciler";
+import type { AttentionItem } from "../attention/domain";
+import type { LogEntry } from "../logs/domain";
 
 /**
  * Launch command produced by the pure Mission draft domain and consumed at the
@@ -87,6 +90,10 @@ export type RuntimeSnapshot = {
   observabilityBySession: Record<string, RuntimeObservability | null>;
   executionBySession: Record<string, MissionExecution | null>;
   resourceLedger: ResourceLedger | null;
+  /** Explicit runtime Attention items. Derived Attention remains selector-owned. */
+  attentionItems?: AttentionItem[];
+  /** Append-oriented runtime logs. Surfaces may combine these with projections. */
+  logs?: LogEntry[];
   bootstrap: BootstrapState;
 };
 
@@ -107,6 +114,8 @@ export interface OcgRuntimeClient {
   sendMessage(sessionId: string, input: SendMessageInput): Promise<void>;
   subscribe(listener: (event: OcgRuntimeEvent) => void): () => void;
   getSnapshot(): RuntimeSnapshot;
+  /** Canonical synchronization metadata for the external store, when available. */
+  getSyncState?(): RuntimeSyncState;
   cancel?(sessionId: string): Promise<void>;
   /**
    * Frontend-only Mission launch boundary. Validates the command against the

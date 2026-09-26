@@ -22,6 +22,7 @@ import { selectProject } from "../project/domain";
 
 const INITIAL_LIVE_ENTRIES = 3;
 const HISTORY_LIMIT = 120;
+const EMPTY_LOG_ENTRIES: readonly LogEntry[] = [];
 
 const LEVEL_TONE: Record<LogLevel, string> = {
   trace: "text-slate-600 dark:text-slate-300",
@@ -146,14 +147,26 @@ function LogDetail({ entry, onClose }: { entry: LogEntry | undefined; onClose?: 
 
 export function LogsSurface({ snapshot, projectId }: { snapshot: RuntimeSnapshot; projectId?: ProjectId }) {
   const baseEntries = useMemo(
-    () => snapshot.scenario === "logs-live"
-      ? createLogsLiveFixture(projectId)
-      : deriveRuntimeLogEntries(snapshot, snapshot.sessions[0]?.id ?? "workspace"),
+    () => {
+      const fixtureEntries = snapshot.scenario === "logs-live"
+        ? createLogsLiveFixture(projectId)
+        : deriveRuntimeLogEntries(snapshot, snapshot.sessions[0]?.id ?? "workspace");
+      const byId = new Map(fixtureEntries.map((entry) => [entry.id, entry]));
+      for (const entry of snapshot.logs ?? []) byId.set(entry.id, entry);
+      return [...byId.values()];
+    },
     [projectId, snapshot],
   );
   const live = snapshot.scenario === "logs-live";
+  const runtimeEntries = snapshot.logs ?? EMPTY_LOG_ENTRIES;
   const nextIndex = useRef(live ? INITIAL_LIVE_ENTRIES : baseEntries.length);
-  const [entries, setEntries] = useState<LogEntry[]>(() => boundLogEntries(baseEntries.slice(0, live ? INITIAL_LIVE_ENTRIES : baseEntries.length), HISTORY_LIMIT));
+  const [storedEntries, setStoredEntries] = useState<LogEntry[]>(() => boundLogEntries(baseEntries.slice(0, live ? INITIAL_LIVE_ENTRIES : baseEntries.length), HISTORY_LIMIT));
+  const entries = useMemo(() => {
+    const incoming = live ? runtimeEntries : baseEntries;
+    const existing = new Set(storedEntries.map((entry) => entry.id));
+    const additions = incoming.filter((entry) => !existing.has(entry.id));
+    return additions.length === 0 ? storedEntries : boundLogEntries([...storedEntries, ...additions], HISTORY_LIMIT);
+  }, [baseEntries, live, runtimeEntries, storedEntries]);
   const [selectedId, setSelectedId] = useState<string | undefined>(entries[0]?.id);
   const [filters, setFilters] = useState<LogFilters>({});
   const [following, setFollowing] = useState(true);
@@ -167,7 +180,7 @@ export function LogsSurface({ snapshot, projectId }: { snapshot: RuntimeSnapshot
       const next = baseEntries[nextIndex.current];
       if (!next) return;
       nextIndex.current += 1;
-      setEntries((current) => boundLogEntries([...current, next], HISTORY_LIMIT));
+      setStoredEntries((current) => boundLogEntries([...current, next], HISTORY_LIMIT));
     }, 900);
     return () => window.clearInterval(timer);
   }, [baseEntries, live]);

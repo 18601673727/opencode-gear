@@ -7,11 +7,17 @@ import type { CreateSessionInput, MissionLaunchResult, OcgRuntimeClient, Scenari
 import type { MissionLaunchCommand } from "../mission/draft-domain";
 import type { ChatSession, SendMessageInput } from "../types";
 import type { RuntimeSnapshot } from "./runtime-types";
+import type { RuntimeDiagnostic } from "./runtime-envelope";
+import type { RuntimeSyncState } from "./reconciler";
 import type { OnboardingStageId } from "../bootstrap/types";
 
 type RuntimeContextValue = {
   client: OcgRuntimeClient;
   snapshot: RuntimeSnapshot;
+  /** Canonical synchronization metadata for the runtime store, when available. */
+  sync: RuntimeSyncState | null;
+  /** Bounded, display-safe diagnostics observed by the reconciler. */
+  diagnostics: readonly RuntimeDiagnostic[];
   createSession: (input: CreateSessionInput) => Promise<ChatSession>;
   sendMessage: (sessionId: string, input: SendMessageInput) => Promise<void>;
   cancel: (sessionId: string) => Promise<void>;
@@ -25,6 +31,8 @@ type RuntimeContextValue = {
 
 const RuntimeContext = createContext<RuntimeContextValue | null>(null);
 
+const EMPTY_DIAGNOSTICS: readonly RuntimeDiagnostic[] = [];
+
 export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioId; children: ReactNode }) {
   const client = useMemo(() => new MockOcgRuntimeClient(scenario), [scenario]);
   const subscribe = useCallback(
@@ -33,6 +41,9 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
   );
   const getSnapshot = useCallback(() => client.getSnapshot(), [client]);
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  const getSyncState = useCallback(() => client.getSyncState?.() ?? null, [client]);
+  const sync = useSyncExternalStore(subscribe, getSyncState, getSyncState);
+  const diagnostics = sync?.diagnostics ?? EMPTY_DIAGNOSTICS;
 
   const createSession = useCallback(async (input: CreateSessionInput) => {
     return client.createSession(input);
@@ -77,6 +88,8 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
     () => ({
       client,
       snapshot,
+      sync,
+      diagnostics,
       createSession,
       sendMessage,
       cancel,
@@ -87,7 +100,7 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
       setActiveProfile,
       launchMission,
     }),
-    [cancel, client, completeOnboarding, createSession, launchMission, requestAccessHandoff, retryBootstrap, sendMessage, setActiveProfile, setOnboardingStage, snapshot],
+    [cancel, client, completeOnboarding, createSession, diagnostics, launchMission, requestAccessHandoff, retryBootstrap, sendMessage, setActiveProfile, setOnboardingStage, snapshot, sync],
   );
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;
 }

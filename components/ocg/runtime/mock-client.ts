@@ -8,7 +8,6 @@ import type {
   WorkType,
 } from "../types";
 import { createScenarioFixture } from "./scenarios";
-import { boundActivities, boundTimeline } from "./observability";
 import {
   advanceOnboarding,
   resolveAccessHandoff,
@@ -33,6 +32,10 @@ import {
   createLaunchedObservability,
   missionIdForLaunch,
 } from "../mission/launch-fixtures";
+import { RuntimeEnvelopeFactory, eventSessionId, type AnyRuntimeEnvelope } from "./runtime-envelope";
+import { createSnapshotEnvelopeFromFixture } from "./runtime-snapshot";
+import { RuntimeStore } from "./runtime-store";
+import { createUninitializedRuntimeState, type RuntimeState, type RuntimeSyncState } from "./reconciler";
 
 type Timer = ReturnType<typeof setTimeout>;
 
@@ -50,76 +53,82 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
   private readonly listeners = new Set<(event: OcgRuntimeEvent) => void>();
   private readonly timers = new Map<string, Timer[]>();
   private nextId = 0;
-  private snapshot: RuntimeSnapshot;
+  private readonly store: RuntimeStore;
+  private readonly envelopes: RuntimeEnvelopeFactory;
   private liveScenarioStarted = false;
   /** Accepted launch results keyed by stable command identity for idempotency. */
   private readonly launchResults = new Map<string, MissionLaunchResult>();
 
   constructor(scenario: ScenarioId) {
-    const fixture = createScenarioFixture(scenario);
     this.scenario = scenario;
-    this.snapshot = {
-      scenario,
-      status: clone(fixture.runtimeStatus),
-      sessions: clone(fixture.sessions),
-      messagesBySession: clone(fixture.messagesBySession),
-      missionsBySession: clone(fixture.missionsBySession),
-      observabilityBySession: clone(fixture.observabilityBySession),
-      executionBySession: clone(fixture.executionBySession),
-      resourceLedger: clone(fixture.resourceLedger),
-      bootstrap: clone(fixture.bootstrap),
-    };
+    const fixture = createScenarioFixture(scenario);
+    const seed = createSnapshotEnvelopeFromFixture(fixture, { streamId: `stream:${scenario}`, generation: 1 });
+    this.store = new RuntimeStore(createUninitializedRuntimeState(scenario));
+    this.store.installSnapshot(seed);
+    this.envelopes = new RuntimeEnvelopeFactory(seed.streamId, seed.generation, {
+      startSequence: seed.cursor.sequence + 1,
+    });
   }
 
   getSnapshot(): RuntimeSnapshot {
-    return this.snapshot;
+    return this.store.getSnapshot();
+  }
+
+  getRuntimeState(): RuntimeState {
+    return this.store.getState();
+  }
+
+  getSyncState(): RuntimeSyncState {
+    return this.store.getSync();
   }
 
   async getRuntimeStatus(): Promise<RuntimeStatus> {
-    return clone(this.snapshot.status);
+    return clone(this.store.getSnapshot().status);
   }
 
   async listSessions(): Promise<ChatSession[]> {
-    return clone(this.snapshot.sessions);
+    return clone(this.store.getSnapshot().sessions);
   }
 
   async getSession(id: string): Promise<ChatSession | null> {
-    const session = this.snapshot.sessions.find((item) => item.id === id);
+    const session = this.store.getSnapshot().sessions.find((item) => item.id === id);
     return session ? clone(session) : null;
   }
 
   async getMessages(sessionId: string): Promise<ChatMessage[]> {
-    return clone(this.snapshot.messagesBySession[sessionId] ?? []);
+    return clone(this.store.getSnapshot().messagesBySession[sessionId] ?? []);
   }
 
   async getMission(sessionId: string): Promise<Mission | null> {
-    return clone(this.snapshot.missionsBySession[sessionId] ?? null);
+    return clone(this.store.getSnapshot().missionsBySession[sessionId] ?? null);
   }
 
   async getObservability(sessionId: string) {
-    const observability = this.snapshot.observabilityBySession[sessionId];
+    const observability = this.store.getSnapshot().observabilityBySession[sessionId];
     return observability ? clone(observability) : null;
   }
 
   async getBootstrap(): Promise<BootstrapState> {
-    return clone(this.snapshot.bootstrap);
+    return clone(this.store.getSnapshot().bootstrap);
   }
 
   async requestAccessHandoff(): Promise<void> {
-    const access = resolveAccessHandoff(this.snapshot.bootstrap.access);
-    if (access === this.snapshot.bootstrap.access) return;
-    this.updateBootstrap({ ...this.snapshot.bootstrap, access });
+    const bootstrap = this.store.getSnapshot().bootstrap;
+    const access = resolveAccessHandoff(bootstrap.access);
+    if (access === bootstrap.access) return;
+    this.updateBootstrap({ ...bootstrap, access });
   }
 
   async setOnboardingStage(stage: OnboardingStageId): Promise<void> {
-    const onboarding = this.snapshot.bootstrap.onboarding;
+    const bootstrap = this.store.getSnapshot().bootstrap;
+    const onboarding = bootstrap.onboarding;
     if (!onboarding) return;
 
-    const current = selectActiveOnboardingStage(this.snapshot.bootstrap);
+    const current = selectActiveOnboardingStage(bootstrap);
     const next = selectNextStage(current);
     if (stage === next) {
-      const advanced = advanceOnboarding(this.snapshot.bootstrap);
-      if (advanced !== this.snapshot.bootstrap) this.updateBootstrap(advanced);
+      const advanced = advanceOnboarding(bootstrap);
+      if (advanced !== bootstrap) this.updateBootstrap(advanced);
       return;
     }
 
@@ -129,16 +138,17 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
     const requestedIndex = ONBOARDING_STAGES.indexOf(stage);
     if (requestedIndex < 0 || requestedIndex > currentIndex || (requestedIndex < currentIndex && !onboarding.completedStages.includes(stage))) return;
     this.updateBootstrap({
-      ...this.snapshot.bootstrap,
+      ...bootstrap,
       onboarding: { ...onboarding, stage, canResume: onboarding.canResume || onboarding.completedStages.length > 0, failure: undefined },
     });
   }
 
   async completeOnboarding(): Promise<void> {
-    const onboarding = this.snapshot.bootstrap.onboarding;
-    if (!onboarding || selectActiveOnboardingStage(this.snapshot.bootstrap) !== "ready") return;
+    const bootstrap = this.store.getSnapshot().bootstrap;
+    const onboarding = bootstrap.onboarding;
+    if (!onboarding || selectActiveOnboardingStage(bootstrap) !== "ready") return;
     this.updateBootstrap({
-      ...this.snapshot.bootstrap,
+      ...bootstrap,
       ready: true,
       onboarding: {
         ...onboarding,
@@ -152,7 +162,7 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
   }
 
   async retryBootstrap(): Promise<void> {
-    this.updateBootstrap(resolveBootstrapRetry(this.snapshot.bootstrap));
+    this.updateBootstrap(resolveBootstrapRetry(this.store.getSnapshot().bootstrap));
   }
 
   /**
@@ -161,10 +171,11 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
    * in-memory snapshot.
    */
   async setActiveProfile(profileId: string): Promise<void> {
-    const profile = this.snapshot.bootstrap.profiles.find((item) => item.id === profileId);
+    const bootstrap = this.store.getSnapshot().bootstrap;
+    const profile = bootstrap.profiles.find((item) => item.id === profileId);
     if (!profile) return;
-    if (this.snapshot.bootstrap.activeProfileId === profile.id) return;
-    this.updateBootstrap({ ...this.snapshot.bootstrap, activeProfileId: profile.id });
+    if (bootstrap.activeProfileId === profile.id) return;
+    this.updateBootstrap({ ...bootstrap, activeProfileId: profile.id });
   }
 
   async createSession(input: CreateSessionInput): Promise<ChatSession> {
@@ -175,14 +186,6 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
       workType: input.workType,
       updatedAt: "now",
     };
-    this.snapshot = {
-      ...this.snapshot,
-      sessions: [session, ...this.snapshot.sessions],
-      messagesBySession: { ...this.snapshot.messagesBySession, [id]: [] },
-      missionsBySession: { ...this.snapshot.missionsBySession, [id]: null },
-      observabilityBySession: { ...this.snapshot.observabilityBySession, [id]: null },
-      executionBySession: { ...this.snapshot.executionBySession, [id]: null },
-    };
     this.emit({ type: "conversation.session-created", session: clone(session) });
     return clone(session);
   }
@@ -191,15 +194,16 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
     const content = input.content.trim();
     if (!content) return;
 
-    if (this.snapshot.status.state !== "connected") {
+    const snapshot = this.store.getSnapshot();
+    if (snapshot.status.state !== "connected") {
       this.emit({
         type: "warning",
-        message: this.snapshot.status.detail ?? "The local runtime is not connected.",
+        message: snapshot.status.detail ?? "The local runtime is not connected.",
       });
       return;
     }
 
-    const session = this.snapshot.sessions.find((item) => item.id === sessionId);
+    const session = snapshot.sessions.find((item) => item.id === sessionId);
     if (!session) {
       this.emit({ type: "error", message: `Unknown mock session: ${sessionId}` });
       return;
@@ -212,22 +216,14 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
       createdAt: clockLabel(),
       status: "completed",
     };
-    this.updateMessages(sessionId, [...(this.snapshot.messagesBySession[sessionId] ?? []), userMessage]);
+    this.emit({ type: "conversation.message-started", sessionId, message: clone(userMessage) });
 
     const updatedSession = { ...session, updatedAt: "now" };
-    this.snapshot = {
-      ...this.snapshot,
-      sessions: this.snapshot.sessions.map((item) => item.id === sessionId ? updatedSession : item),
-    };
     this.emit({ type: "conversation.session-updated", session: clone(updatedSession) });
 
-    const currentMission = this.snapshot.missionsBySession[sessionId];
+    const currentMission = this.store.getSnapshot().missionsBySession[sessionId];
     if (currentMission?.status === "running") {
       const updatedMission = { ...currentMission, current: "Responding to operator" };
-      this.snapshot = {
-        ...this.snapshot,
-        missionsBySession: { ...this.snapshot.missionsBySession, [sessionId]: updatedMission },
-      };
       this.emit({ type: "mission.updated", sessionId, mission: clone(updatedMission) });
     }
 
@@ -239,7 +235,6 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
       createdAt: clockLabel(),
       status: "streaming",
     };
-    this.updateMessages(sessionId, [...(this.snapshot.messagesBySession[sessionId] ?? []), assistant]);
     this.emit({ type: "conversation.message-started", sessionId, message: clone(assistant) });
 
     const fixture = createScenarioFixture(this.scenario);
@@ -249,15 +244,17 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
 
     chunks.forEach((chunk, index) => {
       timers.push(setTimeout(() => {
-        const current = this.snapshot.messagesBySession[sessionId]?.find((item) => item.id === assistantId);
+        const current = this.store.getSnapshot().messagesBySession[sessionId]?.find((item) => item.id === assistantId);
         if (!current || current.status === "cancelled") return;
-        const nextMessage = { ...current, content: current.content + chunk, status: "streaming" as const };
-        this.replaceMessage(sessionId, nextMessage);
         this.emit({ type: "conversation.message-delta", sessionId, messageId: assistantId, delta: chunk });
 
         if (index === chunks.length - 1) {
-          const completed = { ...nextMessage, status: "completed" as const };
-          this.replaceMessage(sessionId, completed);
+          // The delta has already gone through the canonical reconciler. Read
+          // the committed message back so multi-chunk streams do not drop
+          // earlier chunks when the terminal replacement arrives.
+          const afterDelta = this.store.getSnapshot().messagesBySession[sessionId]?.find((item) => item.id === assistantId);
+          if (!afterDelta) return;
+          const completed = { ...afterDelta, status: "completed" as const };
           this.emit({ type: "conversation.message-completed", sessionId, message: clone(completed) });
           this.timers.delete(sessionId);
         }
@@ -276,11 +273,9 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
     const timers = this.timers.get(sessionId) ?? [];
     timers.forEach((timer) => clearTimeout(timer));
     this.timers.delete(sessionId);
-    const messages = this.snapshot.messagesBySession[sessionId] ?? [];
+    const messages = this.store.getSnapshot().messagesBySession[sessionId] ?? [];
     const active = [...messages].reverse().find((message) => message.status === "streaming");
     if (active) {
-      const cancelled = { ...active, status: "cancelled" as const };
-      this.replaceMessage(sessionId, cancelled);
       this.emit({ type: "cancelled", sessionId, messageId: active.id });
     } else {
       this.emit({ type: "cancelled", sessionId });
@@ -294,7 +289,8 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
    * - a session owned by another Project is rejected;
    * - a repeated accepted command identity returns the previously recorded result;
    * - rejected/failed attempts remain retryable if the runtime condition changes;
-   * - an accepted command atomically updates the existing per-session maps.
+   * - an accepted command projects Mission/execution/observability through the
+   *   canonical reconciler, never through a parallel UI mutation.
    */
   async launchMission(command: MissionLaunchCommand): Promise<MissionLaunchResult> {
     const prior = this.launchResults.get(command.commandId);
@@ -307,7 +303,10 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
     // failures and rejections do not mutate state and must remain retryable;
     // accepted commands are the ones that need duplicate protection.
     if (result.outcome === "accepted") this.launchResults.set(command.commandId, clone(result));
-    this.emit({ type: "mission.launch-updated", sessionId: command.sessionId, result: clone(result) });
+    this.emit(
+      { type: "mission.launch-updated", sessionId: command.sessionId, result: clone(result) },
+      { projectId: command.projectId ?? null, commandId: command.commandId },
+    );
     return clone(result);
   }
 
@@ -320,11 +319,12 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
       duplicate: false,
     };
 
-    if (this.snapshot.status.state !== "connected") {
+    const snapshot = this.store.getSnapshot();
+    if (snapshot.status.state !== "connected") {
       return {
         ...base,
         outcome: "failed",
-        message: this.snapshot.status.detail ?? "The local runtime is not connected; launch not attempted.",
+        message: snapshot.status.detail ?? "The local runtime is not connected; launch not attempted.",
       };
     }
 
@@ -332,7 +332,7 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
       return { ...base, outcome: "rejected", message: `Unknown Project "${command.projectId}"; launch rejected.` };
     }
 
-    const session = this.snapshot.sessions.find((item) => item.id === command.sessionId);
+    const session = snapshot.sessions.find((item) => item.id === command.sessionId);
     if (!session) {
       return { ...base, outcome: "failed", message: `Unknown session "${command.sessionId}"; launch failed.` };
     }
@@ -354,26 +354,27 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
     const mission = createLaunchedMission(command, missionId);
     const execution = createLaunchedExecution(command, missionId);
     const observability = createLaunchedObservability(command, missionId);
-
-    // Atomic projection into the existing per-session maps. No parallel
-    // created-missions array is introduced.
-    this.snapshot = {
-      ...this.snapshot,
-      missionsBySession: { ...this.snapshot.missionsBySession, [command.sessionId]: mission },
-      executionBySession: { ...this.snapshot.executionBySession, [command.sessionId]: execution },
-      observabilityBySession: { ...this.snapshot.observabilityBySession, [command.sessionId]: observability },
-    };
-
-    this.emit({ type: "mission.updated", sessionId: command.sessionId, mission: clone(mission) });
-    this.emit({ type: "execution.updated", sessionId: command.sessionId, execution: clone(execution) });
-    this.emit({ type: "observability.updated", sessionId: command.sessionId, observability: clone(observability) });
-
-    return {
+    const projectId = command.projectId ?? null;
+    const result: MissionLaunchResult = {
       ...base,
       outcome: "accepted",
       missionId,
       message: `Mission "${mission.title}" accepted for execution.`,
     };
+
+    // Acknowledgement and entity projections share the same canonical path.
+    // The acknowledgement is first so command correlation is observable before
+    // the resulting Mission/execution projections arrive.
+    this.emit(
+      { type: "mission.launch-updated", sessionId: command.sessionId, result: clone(result) },
+      { projectId, commandId: command.commandId, missionId },
+    );
+    const correlation = { projectId, commandId: command.commandId, missionId };
+    this.emit({ type: "mission.updated", sessionId: command.sessionId, mission: clone(mission) }, correlation);
+    this.emit({ type: "execution.updated", sessionId: command.sessionId, execution: clone(execution) }, correlation);
+    this.emit({ type: "observability.updated", sessionId: command.sessionId, observability: clone(observability) }, correlation);
+
+    return result;
   }
 
   private ownerProjectForSession(sessionId: string): ProjectId | null {
@@ -383,50 +384,39 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
     return null;
   }
 
-  private updateMessages(sessionId: string, messages: ChatMessage[]): void {
-    this.snapshot = {
-      ...this.snapshot,
-      messagesBySession: { ...this.snapshot.messagesBySession, [sessionId]: messages },
-    };
-  }
-
-  private replaceMessage(sessionId: string, message: ChatMessage): void {
-    const messages = this.snapshot.messagesBySession[sessionId] ?? [];
-    this.updateMessages(sessionId, messages.map((item) => item.id === message.id ? message : item));
-  }
-
   private updateBootstrap(bootstrap: BootstrapState): void {
-    this.snapshot = { ...this.snapshot, bootstrap };
     this.emit({ type: "bootstrap.updated", bootstrap: clone(bootstrap) });
   }
 
-  private emit(event: OcgRuntimeEvent): void {
-    if (event.type === "runtime.status-changed") {
-      this.snapshot = { ...this.snapshot, status: event.status };
-    }
-    if (event.type === "bootstrap.updated") {
-      this.snapshot = { ...this.snapshot, bootstrap: event.bootstrap };
-    }
-    if (event.type === "observability.updated") {
-      this.snapshot = {
-        ...this.snapshot,
-        observabilityBySession: {
-          ...this.snapshot.observabilityBySession,
-          [event.sessionId]: {
-            ...event.observability,
-            timeline: boundTimeline(event.observability.timeline),
-            activities: boundActivities(event.observability.activities),
-          },
-        },
-      };
-    }
-    if (event.type === "execution.updated") {
-      this.snapshot = {
-        ...this.snapshot,
-        executionBySession: { ...this.snapshot.executionBySession, [event.sessionId]: event.execution },
-      };
-    }
+  /**
+   * Stamp a deterministic envelope, apply it through the canonical store, then
+   * notify raw listeners. State is always updated before listeners run.
+   */
+  private emit(
+    event: OcgRuntimeEvent,
+    scope: { projectId?: ProjectId | null; commandId?: string; missionId?: string } = {},
+  ): void {
+    const envelope = this.stampEnvelope(event, scope);
+    this.store.applyEnvelope(envelope);
     for (const listener of this.listeners) listener(event);
+  }
+
+  private stampEnvelope(
+    event: OcgRuntimeEvent,
+    scope: { projectId?: ProjectId | null; commandId?: string; missionId?: string },
+  ): AnyRuntimeEnvelope {
+    const sessionId = eventSessionId(event);
+    const projectId = scope.projectId !== undefined
+      ? scope.projectId
+      : sessionId
+        ? this.ownerProjectForSession(sessionId)
+        : null;
+    return this.envelopes.fromRuntimeEvent(event, {
+      projectId,
+      commandId: scope.commandId,
+      missionId: scope.missionId,
+      sessionId,
+    });
   }
 
   private startLiveScenario(): void {
@@ -435,22 +425,14 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
     const fixture = createScenarioFixture(this.scenario);
     fixture.observabilityUpdates?.forEach((update) => {
       const timer = setTimeout(() => {
-        this.snapshot = {
-          ...this.snapshot,
-          missionsBySession: update.mission
-            ? { ...this.snapshot.missionsBySession, [update.sessionId]: clone(update.mission) }
-            : this.snapshot.missionsBySession,
-        };
         this.emit({
           type: "observability.updated",
           sessionId: update.sessionId,
-          observability: clone({
-            ...update.observability,
-            timeline: boundTimeline(update.observability.timeline),
-            activities: boundActivities(update.observability.activities),
-          }),
+          observability: clone(update.observability),
         });
-        if (update.mission) this.emit({ type: "mission.updated", sessionId: update.sessionId, mission: clone(update.mission) });
+        if (update.mission) {
+          this.emit({ type: "mission.updated", sessionId: update.sessionId, mission: clone(update.mission) });
+        }
       }, update.afterMs);
       const timers = this.timers.get("__observability__") ?? [];
       this.timers.set("__observability__", [...timers, timer]);

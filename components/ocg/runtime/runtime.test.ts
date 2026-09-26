@@ -47,6 +47,10 @@ test("mock client emits deterministic send events and supports unsubscribe", asy
   assert.ok(events.includes("mission.updated"));
   const messages = await client.getMessages("design-pwa-shell");
   assert.equal(messages.at(-1)?.status, "completed");
+  assert.equal(
+    messages.at(-1)?.content,
+    "Mock runtime received your message. This response is streamed locally, one deterministic chunk at a time.",
+  );
 
   const eventCount = events.length;
   unsubscribe();
@@ -141,10 +145,12 @@ test("launchMission projects a deterministic Mission, execution, and observabili
 test("launchMission rejects a Project that does not own the session", async () => {
   const client = new MockOcgRuntimeClient("normal-chat");
   const before = client.getSnapshot();
-  const result = await client.launchMission!(launchCommand("zhuju", "research-space-bunny"));
+  const command = launchCommand("zhuju", "research-space-bunny");
+  const result = await client.launchMission!(command);
 
   assert.equal(result.outcome, "rejected");
   assert.match(result.message, /does not own/);
+  assert.equal(client.getSyncState().commandResults[command.commandId]?.outcome, "rejected");
   assert.deepEqual(client.getSnapshot().missionsBySession, before.missionsBySession);
   assert.deepEqual(client.getSnapshot().executionBySession, before.executionBySession);
   assert.equal(client.getSnapshot().executionBySession["research-space-bunny"], null);

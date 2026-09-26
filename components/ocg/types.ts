@@ -126,6 +126,10 @@ export type OcgRuntimeEvent =
   | { type: "observability.updated"; sessionId: string; observability: import("./runtime/observability").RuntimeObservability }
   | { type: "execution.updated"; sessionId: string; execution: import("./execution/domain").MissionExecution }
   | { type: "mission.launch-updated"; sessionId: string; result: import("./runtime/runtime-types").MissionLaunchResult }
+  | { type: "attention.updated"; item: import("./attention/domain").AttentionItem }
+  | { type: "ledger.entry-added"; entry: import("./resource-ledger/types").ResourceLedgerEntry }
+  | { type: "ledger.entry-updated"; entry: import("./resource-ledger/types").ResourceLedgerEntry }
+  | { type: "log.appended"; entry: import("./logs/domain").LogEntry }
   | { type: "bootstrap.updated"; bootstrap: import("./bootstrap/types").BootstrapState }
   | { type: "worker.updated"; sessionId: string; worker: Worker }
   | { type: "warning"; message: string }

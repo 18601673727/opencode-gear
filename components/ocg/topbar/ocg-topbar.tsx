@@ -18,6 +18,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import type { ChatSession, RuntimeStatus } from "../types";
 import { WORK_TYPE_LABEL } from "../types";
+import { isDegradedSyncStatus, type RuntimeSyncStatus } from "../runtime/reconciler";
 
 type OcgTopbarProps = {
   session: ChatSession;
@@ -47,6 +48,8 @@ type OcgTopbarProps = {
   onOpenLogs?: () => void;
   onOpenSettings?: () => void;
   runtimeStatus: RuntimeStatus;
+  /** Canonical reconciler sync status. Only degraded states are surfaced. */
+  syncStatus?: RuntimeSyncStatus | null;
 };
 
 const WORK_TYPE_DOT: Record<ChatSession["workType"], string> = {
@@ -81,6 +84,7 @@ export function OcgTopbar({
   onOpenLogs,
   onOpenSettings,
   runtimeStatus,
+  syncStatus,
 }: OcgTopbarProps) {
   return (
     <header className="flex h-12 shrink-0 items-center gap-1.5 border-b border-border bg-background px-2 sm:px-3">
@@ -141,6 +145,24 @@ export function OcgTopbar({
         <span aria-hidden="true">·</span>
         <span>{runtimeStatus.state}</span>
       </div>
+
+      {syncStatus && isDegradedSyncStatus(syncStatus) && (
+        <div
+          className="hidden shrink-0 items-center gap-1.5 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[11px] text-amber-700 md:flex dark:text-amber-300"
+          title={`Runtime synchronization: ${syncStatus}`}
+        >
+          <span
+            className={cn(
+              "size-1.5 rounded-full",
+              syncStatus === "error" ? "bg-red-500" : "animate-pulse bg-amber-500",
+            )}
+            aria-hidden="true"
+          />
+          <span className="font-medium">
+            {syncStatus === "stale" ? "resync needed" : syncStatus === "error" ? "sync error" : "syncing"}
+          </span>
+        </div>
+      )}
 
       {onOpenHome && (
         <Button
