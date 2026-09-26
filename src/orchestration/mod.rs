@@ -37,6 +37,7 @@ pub mod reconcile;
 pub mod replay;
 pub mod rollover;
 pub mod state;
+pub mod substrate;
 
 pub use budget::{
     admit as admit_spend, reservation_id, BudgetConfig, BudgetOrigin, BudgetStatus, CostBasis,
@@ -92,4 +93,8 @@ pub use rollover::{
 pub use state::{
     Attempts, OrchestrationPhase, OrchestrationState, RepositoryBaseline, SessionState,
     STATE_SCHEMA_VERSION,
+};
+pub use substrate::{
+    Dependency, Event as SubstrateEvent, MissionId, MissionState, Run as SubstrateRun, RunContract,
+    RunId, RunState, SubstrateRepository, WorkNode as SubstrateWorkNode, WorkNodeId, WorkState,
 };

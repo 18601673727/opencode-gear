@@ -31,6 +31,8 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde_yaml_ng = "0.10.0"
 fs2 = "0.4"
+typed-index-collections = "3.5"
+rusqlite = { version = "0.40", features = ["bundled"] }
 # Phase 3B-1 provider transport substrate. Pinned to the exact versions the
 # aimux 0.3.0 conformance probe was run against; `default-features = false`
 # drops the realtime/WebSocket surface (chat completions only).
