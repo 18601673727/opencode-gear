@@ -2,40 +2,55 @@
 
 This document is the execution contract for the first long-horizon OCG 0.4
 Mission. It is written against the pushed preparation baseline below. The
-executor must verify the repository identity and exact `HEAD` before changing
-anything.
+executor must verify the repository identity and immutable mission tag before
+changing anything.
 
 OCG 0.4 is the self-hosting threshold: the canonical WorkNode/Run execution
 spine must own enough of the real production lifecycle to execute one
 meaningful engineering Mission end to end, with durable evidence and no
 ambiguous result correlation.
 
-## 1. Exact Baseline
+## 1. Baselines
 
 | Item | Value |
 | --- | --- |
 | Canonical repository | `https://github.com/18601673727/opencode-gear.git` |
 | Canonical local root | repository root containing `Cargo.toml`, `src/`, `tests/`, and `frontend/` |
 | Canonical branch | `main` |
-| Pushed baseline SHA | `bf8a79e0b355a0ed21c5c0dd08a1f0720eef713a` |
+| Preparation/code provenance baseline | `bf8a79e0b355a0ed21c5c0dd08a1f0720eef713a` |
+| Immutable execution Mission baseline | annotated Git tag `ocg-0.4-mission-baseline` |
 | Current OCG version | `0.3.7` in root `Cargo.toml` |
 | Backend/core path | `src/`, `tests/`, `config/`, `docs/` |
 | Frontend path | `frontend/` |
 
-Before starting, the executor must run:
+The preparation/code provenance baseline is the consolidated backend/frontend
+state from which this Mission was grounded. It is retained for provenance and
+must not be confused with the immutable execution baseline. The execution
+baseline is the annotated tag created on the final hardening commit containing
+this document. Its commit SHA is intentionally not embedded here: the tag is
+the immutable identity and avoids a self-referential exact-`HEAD` contract.
+
+Before starting implementation, the executor must run from the canonical
+repository root:
 
 ```bash
+set -eu
 git rev-parse --show-toplevel
 git branch --show-current
-git rev-parse HEAD
 git worktree list --porcelain
 git status --short --branch
+test "$(git branch --show-current)" = main
+test "$(git rev-parse --show-toplevel)" = "$(pwd -P)"
+test "$(git cat-file -t ocg-0.4-mission-baseline)" = tag
+test "$(git rev-parse 'ocg-0.4-mission-baseline^{commit}')" = "$(git rev-parse HEAD)"
+git show --no-patch --decorate --format=fuller ocg-0.4-mission-baseline
 ```
 
-The branch must be `main`, the worktree must be the canonical repository, and
-`HEAD` must equal the baseline SHA above unless the operator has explicitly
-published a newer mission baseline. Do not silently execute in a sibling
-checkout or a different worktree.
+The annotated tag must resolve to `HEAD`, the branch must be `main`, and the
+worktree must be the canonical repository. Do not silently execute in a sibling
+checkout, a different worktree, or a commit that merely contains the tag name.
+An operator who intentionally publishes a newer Mission baseline must create a
+new annotated tag and update this contract before implementation begins.
 
 Backend verification commands:
 
@@ -130,6 +145,11 @@ history while extending the canonical execution spine.
   stable backend event/snapshot contract only after the backend contract is
   durable and versioned. Keep reconciliation as the frontend authority for its
   presentation state.
+- Existing frontend Project, Profiles/Providers/Models, Settings, Mission
+  Control, Execution Graph, Logs, Resource Ledger, Attention, and runtime
+  surfaces: connect them to real persisted/control-plane state. Add only the
+  missing Project Manager/Import, global configuration, and pre-run Mission
+  configuration actions needed to make those existing surfaces useful.
 
 ### MIGRATE
 
@@ -209,6 +229,10 @@ the canonical tests pass.
 | Evidence-based WorkNode/Mission completion | Partial and conflicting | Legacy Mission completion records verification evidence; canonical WorkNode completion is available but not connected to that evidence contract. |
 | Production authority cutover | Missing | `docs/architecture/live-worknode-cutover-draft.md` explicitly records that legacy Mission/SessionState still owns live decisions. |
 | Frontend runtime reconciliation | Implemented for frontend mock/runtime contract | `frontend/components/ocg/runtime/` tests generation, sequence, deduplication, stale events, project scope, command acknowledgements, and recovery. Backend transport integration is not the 0.4 authority yet. |
+| PWA Project Manager / Import | Missing as a real control-plane workflow | Existing project selectors and UI surfaces are present, but registration/import, boundary validation, persisted project identity, and project selection are not yet proven against backend state. |
+| PWA Global Configurator | Partial visual surface; real persistence missing | Profiles, Providers/Models, Settings, and resource-oriented UI exist, but 0.4 requires their supported changes to use persisted OCG configuration/control commands rather than mock-only state. |
+| PWA Mission pre-run configuration | Partial visual surface; canonical write path missing | The PWA can present Mission/runtime concepts, but undispatched target Project, objective/source, profile/policy, routing, and supported budget/resource settings need a real pre-dispatch control contract. |
+| PWA running Mission dashboard | Partial projection; canonical backend feed missing | Mission Control, Execution Graph, Logs, Resource Ledger, Attention, and runtime reconciliation exist; canonical WorkNode/Run snapshots/events and acknowledgements must feed them from persisted backend state. |
 | One meaningful self-dogfood Mission | Missing | No baseline evidence shows a real engineering Mission completed through canonical production WorkNode/Run execution. |
 
 ## 4. Concrete OCG 0.4 Delta
@@ -247,8 +271,26 @@ The executor must implement and prove all of the following, in this order:
 9. **Frontend contract.** The existing RuntimeStore receives versioned,
    project-scoped canonical snapshots/events with command correlation. UI
    rendering remains a projection and must not become execution authority.
-10. **Self-hosting dogfood.** One real engineering Mission completes through
-    the production path described in section 10.
+10. **PWA control surface.** The existing PWA becomes a useful, real OCG
+    dashboard and configurator backed by persisted project/configuration state
+    and the canonical control/event path. It must provide Project Manager /
+    Project Import, Global Configurator, Mission pre-run configuration, and a
+    running Mission dashboard. It may rely on another supported OCG control
+    surface to launch a Mission; pressing a PWA Launch button is not required.
+11. **PWA configuration semantics.** Project registration/import, global and
+    project defaults, and undispatched Mission settings are mutable through
+    real backend commands and acknowledgements where supported. A dispatched
+    Run keeps its frozen executor contract; edits may affect only valid future
+    dispatches, future child Runs, or a newly created replacement Run.
+12. **Self-hosting dogfood.** One real engineering Mission completes through
+    the production path described in section 10, and its canonical state is
+    inspectable through the real PWA dashboard.
+
+The PWA requirements are deliberately about usefulness and authority
+boundaries, not a particular launch workflow. The PWA must not remain a
+template, mock dashboard, passive visual prototype, or static-fixture demo.
+It is a projection/control surface and must never become the authoritative
+execution database.
 
 ## 5. Stable Dispatch Witness / Run Correlation
 
@@ -338,6 +380,38 @@ Required cutover evidence:
   newer canonical decision;
 - the bridge fails closed when the canonical database is missing, corrupted,
   or outside the resolved repository boundary.
+
+The PWA control/data loop must be proven alongside the execution cutover:
+
+```text
+Project registration and configuration commands
+  -> OCG control API / persistent configuration
+  -> canonical project and configuration state
+
+canonical Mission / WorkNode / Run state
+  -> versioned canonical snapshots and events
+  -> frontend RuntimeStore and reconciler
+  -> Mission Control / Execution Graph / Logs / Ledger / Attention
+```
+
+Project Import must register an existing repository root through the existing
+project-boundary resolver, validate that boundary, persist a backend Project
+identity, and let the user select and inspect it independently of chat or
+session identity. It is not a general-purpose filesystem manager. Global
+configuration must cover the supported provider/model, profile/routing,
+runtime/default, resource/budget, and project-default concepts already present
+in OCG. Mission pre-run configuration must expose the supported target Project,
+objective/source, execution policy/profile, routing defaults, and resource or
+hard-budget settings before any Run is dispatched.
+
+Configuration commands must use real command identities and acknowledgements
+where the control contract supports them. The PWA may edit mutable global,
+project, and undispatched Mission settings. Once a Run is dispatched, its
+executor/model/role contract is immutable; changing defaults must not rewrite
+that active Run and may apply only to future child dispatches, future valid
+dispatches, or a newly created replacement Run. The PWA must expose this
+distinction rather than presenting an active Run dropdown as if it rewrites
+execution authority.
 
 ## 7. Concrete WorkNode Hierarchy
 
@@ -440,29 +514,46 @@ the witness and authority path are the critical path.
 
 - Parent: W4.
 - Dependencies: W4 and the backend event/snapshot contract.
-- Objective: connect the existing UI runtime transport to canonical snapshots,
-  events, command acknowledgements, logs, ledger, attention, and execution
-  projections.
+- Objective: make the existing PWA a real Project Manager/Import surface,
+  Global Configurator, Mission pre-run configurator, and running Mission
+  dashboard backed by persisted OCG control state and canonical snapshots,
+  events, and command acknowledgements. Mission launch may remain on another
+  supported OCG control surface.
 - Relevant code: `frontend/components/ocg/runtime/runtime-envelope.ts`,
-  `runtime-store.ts`, `reconciler.ts`, `runtime-snapshot.ts`, execution and
-  Mission projections.
+  `runtime-store.ts`, `reconciler.ts`, `runtime-snapshot.ts`, Project,
+  Profiles/Providers/Models, Settings, Mission Control, Execution Graph, Logs,
+  Resource Ledger, Attention, and their backend control/event seams.
 - Invariants: generation/sequence and project isolation remain enforced;
-  frontend state remains a projection; commands carry stable identities.
+  frontend state remains a projection; commands carry stable identities; real
+  project/configuration state is not replaced by frontend-only fixtures; an
+  active Run's frozen contract is never edited through the PWA.
 - Tests: existing 202 frontend tests plus backend/frontend contract fixtures
-  for snapshot, event, acknowledgement, reconnect, stale event, and late Run.
-- Acceptance: UI can inspect the same canonical Run/WorkNode identity as the
-  backend without deriving authority from presentation state.
-- Non-goals: no broad UI polish, PWA redesign, or mock fixture rewrite.
+  for Project Import and boundary validation, persisted global/project
+  configuration, pre-run Mission edits, command acknowledgements, canonical
+  snapshot/event projection, reconnect, stale events, late Runs, and immutable
+  dispatched contracts.
+- Acceptance: a user can register/import an existing repository, select and
+  inspect its backend Project identity, configure supported global/project
+  defaults, configure an undispatched Mission, and inspect a running canonical
+  Mission through Mission Control/Execution Graph/Logs/Ledger/Attention. The
+  PWA cannot mutate an active Run contract or derive execution authority from
+  presentation state.
+- Non-goals: no broad PWA redesign, general-purpose filesystem manager, or
+  mock fixture rewrite.
 
 ### W6: Execute and preserve dogfood evidence
 
 - Parent: W5.
 - Dependencies: W5 and all critical-path acceptance tests.
 - Objective: execute the Mission in section 10 through the real production
-  OCG path and retain inspectable evidence.
+  OCG path and retain inspectable evidence. The Mission may be created or
+  launched by another supported OCG control surface, but its Project,
+  configuration, pre-run settings, running state, and terminal evidence must
+  be inspectable through the real PWA control/data loop.
 - Evidence: canonical event stream, Run/WorkNode snapshot before and after,
   verification report/log references, replacement or recovery trace where
-  exercised, final commit, and frontend projection trace.
+  exercised, final commit, frontend project/configuration command
+  acknowledgements, and frontend runtime projection trace.
 - Acceptance: all criteria in section 10 pass against durable state.
 - Non-goals: do not claim 0.4 from tests alone.
 
@@ -483,6 +574,10 @@ Bunny and Pixel must not redesign these decisions during execution:
 - Execution state is durable and authoritative below the inference boundary.
 - Repository/workspace identity is machine-enforced.
 - Completion requires verification and evidence, not model assertion.
+- The PWA is a projection/control surface backed by real persisted OCG state;
+  it is never the execution database.
+- Global, project, and undispatched Mission configuration may be changed where
+  supported; a dispatched Run's executor contract is immutable.
 
 ## 9. Out of Scope
 
@@ -518,30 +613,47 @@ projection boundary that OCG must use to operate itself. It is bounded: the
 inspector is read-only, uses existing `work.inspect`/control projection seams,
 and does not require a full World Graph or a new provider ecosystem.
 
-The dogfood Mission must have at least this WorkNode shape:
+The dogfood Mission must have at least this WorkNode shape. The graph makes
+parallel readiness explicit: B and C are sibling WorkNodes, both depend on the
+completed A, and both become independently ready. D is a later reconvergence
+that depends on both B and C. The nested A1, B1, and D1 nodes exercise
+recursive depth without inventing unrelated parallel work.
 
 ```text
 root: define and implement the canonical execution inspector
   child A: trace current substrate/controller and define the projection
     child A1: inspect WorkNode/Run/dependency/event invariants
-  child B: implement backend canonical inspection and event projection
+  child B: implement backend canonical inspection
     depends on A
     child B1: implement witness-aware Run history and late-result display
-  child C: connect the existing RuntimeStore and Execution Graph projection
-    depends on B
-  child D: verify, recover, and document the result
+  child C: implement canonical event/snapshot contract fixtures
+    depends on A
+  child D: connect RuntimeStore and Execution Graph projection
     depends on B and C
+    child D1: exercise canonical execution visualization
+  child E: verify, recover, and document the result
+    depends on D
 ```
 
 The Mission must exercise:
 
-- at least five WorkNodes, including recursive depth of two or more;
-- at least one real dependency chain and at least two independent children;
+- at least eight WorkNodes including the root, recursive depth of two or more,
+  and the explicit A -> {B, C} -> D -> E dependency shape above;
+- at least one completed prerequisite shared by two sibling WorkNodes that then
+  become independently ready and execute independently before reconverging at
+  D;
 - a root Run and child Runs with frozen contracts;
 - canonical readiness and dispatch;
 - independent verification commands and durable evidence;
 - terminal WorkNode and Mission completion;
-- frontend snapshot/event projection with command correlation.
+- frontend Project registration/import with backend boundary validation;
+- meaningful persisted global and project configuration;
+- meaningful pre-run Mission configuration before any Run dispatch;
+- frontend snapshot/event projection with command correlation for the running
+  canonical Mission, including Mission Control, Execution Graph, Logs,
+  Resource Ledger, and Attention state where applicable;
+- proof that changing defaults or pre-run settings does not mutate a dispatched
+  Run's frozen executor contract.
 
 Where practical, the same run must also exercise a Worker Run Replacement,
 restart/resume between dispatch and completion, and a stale late result from a
@@ -565,8 +677,14 @@ Objective acceptance criteria:
    is required for the terminal success transition.
 6. The existing frontend RuntimeStore rejects stale generation/sequence or
    wrong-project events and displays the canonical identities without inventing
-   a second authority.
-7. The final repository contains the implementation, focused tests, durable
+   a second authority. The PWA also registers/imports a real Project, persists
+   supported global/project configuration, edits an undispatched Mission, and
+   surfaces the running Mission through Mission Control, Execution Graph, Logs,
+   Ledger, and Attention.
+7. A configuration change made after dispatch cannot mutate the active Run's
+   frozen executor/model/role contract; it can affect only semantically valid
+   future dispatches, future child Runs, or a replacement Run.
+8. The final repository contains the implementation, focused tests, durable
    event/evidence artifacts, and a concise dogfood report that another
    executor can inspect from the canonical repository.
 
@@ -583,8 +701,14 @@ OCG 0.4 is reached only when:
    Mission/SessionState lifecycle;
 4. durable restart/recovery and evidence-based verification work on the real
    path; and
-5. the meaningful dogfood Mission above completes end to end through that path
-   with inspectable evidence.
+5. the existing PWA is a genuinely useful, backend-backed Project Manager /
+   Project Import surface, Global Configurator, Mission pre-run configurator,
+   and running Mission dashboard;
+6. global/project/pre-run configuration is mutable only where supported,
+   dispatched Run contracts remain frozen, and the PWA remains a projection/
+   control surface rather than an execution database; and
+7. the meaningful dogfood Mission above completes end to end through that path
+   with inspectable evidence. It need not be launched by pressing a PWA button.
 
 The milestone is the **SELF-HOSTING THRESHOLD**.
 
