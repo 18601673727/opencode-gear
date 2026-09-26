@@ -41,7 +41,7 @@
 use crate::error::{GearError, Result};
 use crate::http::Secret;
 use crate::runtime::compat::{
-    select_existing_session_lead, EffectiveLead, LeadSelection, SessionClient,
+    select_existing_session_lead, BridgeRuntimeClient, EffectiveLead, LeadSelection, SessionClient,
     SessionLifecycleClient,
 };
 use crate::runtime::lifecycle::{
@@ -704,6 +704,16 @@ impl SessionClient for V2SessionClient {
             model_id,
             variant,
         })
+    }
+}
+
+impl BridgeRuntimeClient for V2SessionClient {
+    fn as_lifecycle(&mut self) -> &mut dyn RuntimeAdapter {
+        self
+    }
+
+    fn as_session(&mut self) -> &mut dyn SessionClient {
+        self
     }
 }
 

@@ -125,7 +125,10 @@ fn project(dir: &TestDir) -> PathBuf {
 
 fn admit_root(dir: &TestDir, project: &Path, session_id: &str) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ocg"))
-        .args(["__bridge", "session.prompt", "--project"])
+        // This smoke test exercises durable root-output capture, not V2 prompt
+        // admission. Use the legacy local admission path so the test does not
+        // need to fabricate a live authenticated V2 runtime client.
+        .args(["__bridge", "chat.message", "--project"])
         .arg(project)
         .env("OPENCODE_GEAR_PROJECT", project)
         .env("OPENCODE_GEAR_ORCHESTRATION_ENABLED", "1")
@@ -140,23 +143,23 @@ fn admit_root(dir: &TestDir, project: &Path, session_id: &str) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn session.prompt bridge");
+        .expect("spawn chat.message bridge");
     child
         .stdin
         .as_mut()
-        .expect("session.prompt stdin")
+        .expect("chat.message stdin")
         .write_all(
             &serde_json::to_vec(&serde_json::json!({
                 "session_id": session_id,
                 "text": "capture the current root execution"
             }))
-            .expect("serialize session.prompt"),
+            .expect("serialize chat.message"),
         )
-        .expect("write session.prompt");
-    let output = child.wait_with_output().expect("wait for session.prompt");
+        .expect("write chat.message");
+    let output = child.wait_with_output().expect("wait for chat.message");
     assert!(
         output.status.success(),
-        "session.prompt bridge failed: {}",
+        "chat.message bridge failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("parse admission");

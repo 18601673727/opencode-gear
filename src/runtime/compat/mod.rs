@@ -28,6 +28,7 @@ pub mod v2_server;
 use crate::error::{GearError, Result};
 use crate::model::LeadContract;
 use crate::process::ProcessHost;
+use crate::runtime::lifecycle;
 use semver::Version;
 use std::path::Path;
 
@@ -359,6 +360,19 @@ pub trait RolloverRuntime: SessionClient + SessionLifecycleClient {}
 
 impl<T> RolloverRuntime for T where T: SessionClient + SessionLifecycleClient {}
 
+/// The invocation-scoped client surface required by the orchestration bridge.
+///
+/// A concrete V2 client implements all three interfaces, but Rust does not
+/// allow a `dyn A + B + C` object. Keeping this named composition trait gives
+/// the bridge one shared client without cloning or moving the transport into
+/// separate trait objects.
+pub trait BridgeRuntimeClient:
+    lifecycle::RuntimeAdapter + SessionClient + SessionLifecycleClient
+{
+    fn as_lifecycle(&mut self) -> &mut dyn lifecycle::RuntimeAdapter;
+    fn as_session(&mut self) -> &mut dyn SessionClient;
+}
+
 /// Apply and verify a Lead contract to an already-created session.
 ///
 /// Rollover must never call `resolve_session` after creating a target: that
@@ -399,11 +413,70 @@ pub fn select_existing_session_lead(
     })
 }
 
+/// Idempotent Lead enforcement for prompt authority gate.
+///
+/// Reads the effective Lead first. If it already matches the resolved contract,
+/// no mutation calls are made. If it differs, applies select_agent + select_model
+/// and re-verifies. This is the single canonical path for "desired == effective"
+/// used by both launch and prompt admission.
+pub fn ensure_existing_session_lead(
+    client: &mut dyn SessionClient,
+    session_id: &str,
+    lead: &LeadSelection,
+) -> Result<SessionLeadSelection> {
+    if session_id.is_empty() {
+        return Err(GearError::config(
+            "cannot ensure Lead for an empty session id",
+        ));
+    }
+
+    // 1. Read effective Lead first
+    let effective = client.effective_lead(session_id)?;
+
+    // 2. Canonical verification - if already matches, no-op
+    if verify_effective_lead(lead, &effective).is_ok() {
+        return Ok(SessionLeadSelection {
+            session_id: session_id.to_string(),
+            lead: lead.clone(),
+            steps: vec!["verify_effective_lead: already matches".to_string()],
+        });
+    }
+
+    // 3. Mismatch: apply contract, then re-verify
+    client.select_agent(session_id, &lead.agent)?;
+    client.select_model(
+        session_id,
+        &lead.provider_id,
+        &lead.model_id,
+        lead.variant.as_deref(),
+    )?;
+    let effective = client.effective_lead(session_id)?;
+    verify_effective_lead(lead, &effective)?;
+    Ok(SessionLeadSelection {
+        session_id: session_id.to_string(),
+        lead: lead.clone(),
+        steps: vec![
+            format!("select_agent={}", lead.agent),
+            format!("select_model={}", lead.full_model_id()),
+            format!(
+                "variant={}",
+                lead.variant.as_deref().unwrap_or("provider-default")
+            ),
+            "verify_effective_lead".to_string(),
+        ],
+    })
+}
+
 /// A deterministic, offline [`SessionClient`] used by tests and by callers that
 /// need to rehearse a session selection without a live daemon.
+///
+/// Also implements [`RuntimeAdapter`] and [`SessionLifecycleClient`] so that
+/// tests can wrap it in [`Rc<RefCell<MemorySessionClient>>`](std::rc::Rc) and
+/// use it as the invocation-scoped runtime client for [`BridgeContext`].
 #[derive(Debug, Clone, Default)]
 pub struct MemorySessionClient {
     session_id: String,
+    parent_session_id: Option<String>,
     selected_agent: Option<String>,
     selected_model: Option<(String, String, Option<String>)>,
     forced_effective: Option<EffectiveLead>,
@@ -422,6 +495,13 @@ impl MemorySessionClient {
 
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = session_id.into();
+        self
+    }
+
+    /// Model a runtime worker execution whose durable parent is the root
+    /// execution. Used by prompt-authority regression tests.
+    pub fn with_parent_session(mut self, parent: impl Into<String>) -> Self {
+        self.parent_session_id = Some(parent.into());
         self
     }
 
@@ -445,6 +525,137 @@ impl MemorySessionClient {
     /// The ordered transcript of session operations, for determinism tests.
     pub fn calls(&self) -> &[String] {
         &self.calls
+    }
+}
+
+impl RuntimeAdapter for MemorySessionClient {
+    fn major(&self) -> Major {
+        Major::V2
+    }
+
+    fn plugin_key(&self) -> &'static str {
+        "plugin"
+    }
+
+    fn task_key(&self) -> &'static str {
+        "subagent"
+    }
+
+    fn plugin_source(&self) -> &'static str {
+        ""
+    }
+
+    fn local_plugin_uri(&self, _path: &Path) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn lead_selection(&self) -> LeadSelectionMode {
+        LeadSelectionMode::Session
+    }
+
+    fn launch_mode(&self) -> LaunchMode {
+        LaunchMode::Daemon
+    }
+
+    fn lifecycle_capabilities(&self) -> crate::runtime::lifecycle::RuntimeCapabilities {
+        crate::runtime::lifecycle::RuntimeCapabilities::OPENCODE_V2
+    }
+
+    fn is_task_tool(&self, tool: &str) -> bool {
+        tool == "subagent"
+    }
+}
+
+impl lifecycle::RuntimeAdapter for MemorySessionClient {
+    fn identity(&self) -> lifecycle::RuntimeIdentity {
+        lifecycle::RuntimeIdentity::new("memory", "v2", "test")
+    }
+
+    fn capabilities(&self) -> lifecycle::RuntimeCapabilities {
+        lifecycle::RuntimeCapabilities::OPENCODE_V2
+    }
+
+    fn execution_parent(
+        &self,
+        execution_id: &lifecycle::RuntimeExecutionId,
+    ) -> lifecycle::RuntimeResult<Option<lifecycle::RuntimeExecutionId>> {
+        if execution_id.as_str().is_empty() {
+            Err(lifecycle::RuntimeError::new(
+                lifecycle::RuntimeErrorKind::ExecutionMissing,
+                "memory execution is unknown",
+            ))
+        } else {
+            Ok(self
+                .parent_session_id
+                .as_deref()
+                .map(lifecycle::RuntimeExecutionId::new))
+        }
+    }
+
+    fn inspect_execution(
+        &self,
+        execution_id: &lifecycle::RuntimeExecutionId,
+    ) -> lifecycle::RuntimeResult<lifecycle::RuntimeExecution> {
+        if execution_id.as_str().is_empty() {
+            return Err(lifecycle::RuntimeError::new(
+                lifecycle::RuntimeErrorKind::ExecutionMissing,
+                "memory execution is unknown",
+            ));
+        }
+        Ok(lifecycle::RuntimeExecution {
+            id: execution_id.clone(),
+            profile: None,
+        })
+    }
+}
+
+impl BridgeRuntimeClient for MemorySessionClient {
+    fn as_lifecycle(&mut self) -> &mut dyn lifecycle::RuntimeAdapter {
+        self
+    }
+
+    fn as_session(&mut self) -> &mut dyn SessionClient {
+        self
+    }
+}
+
+impl SessionLifecycleClient for MemorySessionClient {
+    fn create_fresh_session(&self) -> Result<String> {
+        Ok(self.session_id.clone())
+    }
+
+    fn context_messages(&self, _session: &str) -> Result<Vec<serde_json::Value>> {
+        Ok(vec![])
+    }
+
+    fn session_info(&self, session: &str) -> Result<serde_json::Value> {
+        let agent = self
+            .selected_agent
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        Ok(serde_json::json!({
+            "id": session,
+            "agent": agent,
+        }))
+    }
+
+    fn model_metadata(
+        &self,
+        _provider_id: Option<&str>,
+        _model_id: Option<&str>,
+    ) -> Result<crate::runtime::lifecycle::RuntimeModelMetadata> {
+        Ok(crate::runtime::lifecycle::RuntimeModelMetadata::default())
+    }
+
+    fn inject_continuation(
+        &self,
+        _session: &str,
+        _message_id: &str,
+        _text: &str,
+        _description: &str,
+        _metadata: &serde_json::Value,
+    ) -> Result<()> {
+        Ok(())
     }
 }
 

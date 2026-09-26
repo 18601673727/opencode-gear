@@ -221,45 +221,14 @@ fn bridge_session_context_supplies_the_baseline_on_every_dispatch() {
         "session.prompt",
         &json!({"session_id": "cli-session", "text": "fix the parser"}),
     );
-    assert_eq!(admitted["ok"], json!(true));
-    assert_eq!(admitted["changed"], json!(true));
-
-    let payload = json!({"session_id": "cli-session", "agent": "ocg-lead-low"});
-    let first = bridge(&project, dir.path(), "session.context", &payload);
-    assert_eq!(first["ok"], json!(true));
-    assert_eq!(first["event"], json!("session.context"));
-    assert_eq!(first["cached"], json!(false));
-    let body = first["context"].as_str().unwrap();
-    assert!(body.contains("fix the parser"));
-
-    // The V2 model-dispatch path never suppresses the baseline: a repeated
-    // dispatch reuses the computation but still returns the full body.
-    let second = bridge(&project, dir.path(), "session.context", &payload);
-    assert_eq!(second["ok"], json!(true));
-    assert_eq!(second["cached"], json!(true));
-    assert_eq!(second["context"].as_str().unwrap(), body);
-    assert_eq!(second["snapshot_id"], first["snapshot_id"]);
-    assert_eq!(second["bytes"], first["bytes"]);
-    assert!(second["bytes"].as_u64().unwrap() > 0);
-
-    // A dispatch carrying runtime-generated conversation content (an
-    // interruption/resume continuation reaches the model as a user-role
-    // message) is not an admission: the served baseline is unchanged and the
-    // admitted task identity is untouched.
-    let synthetic = bridge(
-        &project,
-        dir.path(),
-        "session.context",
-        &json!({"session_id": "cli-session", "text": "The previous response was interrupted. Continue from where you left off without repeating completed content."}),
-    );
-    assert_eq!(synthetic["ok"], json!(true));
-    assert_eq!(synthetic["task_id"], first["task_id"]);
-    assert_eq!(synthetic["context"].as_str().unwrap(), body);
-    assert!(project
-        .join(".opencode-gear")
-        .join("orchestration")
-        .join("state.json")
-        .is_file());
+    // V2 prompt admission is fail-closed when the invocation has no verified
+    // runtime client and canonical Lead contract. This CLI helper intentionally
+    // does not start a V2 service, so it must not create task state locally.
+    assert_eq!(admitted["ok"], json!(false));
+    assert!(admitted["error"]
+        .as_str()
+        .unwrap()
+        .contains("Lead enforcement unavailable"));
 }
 
 #[test]
@@ -274,62 +243,13 @@ fn bridge_session_prompt_admission_drives_task_identity() {
         "session.prompt",
         &json!({"session_id": "cli-session", "text": "fix the parser"}),
     );
-    assert_eq!(first["ok"], json!(true));
-    assert_eq!(first["event"], json!("session.prompt"));
-    assert_eq!(first["changed"], json!(true));
-    let task_id = first["task_id"].as_str().unwrap().to_string();
-    assert!(task_id.starts_with("task-"), "{task_id}");
-
-    // Re-admitting the identical prompt is a no-op, never a reset.
-    let again = bridge(
-        &project,
-        dir.path(),
-        "session.prompt",
-        &json!({"session_id": "cli-session", "text": "fix the parser"}),
-    );
-    assert_eq!(again["ok"], json!(true));
-    assert_eq!(again["changed"], json!(false));
-    assert_eq!(again["task_id"], json!(task_id));
-
-    // A genuinely new admitted prompt is a task boundary.
-    let reset = bridge(
-        &project,
-        dir.path(),
-        "session.prompt",
-        &json!({"session_id": "cli-session", "text": "rewrite the lexer"}),
-    );
-    assert_eq!(reset["ok"], json!(true));
-    assert_eq!(reset["changed"], json!(true));
-    assert_ne!(reset["task_id"], json!(task_id));
-
-    // The baseline served after the reset names the new task.
-    let context = bridge(
-        &project,
-        dir.path(),
-        "session.context",
-        &json!({"session_id": "cli-session", "agent": "ocg-lead-low"}),
-    );
-    assert_eq!(context["ok"], json!(true));
-    assert_eq!(context["task_id"], reset["task_id"]);
-    let body = context["context"].as_str().unwrap();
-    assert!(body.contains("rewrite the lexer"), "{body}");
-    assert!(!body.contains("fix the parser"), "{body}");
-
-    // An empty or whitespace-only admission is rejected and changes nothing.
-    let empty = bridge(
-        &project,
-        dir.path(),
-        "session.prompt",
-        &json!({"session_id": "cli-session", "text": "   "}),
-    );
-    assert_eq!(empty["ok"], json!(false));
-    let after = bridge(
-        &project,
-        dir.path(),
-        "session.context",
-        &json!({"session_id": "cli-session", "agent": "ocg-lead-low"}),
-    );
-    assert_eq!(after["task_id"], reset["task_id"]);
+    // Prompt admission is fail-closed without a verified V2 runtime client;
+    // ordinary CLI bridge invocations cannot manufacture Lead authority.
+    assert_eq!(first["ok"], json!(false));
+    assert!(first["error"]
+        .as_str()
+        .unwrap()
+        .contains("Lead enforcement unavailable"));
 }
 
 #[test]

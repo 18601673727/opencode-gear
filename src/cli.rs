@@ -27,7 +27,9 @@ use crate::provider_gateway::{GatewayRoute, ProviderGateway};
 use crate::provider_transport::ProviderTransportConfig;
 use crate::proxy::{ProxyScheme, ProxySelection, ProxySource};
 use crate::report;
-use crate::runtime::compat::{self, LeadSelection, RuntimeAdapter, SessionClient};
+use crate::runtime::compat::{
+    self, BridgeRuntimeClient, LeadSelection, RuntimeAdapter, SessionClient,
+};
 use crate::runtime::effective as runtime_effective;
 use crate::runtime::lifecycle::RuntimeAdapter as RuntimeLifecycleAdapter;
 use crate::runtime::lifecycle::RuntimeIdentity;
@@ -2214,8 +2216,7 @@ fn launch(
                     .map_err(|error| Failure::Gear(GearError::config(error.to_string())))?;
                 RuntimeLifecycleAdapter::prepare_execution(&mut client, &session_id, &profile)
                     .map_err(|error| Failure::Gear(GearError::config(error.to_string())))?;
-                let observed = client
-                    .effective_lead(session_id.as_str())
+                let observed = SessionClient::effective_lead(&mut client, session_id.as_str())
                     .map_err(Failure::Gear)?;
                 eprintln!(
                     "ocg: runtime {} | session {} | effective Lead {}",
@@ -4629,12 +4630,11 @@ fn bridge_payload(
     let mut bridge =
         crate::orchestration::bridge::BridgeContext::new(&controller, &runner, telemetry_config)
             .with_reports(reports);
-    // Only the context observation path needs a live V2 client. Ordinary
-    // bridge events remain entirely local, so an unavailable UI/client cannot
-    // manufacture a Mission failure or write a misleading rollover.
+    // The session.prompt authority gate and context.observe require a live V2 client.
+    // Ordinary bridge events remain entirely local.
     if matches!(
         event,
-        "context.observe" | "session.context.observe" | "context-observation"
+        "context.observe" | "session.context.observe" | "context-observation" | "session.prompt"
     ) {
         if let (Some(url), Some(password), Some(lead)) = (
             env.v2_server_url.as_deref(),
@@ -4648,7 +4648,11 @@ fn bridge_payload(
                 .unwrap_or_else(|| project_root.to_string_lossy().into_owned());
             match compat::v2_client::V2SessionClient::connect(&registration, directory) {
                 Ok(client) => {
-                    bridge = bridge.with_rollover_runtime(client, lead.runtime_profile());
+                    let runtime: std::rc::Rc<std::cell::RefCell<Box<dyn BridgeRuntimeClient>>> =
+                        std::rc::Rc::new(std::cell::RefCell::new(Box::new(client)));
+                    bridge = bridge
+                        .with_bridge_runtime(runtime, lead.runtime_profile())
+                        .with_lead_contract(lead);
                 }
                 Err(_) => {
                     // The bridge will record an explicit unknown observation;

@@ -880,6 +880,93 @@ async function bridge(event, payload) {
   }
 }
 
+// STRICT bridge for Lead authority gate (session.prompt ONLY).
+// Throws on ANY failure: spawn, non-zero exit, timeout, empty stdout, invalid JSON, ok:false.
+// The timeout is an internal parameter so tests can use a short bound while
+// production keeps the 30 second contract.
+const STRICT_BRIDGE_TIMEOUT_MS = 30000;
+const STRICT_BRIDGE_KILL_GRACE_MS = 100;
+
+function strictBridgeTimeoutMs() {
+  // The production path has a fixed 30 second bound. The private global is
+  // only an injection seam for the generated-plugin contract tests; callers
+  // cannot configure the production timeout through the public plugin API.
+  const injected = globalThis.__OCG_STRICT_BRIDGE_TIMEOUT_MS;
+  return Number.isFinite(injected) && injected >= 0 ? injected : STRICT_BRIDGE_TIMEOUT_MS;
+}
+
+async function strictBridge(event, payload, timeoutMs = strictBridgeTimeoutMs()) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(executable(), ["__bridge", event, "--project", project()], {
+        shell: false,
+        stdio: ["pipe", "pipe", "ignore"],
+        env: process.env,
+      });
+    } catch (e) {
+      return reject(new Error(`OCG strict bridge spawn failed: ${e.message}`));
+    }
+
+    let stdout = "";
+    let settled = false;
+    let timer;
+    let killTimer;
+    const settle = (fn, value) => {
+      if (settled) return false;
+      settled = true;
+      clearTimeout(timer);
+      fn(value);
+      return true;
+    };
+    const killTimedOutChild = () => {
+      try {
+        const terminated = child.kill("SIGTERM");
+        // Node returns false when the child is already gone. If SIGTERM did
+        // not reach a still-running child, escalate without waiting.
+        if (terminated === false) child.kill("SIGKILL");
+      } catch (_) {
+        try { child.kill("SIGKILL"); } catch (_) {}
+      }
+      killTimer = setTimeout(() => {
+        try { child.kill("SIGKILL"); } catch (_) {}
+      }, STRICT_BRIDGE_KILL_GRACE_MS);
+    };
+    timer = setTimeout(() => {
+      if (settled) return;
+      killTimedOutChild();
+      settle(reject, new Error("OCG strict bridge timeout"));
+    }, timeoutMs);
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.on("error", (e) => {
+      settle(reject, new Error(`OCG strict bridge spawn error: ${e.message}`));
+    });
+    child.on("close", (code) => {
+      if (settled) {
+        clearTimeout(killTimer);
+        return;
+      }
+      if (code !== 0) return settle(reject, new Error(`OCG strict bridge exited ${code}`));
+      if (!stdout.trim()) return settle(reject, new Error("OCG strict bridge empty response"));
+      try {
+        const parsed = JSON.parse(stdout);
+        if (parsed.ok === false) return settle(reject, new Error(parsed.error || "OCG strict bridge returned ok:false"));
+        settle(resolve, parsed);
+      } catch (e) {
+        settle(reject, new Error(`OCG strict bridge invalid JSON: ${e.message}`));
+      }
+    });
+    try {
+      child.stdin.on("error", () => {});
+      child.stdin.end(JSON.stringify(payload));
+    } catch (_) {
+      // stdin may already be closed; let close handler deal with it
+    }
+  });
+}
+
 function hasContext(text) {
   return typeof text === "string" && text.includes(START) && text.includes(END);
 }
@@ -948,17 +1035,21 @@ export default {
     // It is strictly non-mutating: OpenCode persists whatever `event.prompt`
     // contains after the hook, so the admitted text, files, metadata and
     // delivery are only ever read, never touched — the persisted user message
-    // stays byte-verbatim what the user submitted. The callback only reports
-    // the admission to the bridge for task bookkeeping; it must never throw
-    // (a throwing prompt hook would fail prompt admission), which holds
-    // because `bridge` swallows every failure.
+    // stays byte-verbatim what the user submitted.
+    //
+    // Lead authority gate (fail-closed): uses strictBridge which throws on
+    // ANY failure (spawn, non-zero exit, timeout, empty stdout, invalid JSON,
+    // explicit ok:false). A throwing prompt hook fails prompt admission,
+    // preventing the model dispatch entirely. This enforces:
+    //   resolved Lead contract -> bind/verify session agent+model -> only then permit inference
     registrations.push(await ctx.session.hook("prompt", async (event) => {
       if (!orchestrationEnabled()) return;
       if (!event || !event.sessionID) return;
       const prompt = event.prompt;
       const text = prompt && typeof prompt.text === "string" ? prompt.text : "";
       if (!text.trim()) return;
-      await bridge("session.prompt", {
+      // strictBridge throws on any failure -> prompt admission fails -> zero model dispatch
+      await strictBridge("session.prompt", {
         session_id: event.sessionID,
         text,
       });
@@ -1479,7 +1570,8 @@ console.log(JSON.stringify(requests));
         // `session.prompt` hook: it reports the admitted text to the bridge
         // and never touches the event.
         assert!(source.contains("ctx.session.hook(\"prompt\""));
-        assert!(source.contains("bridge(\"session.prompt\""));
+        // The V2 prompt hook uses strictBridge for fail-closed authority enforcement.
+        assert!(source.contains("strictBridge(\"session.prompt\""));
         assert!(source.contains("event.system.push({ type: \"text\""));
         assert!(source.contains("bridge(\"session.context\""));
         assert!(source.contains("bridge(\"context.observe\""));
@@ -1542,6 +1634,7 @@ process.stdin.on("end", () => {
       record,
       JSON.stringify({
         argv: args,
+        pid: process.pid,
         project: process.env.OPENCODE_GEAR_PROJECT || null,
         marker: process.env.OCG_FIXTURE_MARKER || null,
         inherited: process.env.OPENCODE_GEAR_ORCHESTRATION_ENABLED || null,
@@ -1553,6 +1646,13 @@ process.stdin.on("end", () => {
   if (mode === "nonzero") { process.exitCode = 7; return; }
   if (mode === "invalid") { process.stdout.write("this is not json"); return; }
   if (mode === "silent") return;
+  if (mode === "hang") {
+    // Exercise the parent's SIGKILL fallback: deliberately ignore SIGTERM and
+    // keep the event loop alive until the child is forcibly killed.
+    process.on("SIGTERM", () => {});
+    setInterval(() => {}, 1000);
+    return;
+  }
   if (mode === "metadata") {
     process.stdout.write(JSON.stringify({
       ok: true,
@@ -1952,6 +2052,48 @@ console.log(JSON.stringify({
                 json!({"session_id": "s1", "text": "update the parser"})
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v2_strict_prompt_timeout_kills_a_sigterm_ignoring_child() {
+        if !node_or_skip("v2_strict_prompt_timeout_kills_a_sigterm_ignoring_child") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write_v2_plugin(&dir);
+        let bridge = write_fixture_bridge(&dir);
+        let record = dir.path().join("record.jsonl");
+        write_check(
+            &dir,
+            &format!(
+                r#"{JS_PRELUDE}
+globalThis.__OCG_STRICT_BRIDGE_TIMEOUT_MS = 25;
+process.env.OCG_FIXTURE_MODE = "hang";
+const {{ ctx, hooks }} = makeCtx({{ agent: "lead-mid" }});
+await plugin.setup(ctx);
+let message = "";
+try {{
+  await hooks["prompt"]({{ sessionID: "timeout-session", prompt: {{ text: "hang" }} }});
+}} catch (error) {{
+  message = String(error && error.message ? error.message : error);
+}}
+console.log(JSON.stringify({{ timedOut: message.includes("timeout"), message }}));
+"#
+            ),
+        );
+        let value = run_check(&dir, &bridge, &record);
+        assert_eq!(value["timedOut"], json!(true), "{value}");
+
+        let records = records(&record);
+        assert_eq!(records.len(), 1, "the hanging child must reach the fixture");
+        let pid = records[0]["pid"].as_u64().unwrap().to_string();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "strictBridge left timed-out child {pid} alive");
     }
 
     #[cfg(unix)]

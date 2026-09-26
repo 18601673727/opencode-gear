@@ -13,11 +13,16 @@ use opencode_gear::orchestration::controller::{BuildDecision, Controller};
 use opencode_gear::orchestration::handoff::{Role, Severity};
 use opencode_gear::orchestration::state::{Attempts, OrchestrationPhase};
 use opencode_gear::process::{CapturedOutput, FakeCaptureRunner, FakeGitHost};
+use opencode_gear::runtime::compat::LeadSelection;
+use opencode_gear::runtime::compat::{BridgeRuntimeClient, MemorySessionClient};
+use opencode_gear::runtime::lifecycle::RuntimeProfile;
 use opencode_gear::telemetry::{TelemetryConfig, TelemetryStats, TelemetryStore};
 use opencode_gear::verification::config::VerificationConfig;
 use serde_json::json;
+use std::cell::RefCell;
 use std::fs;
 use std::path::Path;
+use std::rc::Rc;
 
 const TASK: &str = "update module_1 parser";
 
@@ -446,7 +451,7 @@ fn disabled_orchestration_emits_no_plugin_and_no_state() {
         &clock,
     );
     let runner = FakeCaptureRunner::new();
-    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+    let bridge = bridge_with_runtime(&controller, &runner);
     let value = bridge.dispatch("chat.message", &json!({"session_id": "s", "text": TASK}));
     assert_eq!(value["ok"], json!(false));
     assert_eq!(value["disabled"], json!(true));
@@ -488,10 +493,13 @@ fn v2_plugin_contract_uses_local_discovery_and_subagent_tool() {
     assert!(source.contains("ctx.tool.hook(\"execute.before\""));
     // The repository baseline is injected at model dispatch through the
     // session `context` hook; prompt admission is reported through a strictly
-    // read-only `session.prompt` hook that never mutates the admitted prompt.
     assert!(source.contains("ctx.session.hook(\"context\""));
     assert!(source.contains("ctx.session.hook(\"prompt\""));
-    assert!(source.contains("bridge(\"session.prompt\""));
+    // The V2 prompt hook uses strictBridge for fail-closed authority enforcement.
+    assert!(source.contains("strictBridge(\"session.prompt\""));
+    assert!(source.contains("const STRICT_BRIDGE_TIMEOUT_MS = 30000"));
+    assert!(source.contains("child.kill(\"SIGKILL\")"));
+    assert!(source.contains("if (settled) return"));
     assert!(source.contains("event.system.push({ type: \"text\""));
     // The V2 runtime may be Node, so the bridge is spawned via
     // `node:child_process` with an exact argv and no shell.
@@ -733,7 +741,7 @@ fn bridge_handles_explore_and_build_lifecycle() {
         &clock,
     );
     let runner = failing_runner();
-    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+    let bridge = bridge_with_runtime(&controller, &runner);
 
     let before = bridge.dispatch(
         "tool.execute.before",
@@ -1313,7 +1321,7 @@ fn debug_budget_is_enforced_through_the_bridge_path() {
         &clock,
     );
     let runner = failing_runner();
-    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+    let bridge = bridge_with_runtime(&controller, &runner);
 
     bridge.dispatch("chat.message", &json!({"session_id": "s", "text": TASK}));
     bridge.dispatch(
@@ -1424,6 +1432,32 @@ fn lead_controller<'a>(
     )
 }
 
+/// Create a bridge with a `MemorySessionClient` as the invocation-scoped
+/// runtime and a canonical Lead contract. Required for `session.prompt`
+/// authority-gate tests (P0-J).
+fn bridge_with_runtime<'a>(
+    controller: &'a Controller<'a>,
+    runner: &'a FakeCaptureRunner,
+) -> BridgeContext<'a> {
+    let client: Rc<RefCell<Box<dyn BridgeRuntimeClient>>> =
+        Rc::new(RefCell::new(Box::new(MemorySessionClient::new())));
+    let profile = RuntimeProfile::new(
+        "lead-high".to_string(),
+        "openai/gpt-6-astra".to_string(),
+        Some("low".to_string()),
+    );
+    let lead = LeadSelection {
+        level: "high".to_string(),
+        agent: "lead-high".to_string(),
+        provider_id: "openai".to_string(),
+        model_id: "gpt-6-astra".to_string(),
+        variant: Some("low".to_string()),
+    };
+    BridgeContext::new(controller, runner, TelemetryConfig::disabled())
+        .with_bridge_runtime(client, profile)
+        .with_lead_contract(lead)
+}
+
 fn dispatch_chat(bridge: &BridgeContext<'_>, session: &str, text: &str) -> serde_json::Value {
     bridge.dispatch(
         "chat.message",
@@ -1442,7 +1476,7 @@ fn lead_context_snapshot_is_injected_once_and_deduplicated_per_session() {
     let clock = FixedClock::new(1_000);
     let controller = lead_controller(dir.path(), &git, &clock);
     let runner = FakeCaptureRunner::new();
-    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+    let bridge = bridge_with_runtime(&controller, &runner);
 
     // A. The first prompt injects the full repository snapshot plus metadata.
     let first = dispatch_chat(&bridge, "lead-1", TASK);
@@ -1500,7 +1534,7 @@ fn lead_context_snapshot_changes_when_repository_context_changes() {
     let clock = FixedClock::new(1_000);
     let controller = lead_controller(dir.path(), &git, &clock);
     let runner = FakeCaptureRunner::new();
-    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+    let bridge = bridge_with_runtime(&controller, &runner);
 
     let first = dispatch_chat(&bridge, "lead-1", TASK);
     assert_eq!(first["cached"], json!(false));
@@ -1538,7 +1572,7 @@ fn worker_handoff_is_not_suppressed_by_lead_snapshot_deduplication() {
     let clock = FixedClock::new(1_000);
     let controller = lead_controller(dir.path(), &git, &clock);
     let runner = FakeCaptureRunner::new();
-    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+    let bridge = bridge_with_runtime(&controller, &runner);
 
     // Cache the Lead session's snapshot.
     let first = dispatch_chat(&bridge, "lead-1", TASK);
@@ -1578,7 +1612,7 @@ fn lead_context_snapshot_dedup_survives_a_new_task_message() {
     let clock = FixedClock::new(1_000);
     let controller = lead_controller(dir.path(), &git, &clock);
     let runner = FakeCaptureRunner::new();
-    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+    let bridge = bridge_with_runtime(&controller, &runner);
 
     let first = dispatch_chat(&bridge, "lead-1", "first task");
     assert_eq!(first["cached"], json!(false));
@@ -1602,7 +1636,7 @@ fn lead_context_snapshot_suppresses_different_task() {
     let clock = FixedClock::new(1_000);
     let controller = lead_controller(dir.path(), &git, &clock);
     let runner = FakeCaptureRunner::new();
-    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+    let bridge = bridge_with_runtime(&controller, &runner);
 
     let first = dispatch_chat(&bridge, "lead-1", "update module_1 parser");
     assert_eq!(first["cached"], json!(false));
@@ -1626,7 +1660,7 @@ fn lead_context_snapshot_suppresses_a_b_a() {
     let clock = FixedClock::new(1_000);
     let controller = lead_controller(dir.path(), &git, &clock);
     let runner = FakeCaptureRunner::new();
-    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+    let bridge = bridge_with_runtime(&controller, &runner);
 
     let a = dispatch_chat(&bridge, "lead-1", "update module_1 parser");
     assert_eq!(a["cached"], json!(false));
@@ -1652,7 +1686,7 @@ fn lead_context_snapshot_suppresses_a_b_c_d() {
     let clock = FixedClock::new(1_000);
     let controller = lead_controller(dir.path(), &git, &clock);
     let runner = FakeCaptureRunner::new();
-    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+    let bridge = bridge_with_runtime(&controller, &runner);
 
     let tasks = [
         "update module_1 parser",
@@ -1689,7 +1723,7 @@ fn lead_context_snapshot_suppresses_trivial_third_turn() {
     let clock = FixedClock::new(1_000);
     let controller = lead_controller(dir.path(), &git, &clock);
     let runner = FakeCaptureRunner::new();
-    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+    let bridge = bridge_with_runtime(&controller, &runner);
 
     let first = dispatch_chat(
         &bridge,
@@ -1758,7 +1792,7 @@ fn model_context_supplies_the_full_baseline_on_every_dispatch() {
     let clock = FixedClock::new(1_000);
     let controller = lead_controller(dir.path(), &git, &clock);
     let runner = FakeCaptureRunner::new();
-    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+    let bridge = bridge_with_runtime(&controller, &runner);
 
     // The task enters through prompt admission, never through dispatch
     // content.
@@ -1819,7 +1853,7 @@ fn model_context_never_clobbers_worker_state_mid_turn() {
     let clock = FixedClock::new(1_000);
     let controller = lead_controller(dir.path(), &git, &clock);
     let runner = FakeCaptureRunner::new();
-    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+    let bridge = bridge_with_runtime(&controller, &runner);
 
     // Turn start: admission establishes the task, the first dispatch renders
     // the baseline.
@@ -1898,7 +1932,7 @@ fn session_context_dispatch_never_resets_task_state() {
     let clock = FixedClock::new(1_000);
     let controller = lead_controller(dir.path(), &git, &clock);
     let runner = failing_runner();
-    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+    let bridge = bridge_with_runtime(&controller, &runner);
 
     // Admit the task and build up non-trivial task-scoped state: findings, a
     // checkpoint, a consumed build attempt, phase and destination.
@@ -1956,7 +1990,7 @@ fn session_prompt_admission_resets_task_state() {
     let clock = FixedClock::new(1_000);
     let controller = lead_controller(dir.path(), &git, &clock);
     let runner = failing_runner();
-    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+    let bridge = bridge_with_runtime(&controller, &runner);
 
     // Admit the first task and accumulate task-scoped state plus a retained
     // repository baseline.
@@ -2037,7 +2071,7 @@ fn model_context_refreshes_once_after_a_repository_change() {
     let clock = FixedClock::new(1_000);
     let controller = lead_controller(dir.path(), &git, &clock);
     let runner = FakeCaptureRunner::new();
-    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+    let bridge = bridge_with_runtime(&controller, &runner);
 
     admit_task(&bridge, "lead-1", TASK);
     let first = dispatch_context(&bridge, "lead-1", TASK);
@@ -2081,7 +2115,7 @@ fn model_context_is_session_scoped() {
     let clock = FixedClock::new(1_000);
     let controller = lead_controller(dir.path(), &git, &clock);
     let runner = FakeCaptureRunner::new();
-    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+    let bridge = bridge_with_runtime(&controller, &runner);
 
     admit_task(&bridge, "lead-1", TASK);
     let first = dispatch_context(&bridge, "lead-1", TASK);
@@ -2112,7 +2146,7 @@ fn model_context_without_a_user_message_keeps_the_running_task() {
     let clock = FixedClock::new(1_000);
     let controller = lead_controller(dir.path(), &git, &clock);
     let runner = FakeCaptureRunner::new();
-    let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+    let bridge = bridge_with_runtime(&controller, &runner);
 
     // The running task exists only because it was genuinely admitted; the
     // first dispatch renders the baseline for it.

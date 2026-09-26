@@ -17,14 +17,17 @@ use crate::orchestration::controller::{
     BuildDecision, ContextGovernanceResult, Controller, HandoffOutcome,
 };
 use crate::orchestration::handoff::Role;
+use crate::orchestration::mission;
 use crate::process::CaptureRunner;
 use crate::reports::ReportsConfig;
+use crate::runtime::compat::{BridgeRuntimeClient, LeadSelection};
 use crate::runtime::lifecycle::{
     RuntimeAdapter, RuntimeContextEvent, RuntimeContextUsage, RuntimeExecutionId, RuntimeProfile,
 };
 use crate::telemetry::{self, Event, OrchestrationMetrics, Outcome, TelemetryConfig};
 use serde_json::{json, Value};
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Instant;
 
 /// One bridge request's result plus its telemetry accounting.
@@ -37,6 +40,31 @@ struct BridgeOutcome {
     task_type: String,
 }
 
+impl BridgeOutcome {
+    fn ok(mut value: Value, role: Role, session_id: Option<String>) -> Self {
+        value["ok"] = json!(true);
+        Self {
+            value,
+            metrics: OrchestrationMetrics::default(),
+            outcome: Outcome::Success,
+            role: Some(role.as_str().to_string()),
+            session_id,
+            task_type: "orchestration".to_string(),
+        }
+    }
+
+    fn err(msg: String, role: Role, session_id: Option<String>) -> Self {
+        Self {
+            value: json!({"ok": false, "error": msg}),
+            metrics: OrchestrationMetrics::default(),
+            outcome: Outcome::Unknown,
+            role: Some(role.as_str().to_string()),
+            session_id,
+            task_type: "orchestration".to_string(),
+        }
+    }
+}
+
 /// The bridge context: the controller, the capture runner and the telemetry
 /// policy. `runner` is the trusted verification runner; tests inject a fake.
 pub struct BridgeContext<'a> {
@@ -46,8 +74,20 @@ pub struct BridgeContext<'a> {
     pub reports: ReportsConfig,
     /// Invocation-scoped runtime client. It is absent for ordinary bridge
     /// calls and for tests that only exercise policy projection.
-    pub rollover_runtime: Option<RefCell<Box<dyn RuntimeAdapter>>>,
+    /// Used by `context.observe` for `observe_context` and by
+    /// `session.prompt` for Lead authority enforcement.
+    ///
+    /// Stored as one shared concrete-client trait object so `context.observe`
+    /// and `session.prompt` cannot accidentally use different transports.
+    pub rollover_runtime: Option<Rc<RefCell<Box<dyn BridgeRuntimeClient>>>>,
+    /// Compatibility seam for lifecycle-only callers (including rollover
+    /// tests). It is intentionally never used by `session.prompt`, which must
+    /// have the full shared client surface above.
+    pub lifecycle_runtime: Option<Rc<RefCell<Box<dyn RuntimeAdapter>>>>,
     pub rollover_profile: Option<RuntimeProfile>,
+    /// Canonical ResolvedLeadContract for this invocation. Used by the prompt
+    /// authority gate to enforce Lead before task admission.
+    pub lead_contract: Option<LeadSelection>,
 }
 
 impl<'a> BridgeContext<'a> {
@@ -62,21 +102,46 @@ impl<'a> BridgeContext<'a> {
             telemetry,
             reports: ReportsConfig::default(),
             rollover_runtime: None,
+            lifecycle_runtime: None,
             rollover_profile: None,
+            lead_contract: None,
         }
     }
 
-    /// Attach the invocation-owned V2 client used only by `context.observe`.
-    /// The client is held inside this short-lived bridge value: a dropped
-    /// OpenCode/UI connection cannot turn into a Mission failure because the
-    /// Mission record is never stored in this object.
+    /// Attach the invocation-owned client used by `context.observe`
+    /// and `session.prompt`. The client is held inside this short-lived
+    /// bridge value: a dropped OpenCode/UI connection cannot turn into a
+    /// Mission failure because the Mission record is never stored in this
+    /// object.
+    ///
+    /// The client must implement the three runtime/session interfaces. Both
+    /// `V2SessionClient` and `MemorySessionClient` implement all three.
+    pub fn with_bridge_runtime(
+        mut self,
+        runtime: Rc<RefCell<Box<dyn BridgeRuntimeClient>>>,
+        profile: RuntimeProfile,
+    ) -> Self {
+        self.rollover_runtime = Some(runtime);
+        self.rollover_profile = Some(profile);
+        self
+    }
+
+    /// Attach a lifecycle-only runtime for context observation and rollover.
+    /// Prompt authority enforcement remains unavailable unless callers use
+    /// [`Self::with_bridge_runtime`].
     pub fn with_rollover_runtime<R: RuntimeAdapter + 'static>(
         mut self,
         runtime: R,
         profile: RuntimeProfile,
     ) -> Self {
-        self.rollover_runtime = Some(RefCell::new(Box::new(runtime)));
+        self.lifecycle_runtime = Some(Rc::new(RefCell::new(Box::new(runtime))));
         self.rollover_profile = Some(profile);
+        self
+    }
+
+    /// Attach the canonical ResolvedLeadContract for prompt authority enforcement.
+    pub fn with_lead_contract(mut self, lead: LeadSelection) -> Self {
+        self.lead_contract = Some(lead);
         self
     }
 
@@ -174,6 +239,15 @@ impl<'a> BridgeContext<'a> {
     /// user-role messages (interruption/resume continuations and similar)
     /// never pass through OpenCode's prompt admission, so they never reach
     /// this handler and can never reset task-scoped state.
+    ///
+    /// Lead authority gate (fail-closed):
+    ///   1. Validate payload
+    ///   2. Classify root session via durable Mission binding (not mutable
+    ///      runtime agent name — see P0-J)
+    ///   3. Inspect effective Lead via SessionClient
+    ///   4. Enforce via ensure_existing_session_lead (idempotent)
+    ///   5. ONLY THEN admit_user_task
+    ///   6. Return success
     fn session_prompt(&self, payload: &Value) -> BridgeOutcome {
         let session_id = session_id(payload);
         let text = payload
@@ -182,32 +256,76 @@ impl<'a> BridgeContext<'a> {
             .unwrap_or("")
             .to_string();
         if text.trim().is_empty() {
-            return BridgeOutcome {
-                value: json!({"ok": false, "error": "empty session.prompt payload"}),
-                metrics: OrchestrationMetrics::default(),
-                outcome: Outcome::Unknown,
-                role: Some(Role::Lead.as_str().to_string()),
-                session_id: Some(session_id),
-                task_type: "orchestration".to_string(),
-            };
+            return BridgeOutcome::err(
+                "empty session.prompt payload".into(),
+                Role::Lead,
+                Some(session_id),
+            );
         }
-        match self.controller.admit_user_task(&session_id, &text) {
-            Ok(admission) => BridgeOutcome {
-                value: json!({
-                    "ok": true,
-                    "event": "session.prompt",
-                    "session_id": admission.session_id,
-                    "task_id": admission.task_id,
-                    "changed": admission.changed,
-                }),
-                metrics: OrchestrationMetrics::default(),
-                outcome: Outcome::Success,
-                role: Some(Role::Lead.as_str().to_string()),
-                session_id: Some(admission.session_id),
-                task_type: "orchestration".to_string(),
-            },
-            Err(error) => self.error_outcome(error.to_string(), Some(Role::Lead), Some(session_id)),
+
+        // 1. CLASSIFY: Require runtime client + canonical Lead contract
+        let Some(lead) = self.lead_contract.as_ref() else {
+            return BridgeOutcome::err(
+                "Lead enforcement unavailable: missing runtime client or Lead contract".into(),
+                Role::Lead,
+                Some(session_id),
+            );
+        };
+        let Some(runtime_cell) = self.rollover_runtime.as_ref() else {
+            return BridgeOutcome::err(
+                "Lead enforcement unavailable: missing runtime client or Lead contract".into(),
+                Role::Lead,
+                Some(session_id),
+            );
+        };
+
+        // 2. Determine Root Lead ownership via durable Mission binding.
+        //    The runtime's observed agent name is MUTABLE runtime state
+        //    and MUST NOT be used as the authority test (P0-J).
+        //    A session is an OCG Root Lead session if and only if it
+        //    is the current execution binding for a durable Mission.
+        //    If no mission exists yet (first prompt), we enforce
+        //    conservatively since the bridge carries a canonical
+        //    Lead contract.
+        let mut runtime = runtime_cell.borrow_mut();
+        let is_root_lead = is_root_lead_execution(self.controller, &mut **runtime, &session_id);
+        drop(runtime);
+
+        if is_root_lead {
+            // 3. INSPECT + 4. ENFORCE: idempotent ensure_existing_session_lead
+            //    Uses canonical verify_effective_lead; no-op if already correct
+            let mut session_client = runtime_cell.borrow_mut();
+            if let Err(e) = crate::runtime::compat::ensure_existing_session_lead(
+                session_client.as_session(),
+                &session_id,
+                lead,
+            ) {
+                return BridgeOutcome::err(
+                    format!("Lead enforcement failed: {}", e),
+                    Role::Lead,
+                    Some(session_id),
+                );
+            }
         }
+        // else: worker/subagent (ocg-*) or non-current execution → skip, preserve worker routing
+
+        // 5. ONLY NOW: admit user task (OCG task state advances)
+        let admission = match self.controller.admit_user_task(&session_id, &text) {
+            Ok(a) => a,
+            Err(e) => return BridgeOutcome::err(e.to_string(), Role::Lead, Some(session_id)),
+        };
+
+        // 6. SUCCESS
+        BridgeOutcome::ok(
+            json!({
+                "event": "session.prompt",
+                "session_id": admission.session_id,
+                "task_id": admission.task_id,
+                "changed": admission.changed,
+            }),
+            Role::Lead,
+            Some(admission.session_id),
+        )
     }
 
     /// `session.context` (OpenCode V2 model dispatch): supply the current
@@ -374,7 +492,6 @@ impl<'a> BridgeContext<'a> {
         let (observation, decision, rollover) =
             if let Some(runtime_cell) = self.rollover_runtime.as_ref() {
                 let mut runtime_cell = runtime_cell.borrow_mut();
-                let runtime: &mut dyn RuntimeAdapter = runtime_cell.as_mut();
                 let reported_profile = payload
                     .get("provider_id")
                     .and_then(Value::as_str)
@@ -402,6 +519,7 @@ impl<'a> BridgeContext<'a> {
                     reported_usage: Some(RuntimeContextUsage::from_value(step_tokens.as_ref())),
                     reported_profile,
                 };
+                let runtime: &mut dyn RuntimeAdapter = runtime_cell.as_lifecycle();
                 match runtime.observe_context(&event) {
                     Ok(runtime_observation) => {
                         let observation = ContextObservation::from_runtime(runtime_observation);
@@ -450,6 +568,75 @@ impl<'a> BridgeContext<'a> {
                                 reason: safe_error(&error.to_string()),
                             }
                                 });
+                        (observation, decision, None)
+                    }
+                }
+            } else if let Some(runtime_cell) = self.lifecycle_runtime.as_ref() {
+                let mut runtime_cell = runtime_cell.borrow_mut();
+                let reported_profile = payload
+                    .get("provider_id")
+                    .and_then(Value::as_str)
+                    .zip(payload.get("model_id").and_then(Value::as_str))
+                    .map(|(provider, model)| {
+                        RuntimeProfile::new(
+                            payload
+                                .get("agent")
+                                .and_then(Value::as_str)
+                                .unwrap_or("runtime"),
+                            format!("{provider}/{model}"),
+                            payload
+                                .get("variant")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        )
+                    });
+                let event = RuntimeContextEvent {
+                    execution_id: session.clone().into(),
+                    event_id: event_id.clone(),
+                    observed_at: now,
+                    assistant_message_id: assistant_message_id.clone(),
+                    finish: finish.clone(),
+                    safe_boundary,
+                    reported_usage: Some(RuntimeContextUsage::from_value(step_tokens.as_ref())),
+                    reported_profile,
+                };
+                match runtime_cell.observe_context(&event) {
+                    Ok(runtime_observation) => {
+                        let observation = ContextObservation::from_runtime(runtime_observation);
+                        match self.controller.observe_context(
+                            &session,
+                            observation.clone(),
+                            &mut **runtime_cell,
+                            self.rollover_profile
+                                .as_ref()
+                                .expect("runtime implies a profile"),
+                        ) {
+                            Ok(result) => {
+                                let decision = result.decision.clone();
+                                (observation, decision, Some(result))
+                            }
+                            Err(error) => {
+                                return self.error_outcome(
+                                    safe_error(&error.to_string()),
+                                    Some(Role::Lead),
+                                    Some(session),
+                                )
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let observation = ContextObservation {
+                            session_id: session.clone(),
+                            ..ContextObservation::default()
+                        };
+                        let decision = crate::orchestration::context_governor::GovernorDecision {
+                            state: GovernorState::Unknown,
+                            action: self.controller.config().context_governor.unknown,
+                            utilization_percent: None,
+                            rollover_allowed: false,
+                            deferred_for_boundary: false,
+                            reason: error.to_string(),
+                        };
                         (observation, decision, None)
                     }
                 }
@@ -891,6 +1078,59 @@ fn session_id(payload: &Value) -> String {
     "default".to_string()
 }
 
+/// Classify prompt authority from durable Mission ownership only.
+///
+/// A Mission lookup is not itself authority: a returned Mission is accepted
+/// only when its current durable execution binding equals this session. This
+/// protects the first-prompt fallback from promoting a worker/session view
+/// that merely belongs to the same Mission. No runtime agent name is read.
+fn is_root_lead_execution(
+    controller: &Controller<'_>,
+    runtime: &mut dyn BridgeRuntimeClient,
+    session_id: &str,
+) -> bool {
+    let execution_id = RuntimeExecutionId::new(session_id.to_string());
+    // A worker can be a runtime execution descended from the Mission owner.
+    // Its session may be visible to the runtime while no Mission is directly
+    // bound to that child. A verified lineage prevents the first-prompt
+    // fallback from treating that child as the root Lead.
+    let current = execution_id.clone();
+    for _ in 0..32 {
+        match runtime.as_lifecycle().execution_parent(&current) {
+            Ok(Some(_parent)) => return false,
+            Ok(None) => break,
+            Err(_) => return false,
+        }
+    }
+
+    // Fast path for the controller's canonical durable ownership predicate.
+    // The lookup below remains explicit because first-prompt admission may
+    // race the creation of the Mission record.
+    if controller
+        .is_current_execution(&execution_id)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    // This is deliberately an ownership check, not a membership check. The
+    // Mission returned by `find_by_session` must itself carry this exact
+    // durable execution binding. A worker view that can find the Mission but
+    // is not its authoritative binding is rejected.
+    match mission::find_by_session(controller.root(), session_id) {
+        Ok(Some(mission)) => mission
+            .runtime_execution_id()
+            .is_some_and(|bound| bound == execution_id),
+        Ok(None) => {
+            // No Mission exists yet for a verified root execution: this is the
+            // only first-prompt case, so enforce conservatively before
+            // admission creates the durable binding.
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 fn subagent(args: &Value) -> Option<String> {
     for key in ["subagent_type", "subagentType", "agent", "subagent"] {
         if let Some(value) = args.get(key).and_then(Value::as_str) {
@@ -945,7 +1185,12 @@ mod tests {
     use crate::orchestration::config::OrchestrationConfig;
     use crate::orchestration::mission;
     use crate::process::{FakeCaptureRunner, FakeGitHost};
+    use crate::runtime::compat::MemorySessionClient;
+    use crate::runtime::compat::{BridgeRuntimeClient, LeadSelection};
+    use crate::runtime::lifecycle::RuntimeProfile;
     use crate::verification::config::VerificationConfig;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn controller<'a>(
         root: &'a std::path::Path,
@@ -962,6 +1207,36 @@ mod tests {
             git,
             clock,
         )
+    }
+
+    fn lead_selection() -> LeadSelection {
+        LeadSelection {
+            level: "high".to_string(),
+            agent: "lead-high".to_string(),
+            provider_id: "openai".to_string(),
+            model_id: "gpt-6-astra".to_string(),
+            variant: Some("low".to_string()),
+        }
+    }
+
+    /// Create a bridge with a `MemorySessionClient` as the invocation-scoped
+    /// runtime and a canonical Lead contract. Required for `session.prompt`
+    /// authority-gate tests (P0-J).
+    fn bridge_with_runtime<'a>(
+        controller: &'a Controller<'a>,
+        runner: &'a FakeCaptureRunner,
+    ) -> BridgeContext<'a> {
+        let client = MemorySessionClient::new();
+        let runtime: Rc<RefCell<Box<dyn BridgeRuntimeClient>>> =
+            Rc::new(RefCell::new(Box::new(client)));
+        let profile = RuntimeProfile::new(
+            lead_selection().agent.clone(),
+            lead_selection().full_model_id(),
+            lead_selection().variant.clone(),
+        );
+        BridgeContext::new(controller, runner, TelemetryConfig::disabled())
+            .with_bridge_runtime(runtime, profile)
+            .with_lead_contract(lead_selection())
     }
 
     #[test]
@@ -1033,7 +1308,7 @@ mod tests {
         let clock = FixedClock::new(1);
         let controller = controller(dir.path(), &git, &clock, VerificationConfig::default());
         let runner = FakeCaptureRunner::new();
-        let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled());
+        let bridge = bridge_with_runtime(&controller, &runner);
         let admitted = bridge.dispatch(
             "session.prompt",
             &json!({"session_id": "ses_source", "text": "keep this Mission durable"}),
@@ -1080,6 +1355,50 @@ mod tests {
         );
         assert_eq!(value["ok"], json!(true), "{value}");
         assert_eq!(value["ignored"], json!(null));
+    }
+
+    #[test]
+    fn mission_bound_worker_execution_is_not_root_lead_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = FakeGitHost::new();
+        let clock = FixedClock::new(1);
+        let controller = controller(dir.path(), &git, &clock, VerificationConfig::default());
+        let runner = FakeCaptureRunner::new();
+
+        // Deliberately bind the Mission lookup to the worker execution. The
+        // lookup succeeds, but runtime lineage proves that this execution is
+        // a child of the durable root execution.
+        let worker = "worker-execution";
+        let task = "worker prompt must preserve worker routing";
+        controller.admit_user_task(worker, task).unwrap();
+        assert!(mission::find_by_session(dir.path(), worker)
+            .unwrap()
+            .is_some());
+
+        let client = MemorySessionClient::new()
+            .with_session_id(worker)
+            .with_parent_session("root-execution");
+        let runtime: Rc<RefCell<Box<dyn BridgeRuntimeClient>>> =
+            Rc::new(RefCell::new(Box::new(client)));
+        let lead = lead_selection();
+        let profile = lead.runtime_profile();
+        let bridge = BridgeContext::new(&controller, &runner, TelemetryConfig::disabled())
+            .with_bridge_runtime(runtime, profile)
+            .with_lead_contract(lead);
+
+        let result = bridge.dispatch(
+            "session.prompt",
+            &json!({"session_id": worker, "text": "continue worker work"}),
+        );
+        assert_eq!(result["ok"], json!(true), "{result}");
+        // The worker path admits bookkeeping but skips Root Lead selection.
+        // The durable parent check is what makes this independent of any
+        // mutable runtime agent name.
+        let mut runtime = bridge.rollover_runtime.as_ref().unwrap().borrow_mut();
+        assert_eq!(
+            runtime.as_session().effective_lead(worker).unwrap().agent,
+            None
+        );
     }
 
     #[test]
