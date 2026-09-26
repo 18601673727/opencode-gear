@@ -51,6 +51,9 @@ use crate::orchestration::rollover::{
     self, ContinuationPacket, LeadBinding, RolloverArtifact, RolloverStatus,
 };
 use crate::orchestration::state::{self, Attempts, OrchestrationPhase, SessionState};
+use crate::orchestration::substrate::{
+    MissionId, MissionState, RunContract, RunId, RunState, SubstrateRepository, WorkNodeId,
+};
 use crate::process::{CaptureRunner, GitHost};
 use crate::runtime::lifecycle::{
     RuntimeAdapter, RuntimeContinuation, RuntimeError, RuntimeExecutionId, RuntimeProfile,
@@ -259,6 +262,118 @@ pub struct Controller<'a> {
 }
 
 impl<'a> Controller<'a> {
+    /// The canonical execution lane uses its own Mission namespace. Legacy
+    /// task admission cannot create this identity; it has no JSON fallback.
+    fn work_mission_id(id: &str) -> Result<MissionId> {
+        if !id.starts_with("wn-") {
+            return Err(GearError::config("canonical MissionId must start with wn-"));
+        }
+        MissionId::new(id)
+    }
+
+    pub fn create_work_mission(
+        &self,
+        id: &str,
+        payload: &str,
+        lead: RunContract,
+        runtime: &RuntimeExecutionId,
+    ) -> Result<RunId> {
+        let id = Self::work_mission_id(id)?;
+        SubstrateRepository::open(&self.root)?.create_live_mission(
+            &id,
+            payload,
+            lead,
+            runtime.as_str(),
+            self.now(),
+        )
+    }
+
+    pub fn load_work_mission(&self, id: &str) -> Result<Option<MissionState>> {
+        let id = Self::work_mission_id(id)?;
+        SubstrateRepository::open(&self.root)?.load(&id)
+    }
+
+    pub fn create_child_work(
+        &self,
+        id: &str,
+        parent: WorkNodeId,
+        by: RunId,
+        payload: &str,
+        dependencies: &[WorkNodeId],
+    ) -> Result<WorkNodeId> {
+        let id = Self::work_mission_id(id)?;
+        SubstrateRepository::open(&self.root)?.create_child_work(
+            &id,
+            parent,
+            by,
+            payload,
+            dependencies,
+            self.now(),
+        )
+    }
+
+    pub fn dispatch_work(
+        &self,
+        id: &str,
+        node: WorkNodeId,
+        by: RunId,
+        contract: RunContract,
+        runtime: &RuntimeExecutionId,
+    ) -> Result<RunId> {
+        let id = Self::work_mission_id(id)?;
+        SubstrateRepository::open(&self.root)?.dispatch_run(
+            &id,
+            node,
+            by,
+            contract,
+            runtime.as_str(),
+            self.now(),
+        )
+    }
+
+    pub fn finish_work(
+        &self,
+        id: &str,
+        node: WorkNodeId,
+        run: RunId,
+        outcome: RunState,
+        result: Option<&str>,
+    ) -> Result<()> {
+        let id = Self::work_mission_id(id)?;
+        SubstrateRepository::open(&self.root)?.finish_run(
+            &id,
+            node,
+            run,
+            outcome,
+            result,
+            self.now(),
+        )
+    }
+
+    /// Root and child failover call the same repository transaction.
+    pub fn replace_work_run(
+        &self,
+        id: &str,
+        node: WorkNodeId,
+        old: RunId,
+        contract: RunContract,
+        runtime: &RuntimeExecutionId,
+    ) -> Result<RunId> {
+        let id = Self::work_mission_id(id)?;
+        SubstrateRepository::open(&self.root)?.replace_bound_run(
+            &id,
+            node,
+            old,
+            contract,
+            runtime.as_str(),
+            self.now(),
+        )
+    }
+
+    pub fn record_late_work_result(&self, id: &str, run: RunId, result: &str) -> Result<()> {
+        let id = Self::work_mission_id(id)?;
+        SubstrateRepository::open(&self.root)?.record_fenced_result(&id, run, result)
+    }
     pub fn new(
         root: impl Into<PathBuf>,
         config: OrchestrationConfig,

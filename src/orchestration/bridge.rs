@@ -18,6 +18,7 @@ use crate::orchestration::controller::{
 };
 use crate::orchestration::handoff::Role;
 use crate::orchestration::mission;
+use crate::orchestration::substrate::{RunContract, RunId, RunState, WorkNodeId};
 use crate::process::CaptureRunner;
 use crate::reports::ReportsConfig;
 use crate::runtime::compat::{BridgeRuntimeClient, LeadSelection};
@@ -162,6 +163,14 @@ impl<'a> BridgeContext<'a> {
         }
         let started = Instant::now();
         let outcome = match event {
+            "work.mission.create"
+            | "work.child.create"
+            | "work.ready"
+            | "work.dispatch"
+            | "work.finish"
+            | "work.replace"
+            | "work.result.late"
+            | "work.inspect" => self.canonical_work(event, payload),
             "chat.message" | "chat-message" => self.chat_message(payload),
             "session.prompt" => self.session_prompt(payload),
             "session.context" => self.session_context(payload),
@@ -184,6 +193,196 @@ impl<'a> BridgeContext<'a> {
         };
         self.record(&outcome, started.elapsed().as_millis() as u64);
         outcome.value
+    }
+
+    /// Explicit canonical lifecycle boundary. Callers carry the Run witness;
+    /// this path never consults legacy replay, session state or task phases.
+    fn canonical_work(&self, event: &str, payload: &Value) -> BridgeOutcome {
+        let operation = || -> crate::error::Result<Value> {
+            let mission = payload
+                .get("mission_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| crate::error::GearError::config("missing mission_id"))?;
+            let node = || -> crate::error::Result<WorkNodeId> {
+                Ok(WorkNodeId(
+                    payload
+                        .get("node_id")
+                        .and_then(Value::as_u64)
+                        .and_then(|id| usize::try_from(id).ok())
+                        .ok_or_else(|| crate::error::GearError::config("missing node_id"))?,
+                ))
+            };
+            let run = || -> crate::error::Result<RunId> {
+                Ok(RunId(
+                    payload
+                        .get("run_id")
+                        .and_then(Value::as_u64)
+                        .and_then(|id| usize::try_from(id).ok())
+                        .ok_or_else(|| crate::error::GearError::config("missing run_id"))?,
+                ))
+            };
+            let binding = || -> crate::error::Result<RuntimeExecutionId> {
+                Ok(RuntimeExecutionId::new(
+                    payload
+                        .get("runtime_execution_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .ok_or_else(|| {
+                            crate::error::GearError::config("missing runtime_execution_id")
+                        })?,
+                ))
+            };
+            let contract = || -> crate::error::Result<RunContract> {
+                let value = payload
+                    .get("contract")
+                    .ok_or_else(|| crate::error::GearError::config("missing RunContract"))?;
+                serde_json::from_value(value.clone())
+                    .map_err(|_| crate::error::GearError::config("invalid RunContract"))
+            };
+            match event {
+                "work.mission.create" => {
+                    let lead = self.lead_contract.as_ref().ok_or_else(|| {
+                        crate::error::GearError::config("resolved Lead contract unavailable")
+                    })?;
+                    let runtime_cell = self.rollover_runtime.as_ref().ok_or_else(|| {
+                        crate::error::GearError::config("Lead runtime unavailable")
+                    })?;
+                    let runtime_id = binding()?;
+                    let mut client = runtime_cell.borrow_mut();
+                    match client.as_lifecycle().execution_parent(&runtime_id) {
+                        Ok(None) => {}
+                        _ => {
+                            return Err(crate::error::GearError::config(
+                                "root runtime ancestry unavailable",
+                            ))
+                        }
+                    }
+                    crate::runtime::compat::ensure_existing_session_lead(
+                        client.as_session(),
+                        runtime_id.as_str(),
+                        lead,
+                    )
+                    .map_err(|_| crate::error::GearError::config("Lead enforcement failed"))?;
+                    drop(client);
+                    let payload_text = payload.get("payload").and_then(Value::as_str).unwrap_or("");
+                    let run = self.controller.create_work_mission(
+                        mission,
+                        payload_text,
+                        RunContract {
+                            executor: lead.agent.clone(),
+                            model: lead.full_model_id(),
+                            role: Role::Lead.as_str().into(),
+                        },
+                        &runtime_id,
+                    )?;
+                    Ok(json!({"root_node_id":0,"run_id":run.0}))
+                }
+                "work.child.create" => {
+                    let deps = payload
+                        .get("dependencies")
+                        .and_then(Value::as_array)
+                        .map(|deps| {
+                            deps.iter()
+                                .map(|id| {
+                                    id.as_u64()
+                                        .and_then(|id| usize::try_from(id).ok())
+                                        .map(WorkNodeId)
+                                        .ok_or_else(|| {
+                                            crate::error::GearError::config("invalid Dependency")
+                                        })
+                                })
+                                .collect::<crate::error::Result<Vec<_>>>()
+                        })
+                        .transpose()?
+                        .unwrap_or_default();
+                    let child = self.controller.create_child_work(
+                        mission,
+                        node()?,
+                        run()?,
+                        payload.get("payload").and_then(Value::as_str).unwrap_or(""),
+                        &deps,
+                    )?;
+                    Ok(json!({"node_id":child.0}))
+                }
+                "work.dispatch" => {
+                    let run = self.controller.dispatch_work(
+                        mission,
+                        node()?,
+                        run()?,
+                        contract()?,
+                        &binding()?,
+                    )?;
+                    Ok(json!({"node_id":node()?.0,"run_id":run.0}))
+                }
+                "work.finish" => {
+                    let outcome = match payload.get("outcome").and_then(Value::as_str) {
+                        Some("completed") => RunState::Completed,
+                        Some("failed") => RunState::Failed,
+                        Some("cancelled") => RunState::Cancelled,
+                        Some("superseded") => RunState::Superseded,
+                        _ => {
+                            return Err(crate::error::GearError::config(
+                                "invalid terminal Run outcome",
+                            ))
+                        }
+                    };
+                    self.controller.finish_work(
+                        mission,
+                        node()?,
+                        run()?,
+                        outcome,
+                        payload.get("result").and_then(Value::as_str),
+                    )?;
+                    Ok(
+                        json!({"node_id":node()?.0,"run_id":run()?.0,"outcome":outcome_name(outcome)}),
+                    )
+                }
+                "work.replace" => {
+                    let replacement = self.controller.replace_work_run(
+                        mission,
+                        node()?,
+                        run()?,
+                        contract()?,
+                        &binding()?,
+                    )?;
+                    Ok(json!({"node_id":node()?.0,"run_id":replacement.0}))
+                }
+                "work.result.late" => {
+                    self.controller.record_late_work_result(
+                        mission,
+                        run()?,
+                        payload.get("result").and_then(Value::as_str).unwrap_or(""),
+                    )?;
+                    Ok(json!({"run_id":run()?.0,"reconciled":true}))
+                }
+                "work.ready" | "work.inspect" => {
+                    let state = self.controller.load_work_mission(mission)?.ok_or_else(|| {
+                        crate::error::GearError::config("unknown canonical Mission")
+                    })?;
+                    let ready: Vec<_> = state
+                        .ready(self.controller.now_unix())
+                        .iter()
+                        .map(|id| id.0)
+                        .collect();
+                    if event == "work.ready" {
+                        Ok(json!({"ready":ready}))
+                    } else {
+                        Ok(json!({"root_node_id":state.root().0,"ready":ready,
+                            "work_nodes":state.work_nodes.iter_enumerated().map(|(id,n)| json!({"node_id":id.0,"parent_node_id":n.parent_node_id.map(|p|p.0),"spawned_by_run_id":n.spawned_by_run_id.map(|r|r.0),"state":format!("{:?}",n.state).to_lowercase(),"generation":n.generation,"active_run_id":n.active_run_id.map(|r|r.0)})).collect::<Vec<_>>(),
+                            "runs":state.runs.iter_enumerated().map(|(id,r)| json!({"run_id":id.0,"node_id":r.node_id.0,"generation":r.generation,"state":outcome_name(r.state),"runtime_execution_id":r.runtime_execution_id})).collect::<Vec<_>>(),
+                            "dependencies":state.dependencies.iter().map(|d|json!({"node_id":d.node_id.0,"depends_on_node_id":d.depends_on_node_id.0})).collect::<Vec<_>>() }))
+                    }
+                }
+                _ => unreachable!(),
+            }
+        };
+        match operation() {
+            Ok(mut value) => {
+                value["event"] = json!(event);
+                BridgeOutcome::ok(value, Role::Lead, None)
+            }
+            Err(error) => BridgeOutcome::err(safe_error(&error.to_string()), Role::Lead, None),
+        }
     }
 
     fn chat_message(&self, payload: &Value) -> BridgeOutcome {
@@ -1168,6 +1367,17 @@ fn result_text(payload: &Value) -> String {
     String::new()
 }
 
+fn outcome_name(outcome: RunState) -> &'static str {
+    match outcome {
+        RunState::Active => "active",
+        RunState::Completed => "completed",
+        RunState::Failed => "failed",
+        RunState::Cancelled => "cancelled",
+        RunState::Superseded => "superseded",
+        RunState::Fenced => "fenced",
+    }
+}
+
 fn safe_error(message: &str) -> String {
     if crate::telemetry::task::is_secret_like(message) {
         "orchestration bridge error (details withheld)".to_string()
@@ -1237,6 +1447,165 @@ mod tests {
         BridgeContext::new(controller, runner, TelemetryConfig::disabled())
             .with_bridge_runtime(runtime, profile)
             .with_lead_contract(lead_selection())
+    }
+
+    #[test]
+    fn canonical_controller_bridge_lifecycle_recovers_without_legacy_replay() {
+        use crate::orchestration::substrate::{RunState, WorkState};
+        let dir = tempfile::tempdir().unwrap();
+        let git = FakeGitHost::new();
+        let clock = FixedClock::new(10);
+        let controller = controller(dir.path(), &git, &clock, VerificationConfig::default());
+        let runner = FakeCaptureRunner::new();
+        let bridge = bridge_with_runtime(&controller, &runner);
+        let mission = "wn-production";
+        let call = |event: &str, data: Value| {
+            let mut data = data;
+            data["mission_id"] = json!(mission);
+            let value = bridge.dispatch(event, &data);
+            assert_eq!(value["ok"], true, "{event}: {value}");
+            value
+        };
+        let contract = json!({"executor":"worker","model":"provider/model","role":"worker"});
+        assert_eq!(
+            call(
+                "work.mission.create",
+                json!({"runtime_execution_id":"session-lead","payload":"goal"})
+            )["run_id"],
+            0
+        );
+        let first = call(
+            "work.child.create",
+            json!({"node_id":0,"run_id":0,"payload":"A"}),
+        )["node_id"]
+            .as_u64()
+            .unwrap();
+        let second = call(
+            "work.child.create",
+            json!({"node_id":0,"run_id":0,"payload":"B"}),
+        )["node_id"]
+            .as_u64()
+            .unwrap();
+        let dependent = call(
+            "work.child.create",
+            json!({"node_id":0,"run_id":0,"payload":"C","dependencies":[first,second]}),
+        )["node_id"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            call("work.ready", json!({}))["ready"],
+            json!([first, second])
+        );
+        let run_a = call("work.dispatch",json!({"node_id":first,"run_id":0,"contract":contract,"runtime_execution_id":"session-worker-a"}))["run_id"].as_u64().unwrap();
+        assert_ne!(run_a.to_string(), "session-worker-a");
+        let run_b = call("work.dispatch",json!({"node_id":second,"run_id":0,"contract":contract,"runtime_execution_id":"session-worker-b"}))["run_id"].as_u64().unwrap();
+        assert_eq!(call("work.ready", json!({}))["ready"], json!([]));
+        call(
+            "work.finish",
+            json!({"node_id":first,"run_id":run_a,"outcome":"completed","result":"A done"}),
+        );
+        assert_eq!(call("work.ready", json!({}))["ready"], json!([]));
+        call(
+            "work.finish",
+            json!({"node_id":second,"run_id":run_b,"outcome":"completed"}),
+        );
+        assert_eq!(call("work.ready", json!({}))["ready"], json!([dependent]));
+        let run_c = call("work.dispatch",json!({"node_id":dependent,"run_id":0,"contract":contract,"runtime_execution_id":"session-worker-c"}))["run_id"].as_u64().unwrap();
+        call(
+            "work.finish",
+            json!({"node_id":dependent,"run_id":run_c,"outcome":"failed","result":"failed"}),
+        );
+        let retry = call("work.replace",json!({"node_id":dependent,"run_id":run_c,"contract":contract,"runtime_execution_id":"session-worker-c2"}))["run_id"].as_u64().unwrap();
+        let lead2 = call("work.replace",json!({"node_id":0,"run_id":0,"contract":{"executor":"lead-high","model":"openai/gpt-6-astra","role":"lead"},"runtime_execution_id":"session-lead-2"}))["run_id"].as_u64().unwrap();
+        assert_eq!(
+            bridge.dispatch(
+                "work.child.create",
+                &json!({"mission_id":mission,"node_id":0,"run_id":0})
+            )["ok"],
+            false
+        );
+        assert_eq!(bridge.dispatch("work.dispatch",&json!({"mission_id":mission,"node_id":dependent,"run_id":0,"contract":contract,"runtime_execution_id":"stale"}))["ok"],false);
+        assert_eq!(
+            bridge.dispatch(
+                "work.finish",
+                &json!({"mission_id":mission,"node_id":0,"run_id":0,"outcome":"completed"})
+            )["ok"],
+            false
+        );
+        call("work.result.late", json!({"run_id":0,"result":"late lead"}));
+        let child = call(
+            "work.child.create",
+            json!({"node_id":0,"run_id":lead2,"payload":"new work"}),
+        )["node_id"]
+            .as_u64()
+            .unwrap();
+        let state = controller.load_work_mission(mission).unwrap().unwrap();
+        assert_eq!(state.work_nodes.len(), 5);
+        assert_eq!(
+            state.work_nodes[WorkNodeId(dependent as usize)].active_run_id,
+            Some(RunId(retry as usize))
+        );
+        assert_eq!(
+            state.work_nodes[WorkNodeId(dependent as usize)].spawned_by_run_id,
+            Some(RunId(0))
+        );
+        assert_eq!(
+            state.work_nodes[WorkNodeId(first as usize)].state,
+            WorkState::Completed
+        );
+        assert_eq!(state.runs[RunId(run_c as usize)].state, RunState::Fenced);
+        assert_eq!(state.runs[RunId(0)].result.as_deref(), Some("late lead"));
+        assert_eq!(
+            state.work_nodes[WorkNodeId(child as usize)].parent_node_id,
+            Some(WorkNodeId(0))
+        );
+        assert_eq!(
+            state.runs[RunId(retry as usize)]
+                .runtime_execution_id
+                .as_deref(),
+            Some("session-worker-c2")
+        );
+        assert!(state.events.iter().any(|e| e.kind == "worknode_ready"));
+        drop(bridge);
+        drop(controller);
+        // No replay JSON is written by the canonical execution lane.
+        assert!(!dir
+            .path()
+            .join(".opencode-gear/orchestration/replay/state.json")
+            .exists());
+        let restarted = self::controller(dir.path(), &git, &clock, VerificationConfig::default());
+        let recovered = restarted.load_work_mission(mission).unwrap().unwrap();
+        assert_eq!(recovered.ready(10), vec![WorkNodeId(child as usize)]);
+        assert!(recovered.authoritative(WorkNodeId(0), RunId(lead2 as usize)));
+        assert!(recovered.authoritative(WorkNodeId(dependent as usize), RunId(retry as usize)));
+    }
+
+    #[test]
+    fn canonical_bridge_fails_closed_when_initialized_database_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = FakeGitHost::new();
+        let clock = FixedClock::new(10);
+        let controller = controller(dir.path(), &git, &clock, VerificationConfig::default());
+        let runner = FakeCaptureRunner::new();
+        let bridge = bridge_with_runtime(&controller, &runner);
+        let created = bridge.dispatch(
+            "work.mission.create",
+            &json!({
+                "mission_id":"wn-missing", "runtime_execution_id":"lead-session"
+            }),
+        );
+        assert_eq!(created["ok"], true, "{created}");
+        let path = crate::orchestration::state::state_dir(dir.path()).join("substrate.sqlite3");
+        let retained = path.with_extension("retained");
+        std::fs::rename(&path, &retained).unwrap();
+        let inspected = bridge.dispatch("work.inspect", &json!({"mission_id":"wn-missing"}));
+        assert_eq!(inspected["ok"], false);
+        assert!(inspected["error"]
+            .as_str()
+            .unwrap()
+            .contains("missing after initialization"));
+        assert!(!path.exists());
+        assert!(controller.load_work_mission("wn-missing").is_err());
     }
 
     #[test]

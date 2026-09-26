@@ -4634,7 +4634,11 @@ fn bridge_payload(
     // Ordinary bridge events remain entirely local.
     if matches!(
         event,
-        "context.observe" | "session.context.observe" | "context-observation" | "session.prompt"
+        "context.observe"
+            | "session.context.observe"
+            | "context-observation"
+            | "session.prompt"
+            | "work.mission.create"
     ) {
         if let (Some(url), Some(password), Some(lead)) = (
             env.v2_server_url.as_deref(),
