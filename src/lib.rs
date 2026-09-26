@@ -16,6 +16,7 @@ pub mod config_command;
 pub mod context;
 pub mod control_server;
 pub mod defaults;
+pub mod edit;
 pub mod error;
 pub mod http;
 pub mod json;
